@@ -31,7 +31,7 @@ function resolveViaAlias(importSource, aliases, _rootDir) {
     }
   }
 
-  for (const [pattern, targets] of Object.entries(aliases.paths)) {
+  for (const [pattern, targets] of Object.entries(aliases.paths || {})) {
     const prefix = pattern.replace(/\*$/, '');
     if (!importSource.startsWith(prefix)) continue;
     const rest = importSource.slice(prefix.length);
