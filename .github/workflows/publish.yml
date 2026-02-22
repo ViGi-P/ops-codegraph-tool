@@ -201,7 +201,7 @@ jobs:
         run: npm publish --access public --provenance
 
       - name: Push version commit and tag
-        if: "!inputs.dry-run"
+        if: github.event_name == 'workflow_dispatch' && !inputs.dry-run
         run: |
           git push origin main
           git push origin "v${{ steps.version.outputs.new_version }}"
