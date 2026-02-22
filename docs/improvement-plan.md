@@ -63,32 +63,10 @@ All P0 items have been fixed in this session:
 
 ### P1 — High priority (next 1-2 releases)
 
-#### 3. Split parser.js into per-language extractors
+#### ~~3. Split parser.js into per-language extractors~~ FIXED
 **Found by:** `codegraph deps src/parser.js` (fan-in 15), `codegraph cycles --functions` (1 cycle)
 
-`parser.js` is a 2200+ line file with 47 function definitions. Each language extractor has its own `walk()` function, creating ambiguous function names in the graph. The Rust engine already has this structure (`crates/codegraph-core/src/extractors/`).
-
-**Action:** Create `src/extractors/` directory with one file per language:
-```
-src/extractors/
-  javascript.js    # JS/TS/TSX
-  python.js
-  go.js
-  rust.js
-  java.js
-  csharp.js
-  ruby.js
-  php.js
-  hcl.js
-```
-
-Keep `LANGUAGE_REGISTRY` in `parser.js` but import extractors from the new files.
-
-**Benefits:**
-- Resolves the `findPythonParentClass <-> walk` function-level cycle
-- Disambiguates function names for codegraph's own analysis
-- Each extractor becomes independently testable
-- Aligns with Rust codebase structure
+Completed: `parser.js` reduced from 2200+ lines to ~350. All per-language extractors split into `src/extractors/` (javascript, python, go, rust, java, csharp, ruby, php, hcl) plus shared `helpers.js` and barrel `index.js`. `LANGUAGE_REGISTRY` remains in `parser.js` importing from extractors. Aligns with Rust codebase structure.
 
 #### ~~4. Clean up stale registry entries~~ FIXED
 **Found by:** `codegraph registry list` (30+ dead temp dir entries)
