@@ -128,7 +128,7 @@ codegraph deps src/index.ts  # file-level import/export map
 | 📤 | **Export** | DOT (Graphviz), Mermaid, and JSON graph export |
 | 🧠 | **Semantic search** | Embeddings-powered natural language search with multi-query RRF ranking |
 | 👀 | **Watch mode** | Incrementally update the graph as files change |
-| 🤖 | **MCP server** | 12-tool MCP server with multi-repo support for AI assistants |
+| 🤖 | **MCP server** | 13-tool MCP server for AI assistants; single-repo by default, opt-in multi-repo |
 | 🔒 | **Fully local** | No network calls, no data exfiltration, SQLite-backed |
 
 ## 📦 Commands
@@ -215,7 +215,7 @@ The model used during `embed` is stored in the database, so `search` auto-detect
 
 ### Multi-Repo Registry
 
-Manage a global registry of codegraph-enabled projects. AI agents can query any registered repo from a single MCP session using the `repo` parameter.
+Manage a global registry of codegraph-enabled projects. The registry stores paths to your built graphs so the MCP server can query them when multi-repo mode is enabled.
 
 ```bash
 codegraph registry list        # List all registered repos
@@ -230,8 +230,12 @@ codegraph registry remove <name>  # Unregister
 ### AI Integration
 
 ```bash
-codegraph mcp                  # Start MCP server for AI assistants
+codegraph mcp                  # Start MCP server (single-repo, current project only)
+codegraph mcp --multi-repo     # Enable access to all registered repos
+codegraph mcp --repos a,b      # Restrict to specific repos (implies --multi-repo)
 ```
+
+By default, the MCP server only exposes the local project's graph. AI agents cannot access other repositories unless you explicitly opt in with `--multi-repo` or `--repos`.
 
 ### Common Flags
 
@@ -324,13 +328,17 @@ Benchmarked on a ~3,200-file TypeScript project:
 
 ### MCP Server
 
-Codegraph includes a built-in [Model Context Protocol](https://modelcontextprotocol.io/) server with 12 tools, so AI assistants can query your dependency graph directly:
+Codegraph includes a built-in [Model Context Protocol](https://modelcontextprotocol.io/) server with 13 tools, so AI assistants can query your dependency graph directly:
 
 ```bash
-codegraph mcp
+codegraph mcp                  # Single-repo mode (default) — only local project
+codegraph mcp --multi-repo     # Multi-repo — all registered repos accessible
+codegraph mcp --repos a,b      # Multi-repo with allowlist
 ```
 
-All MCP tools accept an optional `repo` parameter to target any registered repository. Use `list_repos` to see available repos. When `repo` is omitted, the local `.codegraph/graph.db` is used (backwards compatible).
+**Single-repo mode (default):** Tools operate only on the local `.codegraph/graph.db`. The `repo` parameter and `list_repos` tool are not exposed to the AI agent.
+
+**Multi-repo mode (`--multi-repo`):** All tools gain an optional `repo` parameter to target any registered repository, and `list_repos` becomes available. Use `--repos` to restrict which repos the agent can access.
 
 ### CLAUDE.md / Agent Instructions
 

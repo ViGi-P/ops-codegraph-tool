@@ -132,10 +132,16 @@ Speed up CI by caching `.codegraph/`:
 Start the MCP server so AI assistants can query your graph:
 
 ```bash
-codegraph mcp
+codegraph mcp                  # Single-repo mode (default) — only local project
+codegraph mcp --multi-repo     # Multi-repo — all registered repos accessible
+codegraph mcp --repos a,b      # Multi-repo with allowlist
 ```
 
-The server exposes tools for `query_function`, `file_deps`, `impact_analysis`, `find_cycles`, and `module_map`.
+By default, the MCP server runs in **single-repo mode** — the AI agent can only query the current project's graph. The `repo` parameter and `list_repos` tool are not exposed, preventing agents from silently accessing other codebases.
+
+Enable `--multi-repo` to let the agent query any registered repository, or use `--repos` to restrict access to a specific set of repos.
+
+The server exposes tools for `query_function`, `file_deps`, `impact_analysis`, `find_cycles`, `module_map`, `fn_deps`, `fn_impact`, `diff_impact`, `semantic_search`, `export_graph`, `list_functions`, `structure`, and `hotspots`.
 
 ### CLAUDE.md for your project
 

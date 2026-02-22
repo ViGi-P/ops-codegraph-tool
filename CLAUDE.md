@@ -45,7 +45,7 @@ JS source is plain JavaScript (ES modules) in `src/`. No transpilation step. The
 | `queries.js` | Query functions: symbol search, file deps, impact analysis, diff-impact; `SYMBOL_KINDS` constant defines all node kinds |
 | `embedder.js` | Semantic search with `@huggingface/transformers`; multi-query RRF ranking |
 | `db.js` | SQLite schema and operations (`better-sqlite3`) |
-| `mcp.js` | MCP server exposing graph queries to AI agents |
+| `mcp.js` | MCP server exposing graph queries to AI agents; single-repo by default, `--multi-repo` to enable cross-repo access |
 | `cycles.js` | Circular dependency detection |
 | `export.js` | DOT/Mermaid/JSON graph export |
 | `watcher.js` | Watch mode for incremental rebuilds |
@@ -66,6 +66,7 @@ JS source is plain JavaScript (ES modules) in `src/`. No transpilation step. The
 - Non-required parsers (all except JS/TS/TSX) fail gracefully if their WASM grammar is unavailable
 - Import resolution uses a 6-level priority system with confidence scoring (import-aware → same-file → directory → parent → global → method hierarchy)
 - Incremental builds track file hashes in the DB to skip unchanged files
+- **MCP single-repo isolation:** `startMCPServer` defaults to single-repo mode — tools have no `repo` property and `list_repos` is not exposed. Passing `--multi-repo` or `--repos` to the CLI (or `options.multiRepo` / `options.allowedRepos` programmatically) enables multi-repo access. `buildToolList(multiRepo)` builds the tool list dynamically; the backward-compatible `TOOLS` export equals `buildToolList(true)`
 - **Credential resolution:** `loadConfig` pipeline is `mergeConfig → applyEnvOverrides → resolveSecrets`. The `apiKeyCommand` config field shells out to an external secret manager via `execFileSync` (no shell). Priority: command output > env var > file config > defaults. On failure, warns and falls back gracefully
 
 **Database:** SQLite at `.codegraph/graph.db` with tables: `nodes`, `edges`, `metadata`, `embeddings`
@@ -94,9 +95,25 @@ Releases are triggered via the `publish.yml` workflow (`workflow_dispatch`). By 
 
 The workflow can be overridden with a specific version via the `version-override` input. Locally, `npm run release:dry-run` previews the bump and changelog.
 
+## Dogfooding — codegraph on itself
+
+Codegraph is **our own tool**. Use it to analyze this repository before making changes:
+
+```bash
+node src/cli.js build .              # Build/update the graph
+node src/cli.js cycles               # Check for circular dependencies
+node src/cli.js map --limit 20       # Module overview & coupling hotspots
+node src/cli.js diff-impact main     # See impact of current branch changes
+node src/cli.js fn <name>            # Trace function-level dependency chains
+node src/cli.js deps src/<file>.js   # See what imports/depends on a file
+```
+
+If codegraph reports an error, crashes, or produces wrong results when analyzing itself, **fix the bug in the codebase** — don't just work around it. This is the best way to find and resolve real issues.
+
 ## Git Conventions
 
 - Never add AI co-authorship lines (`Co-Authored-By` or similar) to commit messages.
+- Never add "Built with Claude Code", "Generated with Claude Code", or any variation referencing Claude Code or Anthropic to commit messages, PR descriptions, code comments, or any other output.
 
 ## Node Version
 

@@ -16,7 +16,7 @@ const REPO_PROP = {
   },
 };
 
-const TOOLS = [
+const BASE_TOOLS = [
   {
     name: 'query_function',
     description: 'Find callers and callees of a function by name',
@@ -29,7 +29,6 @@ const TOOLS = [
           description: 'Traversal depth for transitive callers',
           default: 2,
         },
-        ...REPO_PROP,
       },
       required: ['name'],
     },
@@ -41,7 +40,6 @@ const TOOLS = [
       type: 'object',
       properties: {
         file: { type: 'string', description: 'File path (partial match supported)' },
-        ...REPO_PROP,
       },
       required: ['file'],
     },
@@ -53,7 +51,6 @@ const TOOLS = [
       type: 'object',
       properties: {
         file: { type: 'string', description: 'File path to analyze' },
-        ...REPO_PROP,
       },
       required: ['file'],
     },
@@ -63,9 +60,7 @@ const TOOLS = [
     description: 'Detect circular dependencies in the codebase',
     inputSchema: {
       type: 'object',
-      properties: {
-        ...REPO_PROP,
-      },
+      properties: {},
     },
   },
   {
@@ -75,7 +70,6 @@ const TOOLS = [
       type: 'object',
       properties: {
         limit: { type: 'number', description: 'Number of top files to show', default: 20 },
-        ...REPO_PROP,
       },
     },
   },
@@ -88,7 +82,6 @@ const TOOLS = [
         name: { type: 'string', description: 'Function/method/class name (partial match)' },
         depth: { type: 'number', description: 'Transitive caller depth', default: 3 },
         no_tests: { type: 'boolean', description: 'Exclude test files', default: false },
-        ...REPO_PROP,
       },
       required: ['name'],
     },
@@ -103,7 +96,6 @@ const TOOLS = [
         name: { type: 'string', description: 'Function/method/class name (partial match)' },
         depth: { type: 'number', description: 'Max traversal depth', default: 5 },
         no_tests: { type: 'boolean', description: 'Exclude test files', default: false },
-        ...REPO_PROP,
       },
       required: ['name'],
     },
@@ -118,7 +110,6 @@ const TOOLS = [
         ref: { type: 'string', description: 'Git ref to diff against (default: HEAD)' },
         depth: { type: 'number', description: 'Transitive caller depth', default: 3 },
         no_tests: { type: 'boolean', description: 'Exclude test files', default: false },
-        ...REPO_PROP,
       },
     },
   },
@@ -132,7 +123,6 @@ const TOOLS = [
         query: { type: 'string', description: 'Natural language search query' },
         limit: { type: 'number', description: 'Max results to return', default: 15 },
         min_score: { type: 'number', description: 'Minimum similarity score (0-1)', default: 0.2 },
-        ...REPO_PROP,
       },
       required: ['query'],
     },
@@ -153,7 +143,6 @@ const TOOLS = [
           description: 'File-level graph (true) or function-level (false)',
           default: true,
         },
-        ...REPO_PROP,
       },
       required: ['format'],
     },
@@ -168,27 +157,94 @@ const TOOLS = [
         file: { type: 'string', description: 'Filter by file path (partial match)' },
         pattern: { type: 'string', description: 'Filter by function name (partial match)' },
         no_tests: { type: 'boolean', description: 'Exclude test files', default: false },
-        ...REPO_PROP,
       },
     },
   },
   {
-    name: 'list_repos',
-    description: 'List all repositories registered in the codegraph registry',
+    name: 'structure',
+    description:
+      'Show project structure with directory hierarchy, cohesion scores, and per-file metrics',
     inputSchema: {
       type: 'object',
-      properties: {},
+      properties: {
+        directory: { type: 'string', description: 'Filter to a specific directory path' },
+        depth: { type: 'number', description: 'Max directory depth to show' },
+        sort: {
+          type: 'string',
+          enum: ['cohesion', 'fan-in', 'fan-out', 'density', 'files'],
+          description: 'Sort directories by metric',
+        },
+      },
+    },
+  },
+  {
+    name: 'hotspots',
+    description:
+      'Find structural hotspots: files or directories with extreme fan-in, fan-out, or symbol density',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        metric: {
+          type: 'string',
+          enum: ['fan-in', 'fan-out', 'density', 'coupling'],
+          description: 'Metric to rank by',
+        },
+        level: {
+          type: 'string',
+          enum: ['file', 'directory'],
+          description: 'Rank files or directories',
+        },
+        limit: { type: 'number', description: 'Number of results to return', default: 10 },
+      },
     },
   },
 ];
 
-export { TOOLS };
+const LIST_REPOS_TOOL = {
+  name: 'list_repos',
+  description: 'List all repositories registered in the codegraph registry',
+  inputSchema: {
+    type: 'object',
+    properties: {},
+  },
+};
+
+/**
+ * Build the tool list based on multi-repo mode.
+ * @param {boolean} multiRepo - If true, inject `repo` prop into each tool and append `list_repos`
+ * @returns {object[]}
+ */
+function buildToolList(multiRepo) {
+  if (!multiRepo) return BASE_TOOLS;
+  return [
+    ...BASE_TOOLS.map((tool) => ({
+      ...tool,
+      inputSchema: {
+        ...tool.inputSchema,
+        properties: { ...tool.inputSchema.properties, ...REPO_PROP },
+      },
+    })),
+    LIST_REPOS_TOOL,
+  ];
+}
+
+// Backward-compatible export: full multi-repo tool list
+const TOOLS = buildToolList(true);
+
+export { TOOLS, buildToolList };
 
 /**
  * Start the MCP server.
  * This function requires @modelcontextprotocol/sdk to be installed.
+ *
+ * @param {string} [customDbPath] - Path to a specific graph.db
+ * @param {object} [options]
+ * @param {boolean} [options.multiRepo] - Enable multi-repo access (default: false)
+ * @param {string[]} [options.allowedRepos] - Restrict access to these repo names only
  */
-export async function startMCPServer(customDbPath) {
+export async function startMCPServer(customDbPath, options = {}) {
+  const { allowedRepos } = options;
+  const multiRepo = options.multiRepo || !!allowedRepos;
   let Server, StdioServerTransport;
   try {
     const sdk = await import('@modelcontextprotocol/sdk/server/index.js');
@@ -223,14 +279,28 @@ export async function startMCPServer(customDbPath) {
     { capabilities: { tools: {} } },
   );
 
-  server.setRequestHandler('tools/list', async () => ({ tools: TOOLS }));
+  server.setRequestHandler('tools/list', async () => ({ tools: buildToolList(multiRepo) }));
 
   server.setRequestHandler('tools/call', async (request) => {
     const { name, arguments: args } = request.params;
 
     try {
+      if (!multiRepo && args.repo) {
+        throw new Error(
+          'Multi-repo access is disabled. Restart with `codegraph mcp --multi-repo` to access other repositories.',
+        );
+      }
+      if (!multiRepo && name === 'list_repos') {
+        throw new Error(
+          'Multi-repo access is disabled. Restart with `codegraph mcp --multi-repo` to list repositories.',
+        );
+      }
+
       let dbPath = customDbPath || undefined;
       if (args.repo) {
+        if (allowedRepos && !allowedRepos.includes(args.repo)) {
+          throw new Error(`Repository "${args.repo}" is not in the allowed repos list.`);
+        }
         const { resolveRepoDbPath } = await import('./registry.js');
         const resolved = resolveRepoDbPath(args.repo);
         if (!resolved)
@@ -333,9 +403,31 @@ export async function startMCPServer(customDbPath) {
             noTests: args.no_tests,
           });
           break;
+        case 'structure': {
+          const { structureData } = await import('./structure.js');
+          result = structureData(dbPath, {
+            directory: args.directory,
+            depth: args.depth,
+            sort: args.sort,
+          });
+          break;
+        }
+        case 'hotspots': {
+          const { hotspotsData } = await import('./structure.js');
+          result = hotspotsData(dbPath, {
+            metric: args.metric,
+            level: args.level,
+            limit: args.limit,
+          });
+          break;
+        }
         case 'list_repos': {
           const { listRepos } = await import('./registry.js');
-          result = { repos: listRepos() };
+          let repos = listRepos();
+          if (allowedRepos) {
+            repos = repos.filter((r) => allowedRepos.includes(r.name));
+          }
+          result = { repos };
           break;
         }
         default:
