@@ -98,15 +98,15 @@ This matters because codegraph runs inside AI agents that have broad tool access
 
 ### 8. Honest about what we're not
 
-**We are not a graph database. We are not a RAG system. We are not an AI agent.**
+**We are not an application. We are not a coding tool. We are not an AI agent.**
 
-We use SQLite, not Neo4j/Memgraph/KuzuDB. Our queries are hand-written SQL, not Cypher. This is intentional — it keeps us at zero infrastructure.
+We are a code intelligence engine — a library that parses, indexes, and queries structural relationships. We don't have a GUI, we don't open in a browser, and we don't present dashboards. Applications are built *on top* of codegraph, not inside it.
 
-We offer semantic search via optional embeddings, but we are not a RAG pipeline. We don't generate code, answer questions, or translate natural language to queries.
+We offer semantic search via optional embeddings, but we are not a coding assistant. We don't generate code, suggest fixes, refactor, or translate natural language to code. Tools that do those things can use our graph as their foundation.
 
-We expose tools to AI agents via MCP, but we are not an agent ourselves. We don't make decisions, run multi-step workflows, or modify code.
+We expose tools to AI agents via MCP, but we are not an agent ourselves. We don't make decisions, run multi-step workflows, or modify code. We answer structural questions so that agents can make better decisions.
 
-Staying in our lane means we can be embedded inside tools that do those things — without competing with them or duplicating their responsibilities.
+Staying in our lane means we can be embedded inside IDEs, AI agents, CI pipelines, and developer platforms — without competing with them or duplicating their responsibilities.
 
 ---
 
