@@ -190,16 +190,18 @@ function kindIcon(kind) {
 
 // ─── Data-returning functions ───────────────────────────────────────────
 
-export function queryNameData(name, customDbPath) {
+export function queryNameData(name, customDbPath, opts = {}) {
   const db = openReadonlyOrFail(customDbPath);
-  const nodes = db.prepare(`SELECT * FROM nodes WHERE name LIKE ?`).all(`%${name}%`);
+  const noTests = opts.noTests || false;
+  let nodes = db.prepare(`SELECT * FROM nodes WHERE name LIKE ?`).all(`%${name}%`);
+  if (noTests) nodes = nodes.filter((n) => !isTestFile(n.file));
   if (nodes.length === 0) {
     db.close();
     return { query: name, results: [] };
   }
 
   const results = nodes.map((node) => {
-    const callees = db
+    let callees = db
       .prepare(`
       SELECT n.name, n.kind, n.file, n.line, e.kind as edge_kind
       FROM edges e JOIN nodes n ON e.target_id = n.id
@@ -207,13 +209,18 @@ export function queryNameData(name, customDbPath) {
     `)
       .all(node.id);
 
-    const callers = db
+    let callers = db
       .prepare(`
       SELECT n.name, n.kind, n.file, n.line, e.kind as edge_kind
       FROM edges e JOIN nodes n ON e.source_id = n.id
       WHERE e.target_id = ?
     `)
       .all(node.id);
+
+    if (noTests) {
+      callees = callees.filter((c) => !isTestFile(c.file));
+      callers = callers.filter((c) => !isTestFile(c.file));
+    }
 
     return {
       name: node.name,
@@ -728,8 +735,9 @@ export function listFunctionsData(customDbPath, opts = {}) {
   return { count: rows.length, functions: rows };
 }
 
-export function statsData(customDbPath) {
+export function statsData(customDbPath, opts = {}) {
   const db = openReadonlyOrFail(customDbPath);
+  const noTests = opts.noTests || false;
 
   // Node breakdown by kind
   const nodeRows = db.prepare('SELECT kind, COUNT(*) as c FROM nodes GROUP BY kind').all();
@@ -756,7 +764,8 @@ export function statsData(customDbPath) {
       extToLang.set(ext, entry.id);
     }
   }
-  const fileNodes = db.prepare("SELECT file FROM nodes WHERE kind = 'file'").all();
+  let fileNodes = db.prepare("SELECT file FROM nodes WHERE kind = 'file'").all();
+  if (noTests) fileNodes = fileNodes.filter((n) => !isTestFile(n.file));
   const byLanguage = {};
   for (const row of fileNodes) {
     const ext = path.extname(row.file).toLowerCase();
@@ -779,10 +788,10 @@ export function statsData(customDbPath) {
     WHERE n.kind = 'file'
     ORDER BY (SELECT COUNT(*) FROM edges WHERE target_id = n.id)
            + (SELECT COUNT(*) FROM edges WHERE source_id = n.id) DESC
-    LIMIT 5
   `)
     .all();
-  const hotspots = hotspotRows.map((r) => ({
+  const filteredHotspots = noTests ? hotspotRows.filter((r) => !isTestFile(r.file)) : hotspotRows;
+  const hotspots = filteredHotspots.slice(0, 5).map((r) => ({
     file: r.file,
     fanIn: r.fan_in,
     fanOut: r.fan_out,
@@ -881,7 +890,7 @@ export function statsData(customDbPath) {
 }
 
 export function stats(customDbPath, opts = {}) {
-  const data = statsData(customDbPath);
+  const data = statsData(customDbPath, { noTests: opts.noTests });
   if (opts.json) {
     console.log(JSON.stringify(data, null, 2));
     return;
@@ -979,7 +988,7 @@ export function stats(customDbPath, opts = {}) {
 // ─── Human-readable output (original formatting) ───────────────────────
 
 export function queryName(name, customDbPath, opts = {}) {
-  const data = queryNameData(name, customDbPath);
+  const data = queryNameData(name, customDbPath, { noTests: opts.noTests });
   if (opts.json) {
     console.log(JSON.stringify(data, null, 2));
     return;
