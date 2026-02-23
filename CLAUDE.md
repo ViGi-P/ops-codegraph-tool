@@ -2,6 +2,8 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+> **Use codegraph before editing code.** This project has a pre-built dependency graph at `.codegraph/graph.db`. Before modifying any function or file, run `node src/cli.js where <name>` to locate it, `node src/cli.js explain <target>` to understand the structure, `node src/cli.js context <name> -T` to gather full context, and `node src/cli.js fn-impact <name> -T` to check blast radius. After staging changes, run `node src/cli.js diff-impact --staged -T` to verify impact. This saves tokens, prevents blind edits, and catches breakage before it happens. See the [Dogfooding](#dogfooding--codegraph-on-itself) section for the full command reference.
+
 ## Project Overview
 
 Codegraph (`@optave/codegraph`) is a local code dependency graph CLI. It parses codebases with tree-sitter (WASM), builds function-level dependency graphs stored in SQLite, and supports semantic search with local embeddings. No cloud services required.
@@ -97,18 +99,34 @@ The workflow can be overridden with a specific version via the `version-override
 
 ## Dogfooding — codegraph on itself
 
-Codegraph is **our own tool**. Use it to analyze this repository before making changes:
+Codegraph is **our own tool**. Use it to analyze this repository before making changes. If codegraph reports an error, crashes, or produces wrong results when analyzing itself, **fix the bug in the codebase** — don't just work around it.
 
+### Before modifying code, always:
+1. `node src/cli.js where <name>` — find where the symbol lives
+2. `node src/cli.js explain <file-or-function>` — understand the structure
+3. `node src/cli.js context <name> -T` — get full context (source, deps, callers)
+4. `node src/cli.js fn-impact <name> -T` — check blast radius before editing
+
+### After modifying code:
+5. `node src/cli.js diff-impact --staged -T` — verify impact before committing
+
+### Other useful commands
 ```bash
-node src/cli.js build .              # Build/update the graph
+node src/cli.js build .              # Build/update the graph (incremental)
+node src/cli.js map --limit 20       # Module overview & most-connected nodes
+node src/cli.js stats                # Graph health and quality score
+node src/cli.js fn <name> -T         # Function call chain (callers + callees)
+node src/cli.js deps src/<file>.js   # File-level imports and importers
+node src/cli.js diff-impact main     # Impact of current branch vs main
 node src/cli.js cycles               # Check for circular dependencies
-node src/cli.js map --limit 20       # Module overview & coupling hotspots
-node src/cli.js diff-impact main     # See impact of current branch changes
-node src/cli.js fn <name>            # Trace function-level dependency chains
-node src/cli.js deps src/<file>.js   # See what imports/depends on a file
+node src/cli.js search "<query>"     # Semantic search (requires `embed` first)
 ```
 
-If codegraph reports an error, crashes, or produces wrong results when analyzing itself, **fix the bug in the codebase** — don't just work around it. This is the best way to find and resolve real issues.
+### Flags
+- `-T` / `--no-tests` — exclude test files (use by default)
+- `-j` / `--json` — JSON output for programmatic use
+- `-f, --file <path>` — scope to a specific file (partial match)
+- `-k, --kind <kind>` — filter by symbol kind (function, method, class, etc.)
 
 ## Parallel Sessions
 

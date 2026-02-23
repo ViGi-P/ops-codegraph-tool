@@ -4,5 +4,7 @@ node_modules/
 coverage/
 .env
 grammars/*.wasm
+.claude/session-edits.log
+.claude/codegraph-checked.log
 artifacts/
 pkg/
