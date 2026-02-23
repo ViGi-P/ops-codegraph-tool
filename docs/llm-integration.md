@@ -55,6 +55,44 @@ Code changes → codegraph build (+ LLM enrichment) → SQLite DB with semantic 
 - Returns: what changed, what's affected, risk assessment, suggested review focus areas
 - MCP tool: `review_diff <ref>` — structured review the consuming AI can relay to the user
 
+#### "Show me a visual impact graph for this PR"
+- **Foundation (implemented):** `codegraph diff-impact <base> --format mermaid -T` generates a Mermaid flowchart showing changed functions, transitive callers, and blast radius — color-coded by new/modified/blast-radius
+- **CI automation:** GitHub Action that runs on every PR:
+  1. `codegraph build .` (incremental, fast on CI cache)
+  2. `codegraph diff-impact $BASE_REF --format mermaid -T` to generate the graph
+  3. Post as a PR comment — GitHub renders Mermaid natively in markdown
+  4. Update on new pushes (edit the existing comment)
+- **LLM-enriched annotations:** Overlay the graph with semantic context:
+  - For each changed function: one-line summary of WHAT changed (from diff hunks)
+  - For each affected caller: WHY it's affected — what behavior might change downstream
+  - Risk labels per node: `low` (cosmetic / internal), `medium` (behavior change), `high` (breaking / public API)
+  - Node colors shift from green → yellow → red based on risk, replacing the static new/modified styling
+- **Diff-aware narrative:** LLM reads the diff + graph and generates a structured PR summary:
+  - "What changed and why it matters" per function
+  - Potential breaking changes and side effects (from `side_effects` metadata)
+  - Overall PR risk score (aggregate of node risks weighted by centrality)
+- **Review focus:** Prioritize reviewer attention:
+  - Rank affected files by risk × blast radius — "review this file first"
+  - Highlight critical paths: the shortest path from a changed function to a high-fan-in entry point
+  - Flag test coverage gaps for affected code (cross-reference with test file graph edges)
+- **Historical context overlay:**
+  - Annotate nodes with churn data: "this function changed 12 times in the last 30 days"
+  - Highlight fragile nodes: high churn + high fan-in = high breakage risk
+  - Track blast radius trends over time: "this PR's blast radius is 2× larger than your average"
+- **Interactive rendering (stretch):**
+  - Render as SVG with clickable nodes linking to file:line in the PR diff view
+  - Collapse/expand depth levels to manage large graphs
+  - Filter by risk level or file path
+
+**Infrastructure needed:**
+| What | Where | Depends on |
+|------|-------|------------|
+| GitHub Action workflow | `.github/workflows/impact-graph.yml` | `diff-impact --format mermaid` (done) |
+| LLM diff summarizer | `llm.js` + `queries.js` | LLM provider abstraction, `summaries` table |
+| Risk scoring per node | `nodes` table column | LLM assessment + graph centrality metrics |
+| Churn tracking | `metadata` table | Git log integration at build time |
+| SVG renderer | New module or external tool | Mermaid CLI (`mmdc`) or D3-based renderer |
+
 ---
 
 ### Refactoring Assistance
