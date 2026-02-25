@@ -827,6 +827,59 @@ export async function buildGraph(rootDir, opts = {}) {
     }
   }
 
+  // For incremental builds, buildStructure needs ALL files (not just changed ones)
+  // because it clears and rebuilds all contains edges and directory metrics.
+  // Load unchanged files from the DB so structure data stays complete.
+  if (!isFullBuild) {
+    const existingFiles = db.prepare("SELECT DISTINCT file FROM nodes WHERE kind = 'file'").all();
+    const defsByFile = db.prepare(
+      "SELECT name, kind, line FROM nodes WHERE file = ? AND kind != 'file' AND kind != 'directory'",
+    );
+    // Count imports per file — buildStructure only uses imports.length for metrics
+    const importCountByFile = db.prepare(
+      `SELECT COUNT(DISTINCT n2.file) AS cnt FROM edges e
+       JOIN nodes n1 ON e.source_id = n1.id
+       JOIN nodes n2 ON e.target_id = n2.id
+       WHERE n1.file = ? AND e.kind = 'imports'`,
+    );
+    const lineCountByFile = db.prepare(
+      `SELECT n.name AS file, m.line_count
+       FROM node_metrics m JOIN nodes n ON m.node_id = n.id
+       WHERE n.kind = 'file'`,
+    );
+    const cachedLineCounts = new Map();
+    for (const row of lineCountByFile.all()) {
+      cachedLineCounts.set(row.file, row.line_count);
+    }
+    let loadedFromDb = 0;
+    for (const { file: relPath } of existingFiles) {
+      if (!fileSymbols.has(relPath)) {
+        const importCount = importCountByFile.get(relPath)?.cnt || 0;
+        fileSymbols.set(relPath, {
+          definitions: defsByFile.all(relPath),
+          imports: new Array(importCount),
+          exports: [],
+        });
+        loadedFromDb++;
+      }
+      if (!lineCountMap.has(relPath)) {
+        const cached = cachedLineCounts.get(relPath);
+        if (cached != null) {
+          lineCountMap.set(relPath, cached);
+        } else {
+          const absPath = path.join(rootDir, relPath);
+          try {
+            const content = fs.readFileSync(absPath, 'utf-8');
+            lineCountMap.set(relPath, content.split('\n').length);
+          } catch {
+            lineCountMap.set(relPath, 0);
+          }
+        }
+      }
+    }
+    debug(`Structure: ${fileSymbols.size} files (${loadedFromDb} loaded from DB)`);
+  }
+
   // Build directory structure, containment edges, and metrics
   const relDirs = new Set();
   for (const absDir of discoveredDirs) {
@@ -837,6 +890,19 @@ export async function buildGraph(rootDir, opts = {}) {
     buildStructure(db, fileSymbols, rootDir, lineCountMap, relDirs);
   } catch (err) {
     debug(`Structure analysis failed: ${err.message}`);
+  }
+
+  // Classify node roles (entry, core, utility, adapter, dead, leaf)
+  try {
+    const { classifyNodeRoles } = await import('./structure.js');
+    const roleSummary = classifyNodeRoles(db);
+    debug(
+      `Roles: ${Object.entries(roleSummary)
+        .map(([r, c]) => `${r}=${c}`)
+        .join(', ')}`,
+    );
+  } catch (err) {
+    debug(`Role classification failed: ${err.message}`);
   }
 
   const nodeCount = db.prepare('SELECT COUNT(*) as c FROM nodes').get().c;
