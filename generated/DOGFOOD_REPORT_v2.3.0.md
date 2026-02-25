@@ -180,6 +180,69 @@ See Bug #1 below. Incremental builds corrupted structure data by clearing ALL `c
 
 **Perfect engine parity.** Both engines produce identical results across all metrics. This is a significant improvement over v2.1.0 which had parity gaps.
 
+### Performance Benchmarks
+
+#### Build Benchmark (`scripts/benchmark.js`)
+
+| Metric | v2.1.0 WASM (92 files) | v2.3.0 WASM (99 files) | Per-file delta |
+|--------|----------------------|----------------------|----------------|
+| Build time | 609ms (6.6ms/file) | 509ms (5.1ms/file) | -22% per file |
+| Query time | 1.9ms | 1.8ms | -5% |
+| Nodes | 527 (5.7/file) | 575 (5.8/file) | +2% |
+| Edges | 814 (8.8/file) | 897 (9.1/file) | +3% |
+| DB size | 344KB (3829B/file) | 372KB (3848B/file) | +0.5% |
+
+Build performance improved 22% per file vs v2.1.0. Node/edge counts grew slightly as the codebase grew from 92→99 files. No regressions.
+
+#### Incremental Benchmark (`scripts/incremental-benchmark.js`)
+
+| Metric | v2.3.0 WASM |
+|--------|-------------|
+| Full build | 474ms |
+| No-op rebuild | 4ms |
+| 1-file rebuild | 144ms |
+| Import resolution (84 pairs) | 1.9ms |
+
+No-op rebuilds complete in 4ms. Single-file incremental rebuilds take ~144ms (30% of full build for 1% of files).
+
+#### Query Benchmark (`scripts/query-benchmark.js`)
+
+| Metric | v2.3.0 WASM |
+|--------|-------------|
+| fnDeps depth 1 | 0.7ms |
+| fnDeps depth 3 | 1.8ms |
+| fnDeps depth 5 | 1.8ms |
+| fnImpact depth 1 | 0.7ms |
+| fnImpact depth 3 | 1.3ms |
+| fnImpact depth 5 | 1.3ms |
+| diff-impact | 13.7ms |
+
+Sub-2ms for all function-level queries. No depth scaling issues.
+
+#### Embedding Benchmark (`scripts/embedding-benchmark.js`)
+
+| Model | Hit@1 | Hit@3 | Hit@5 | Misses |
+|-------|-------|-------|-------|--------|
+| minilm (default) | 252/329 (76.6%) | 312/329 (94.8%) | 322/329 (97.9%) | 2 |
+| jina-small | 256/329 (77.8%) | 318/329 (96.7%) | 324/329 (98.5%) | 2 |
+| jina-base | 248/329 (75.4%) | 311/329 (94.5%) | 320/329 (97.3%) | 3 |
+| nomic | 278/329 (84.5%) | 326/329 (99.1%) | 329/329 (100%) | 0 |
+| nomic-v1.5 | 274/329 (83.3%) | 323/329 (98.2%) | 329/329 (100%) | 0 |
+| bge-large | FAIL (ONNX load error on Windows) | — | — | — |
+
+nomic and nomic-v1.5 achieve perfect Hit@5 (100%) with 0 misses. minilm (default) achieves strong 97.9% Hit@5 with the smallest model size.
+
+#### Fix Impact: Incremental Structure Rebuild (PR #91)
+
+| Metric | Before (main) | After (fix) | Delta |
+|--------|--------------|-------------|-------|
+| Full build | 416ms | 439ms | +23ms (+5.5%) |
+| No-op rebuild | 4ms | 4ms | 0 |
+| 1-file rebuild | 125ms | 159ms | +34ms (+27%) |
+| Import resolution | 2.0ms | 1.9ms | -0.1ms |
+
+The fix adds ~34ms to 1-file incremental rebuilds (loading 98 unchanged files from DB for structure rebuild). Acceptable trade-off for correct structure data.
+
 ---
 
 ## 6. Release-Specific Tests
