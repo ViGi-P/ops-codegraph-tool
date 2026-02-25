@@ -39,6 +39,7 @@ import {
   registerRepo,
   unregisterRepo,
 } from './registry.js';
+import { checkForUpdates, printUpdateNotification } from './update-check.js';
 import { watchProject } from './watcher.js';
 
 const __cliDir = path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Z]:)/i, '$1'));
@@ -56,6 +57,17 @@ program
   .hook('preAction', (thisCommand) => {
     const opts = thisCommand.opts();
     if (opts.verbose) setVerbose(true);
+  })
+  .hook('postAction', async (_thisCommand, actionCommand) => {
+    const name = actionCommand.name();
+    if (name === 'mcp' || name === 'watch') return;
+    if (actionCommand.opts().json) return;
+    try {
+      const result = await checkForUpdates(pkg.version);
+      if (result) printUpdateNotification(result.current, result.latest);
+    } catch {
+      /* never break CLI */
+    }
   });
 
 /**
