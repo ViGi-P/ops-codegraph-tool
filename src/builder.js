@@ -522,9 +522,9 @@ export async function buildGraph(rootDir, opts = {}) {
   }
 
   if (!isFullBuild && parseChanges.length === 0 && removed.length === 0) {
-    // Check if optional analysis was requested but never computed
+    // Check if default analyses were never computed (e.g. legacy DB)
     const needsCfg =
-      opts.cfg &&
+      opts.cfg !== false &&
       (() => {
         try {
           return db.prepare('SELECT COUNT(*) as c FROM cfg_blocks').get().c === 0;
@@ -533,16 +533,10 @@ export async function buildGraph(rootDir, opts = {}) {
         }
       })();
     const needsDataflow =
-      opts.dataflow &&
+      opts.dataflow !== false &&
       (() => {
         try {
-          return (
-            db
-              .prepare(
-                "SELECT COUNT(*) as c FROM edges WHERE kind IN ('flows_to','returns','mutates')",
-              )
-              .get().c === 0
-          );
+          return db.prepare('SELECT COUNT(*) as c FROM dataflow').get().c === 0;
         } catch {
           return true;
         }
@@ -1271,8 +1265,8 @@ export async function buildGraph(rootDir, opts = {}) {
   }
   _t.complexityMs = performance.now() - _t.complexity0;
 
-  // Opt-in CFG analysis (--cfg)
-  if (opts.cfg) {
+  // CFG analysis (skip with --no-cfg)
+  if (opts.cfg !== false) {
     _t.cfg0 = performance.now();
     try {
       const { buildCFGData } = await import('./cfg.js');
@@ -1283,8 +1277,8 @@ export async function buildGraph(rootDir, opts = {}) {
     _t.cfgMs = performance.now() - _t.cfg0;
   }
 
-  // Opt-in dataflow analysis (--dataflow)
-  if (opts.dataflow) {
+  // Dataflow analysis (skip with --no-dataflow)
+  if (opts.dataflow !== false) {
     _t.dataflow0 = performance.now();
     try {
       const { buildDataflowEdges } = await import('./dataflow.js');
@@ -1387,6 +1381,7 @@ export async function buildGraph(rootDir, opts = {}) {
       rolesMs: +_t.rolesMs.toFixed(1),
       complexityMs: +_t.complexityMs.toFixed(1),
       ...(_t.cfgMs != null && { cfgMs: +_t.cfgMs.toFixed(1) }),
+      ...(_t.dataflowMs != null && { dataflowMs: +_t.dataflowMs.toFixed(1) }),
     },
   };
 }
