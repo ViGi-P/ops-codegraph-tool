@@ -24,6 +24,16 @@ export { EXTENSIONS, IGNORE_DIRS } from './constants.js';
 export { findCycles } from './cycles.js';
 export { dataflowData } from './dataflow.js';
 export { buildEmbeddings, hybridSearchData, multiSearchData, searchData } from './embedder.js';
+export {
+  AnalysisError,
+  BoundaryError,
+  CodegraphError,
+  ConfigError,
+  DbError,
+  EngineError,
+  ParseError,
+  ResolutionError,
+} from './errors.js';
 export { exportDOT, exportJSON, exportMermaid } from './export.js';
 export { flowData, listEntryPointsData } from './flow.js';
 export { EVERY_EDGE_KIND, EVERY_SYMBOL_KIND } from './kinds.js';
