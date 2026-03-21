@@ -167,6 +167,12 @@ export function runLouvainUndirectedModularity(graph, optionsInput = {}) {
         options,
         level === 0 ? fixedNodeMask : null,
       );
+      // Post-refinement: split any disconnected communities into their
+      // connected components. This is the cheap O(V+E) alternative to
+      // checking γ-connectedness on every candidate during refinement.
+      // A disconnected community violates even basic connectivity, so
+      // splitting is always correct.
+      splitDisconnectedCommunities(graphAdapter, refined);
       renumberCommunities(refined, options.preserveLabels);
       effectivePartition = refined;
     }
@@ -229,6 +235,28 @@ function buildCoarseGraph(g, p) {
   return coarse;
 }
 
+/**
+ * True Leiden refinement phase (Algorithm 3, Traag et al. 2019).
+ *
+ * Key properties that distinguish this from Louvain-style refinement:
+ *
+ * 1. **Singleton start** — each node begins in its own community.
+ * 2. **Singleton guard** — only nodes still in singleton communities are
+ *    considered for merging. Once a node joins a non-singleton community
+ *    it is locked for the remainder of the pass. This prevents oscillation
+ *    and is essential for the γ-connectedness guarantee.
+ * 3. **Single pass** — one randomized sweep through all nodes, not an
+ *    iterative loop until convergence (that would be Louvain behavior).
+ * 4. **Probabilistic selection** — candidate communities are sampled from
+ *    a Boltzmann distribution `p(v, C) ∝ exp(ΔH / θ)`, with the "stay
+ *    as singleton" option (ΔH = 0) included in the distribution. This
+ *    means a node may probabilistically choose to remain alone even when
+ *    positive-gain merges exist.
+ *
+ * θ (refinementTheta) controls temperature: lower → more deterministic
+ * (approaches greedy), higher → more exploratory. Determinism is preserved
+ * via the seeded PRNG — same seed produces the same assignments.
+ */
 function refineWithinCoarseCommunities(g, basePart, rng, opts, fixedMask0) {
   const p = makePartition(g);
   p.initializeAggregates();
@@ -237,43 +265,142 @@ function refineWithinCoarseCommunities(g, basePart, rng, opts, fixedMask0) {
   const commMacro = new Int32Array(p.communityCount);
   for (let i = 0; i < p.communityCount; i++) commMacro[i] = macro[i];
 
+  const theta = typeof opts.refinementTheta === 'number' ? opts.refinementTheta : 1.0;
+
+  // Single pass in random order (Algorithm 3, step 2).
   const order = new Int32Array(g.n);
   for (let i = 0; i < g.n; i++) order[i] = i;
-  let improved = true;
-  let passes = 0;
-  while (improved) {
-    improved = false;
-    passes++;
-    shuffleArrayInPlace(order, rng);
-    for (let idx = 0; idx < order.length; idx++) {
-      const v = order[idx];
-      if (fixedMask0?.[v]) continue;
-      const macroV = macro[v];
-      const touchedCount = p.accumulateNeighborCommunityEdgeWeights(v);
-      let bestC = p.nodeCommunity[v];
-      let bestGain = 0;
-      const maxSize = Number.isFinite(opts.maxCommunitySize) ? opts.maxCommunitySize : Infinity;
-      for (let t = 0; t < touchedCount; t++) {
-        const c = p.getCandidateCommunityAt(t);
-        if (commMacro[c] !== macroV) continue;
-        if (maxSize < Infinity) {
-          const nextSize = p.getCommunityTotalSize(c) + g.size[v];
-          if (nextSize > maxSize) continue;
-        }
-        const gain = computeQualityGain(p, v, c, opts);
-        if (gain > bestGain) {
-          bestGain = gain;
-          bestC = c;
-        }
+  shuffleArrayInPlace(order, rng);
+
+  for (let idx = 0; idx < order.length; idx++) {
+    const v = order[idx];
+    if (fixedMask0?.[v]) continue;
+
+    // Singleton guard: only move nodes still alone in their community.
+    if (p.getCommunityNodeCount(p.nodeCommunity[v]) > 1) continue;
+
+    const macroV = macro[v];
+    const touchedCount = p.accumulateNeighborCommunityEdgeWeights(v);
+    const maxSize = Number.isFinite(opts.maxCommunitySize) ? opts.maxCommunitySize : Infinity;
+
+    // Collect eligible communities and their quality gains.
+    const candidates = [];
+    for (let t = 0; t < touchedCount; t++) {
+      const c = p.getCandidateCommunityAt(t);
+      if (c === p.nodeCommunity[v]) continue;
+      if (commMacro[c] !== macroV) continue;
+      if (maxSize < Infinity) {
+        const nextSize = p.getCommunityTotalSize(c) + g.size[v];
+        if (nextSize > maxSize) continue;
       }
-      if (bestC !== p.nodeCommunity[v] && bestGain > GAIN_EPSILON) {
-        p.moveNodeToCommunity(v, bestC);
-        improved = true;
+      const gain = computeQualityGain(p, v, c, opts);
+      if (gain > GAIN_EPSILON) {
+        candidates.push({ c, gain });
       }
     }
-    if (passes >= opts.maxLocalPasses) break;
+
+    if (candidates.length === 0) continue;
+
+    // Probabilistic selection: p(v, C) ∝ exp(ΔH / θ), with the "stay"
+    // option (ΔH = 0) included per Algorithm 3.
+    // For numerical stability, subtract the max gain before exponentiation.
+    const maxGain = candidates.reduce((m, x) => (x.gain > m ? x.gain : m), 0);
+    // "Stay as singleton" weight: exp((0 - maxGain) / theta)
+    const stayWeight = Math.exp((0 - maxGain) / theta);
+    let totalWeight = stayWeight;
+    for (let i = 0; i < candidates.length; i++) {
+      candidates[i].weight = Math.exp((candidates[i].gain - maxGain) / theta);
+      totalWeight += candidates[i].weight;
+    }
+
+    const r = rng() * totalWeight;
+    if (r < stayWeight) continue; // node stays as singleton
+
+    let cumulative = stayWeight;
+    let chosenC = candidates[candidates.length - 1].c; // fallback
+    for (let i = 0; i < candidates.length; i++) {
+      cumulative += candidates[i].weight;
+      if (r < cumulative) {
+        chosenC = candidates[i].c;
+        break;
+      }
+    }
+
+    p.moveNodeToCommunity(v, chosenC);
   }
   return p;
+}
+
+/**
+ * Post-refinement connectivity check.  For each community, run a BFS on
+ * the subgraph induced by its members (using the adapter's outEdges).
+ * If a community has multiple connected components, assign secondary
+ * components to new community IDs, then reinitialize aggregates once.
+ *
+ * O(V+E) total since communities partition V.
+ *
+ * This replaces the per-candidate γ-connectedness check from the paper
+ * with a cheaper post-step that catches the most important violation
+ * (disconnected subcommunities).
+ */
+function splitDisconnectedCommunities(g, partition) {
+  const n = g.n;
+  const nc = partition.nodeCommunity;
+  const members = partition.getCommunityMembers();
+  let nextC = partition.communityCount;
+  let didSplit = false;
+
+  const visited = new Uint8Array(n);
+  const inCommunity = new Uint8Array(n);
+
+  for (let c = 0; c < members.length; c++) {
+    const nodes = members[c];
+    if (nodes.length <= 1) continue;
+
+    for (let i = 0; i < nodes.length; i++) inCommunity[nodes[i]] = 1;
+
+    let componentCount = 0;
+    for (let i = 0; i < nodes.length; i++) {
+      const start = nodes[i];
+      if (visited[start]) continue;
+      componentCount++;
+
+      // BFS within the community subgraph.
+      const queue = [start];
+      visited[start] = 1;
+      let head = 0;
+      while (head < queue.length) {
+        const v = queue[head++];
+        const edges = g.outEdges[v];
+        for (let k = 0; k < edges.length; k++) {
+          const w = edges[k].to;
+          if (inCommunity[w] && !visited[w]) {
+            visited[w] = 1;
+            queue.push(w);
+          }
+        }
+      }
+
+      if (componentCount > 1) {
+        // Secondary component — assign new community ID directly.
+        const newC = nextC++;
+        for (let q = 0; q < queue.length; q++) nc[queue[q]] = newC;
+        didSplit = true;
+      }
+    }
+
+    for (let i = 0; i < nodes.length; i++) {
+      inCommunity[nodes[i]] = 0;
+      visited[nodes[i]] = 0;
+    }
+  }
+
+  if (didSplit) {
+    // Grow the partition's typed arrays to accommodate new community IDs,
+    // then recompute all aggregates from the updated nodeCommunity array.
+    partition.resizeCommunities(nextC);
+    partition.initializeAggregates();
+  }
 }
 
 function computeQualityGain(partition, v, c, opts) {
@@ -329,6 +456,8 @@ function normalizeOptions(options = {}) {
   const maxCommunitySize = Number.isFinite(options.maxCommunitySize)
     ? options.maxCommunitySize
     : Infinity;
+  const refinementTheta =
+    typeof options.refinementTheta === 'number' ? options.refinementTheta : 1.0;
   return {
     directed,
     randomSeed,
@@ -341,6 +470,7 @@ function normalizeOptions(options = {}) {
     refine,
     preserveLabels,
     maxCommunitySize,
+    refinementTheta,
     fixedNodes: options.fixedNodes,
   };
 }
