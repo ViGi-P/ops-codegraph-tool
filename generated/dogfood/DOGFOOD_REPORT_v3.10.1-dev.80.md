@@ -198,7 +198,7 @@ Built each `tests/benchmarks/resolution/fixtures/<lang>/` with both engines:
 
 ## 6. Release-Specific Tests (changes since v3.10.0)
 
-The v3.10.1-dev.80 series adds 12 native extractor ports (#1097–#1107), several language-specific fixes (#1109, #1122, #1123, #1124, #1127, #1128, #1158), a MCP enhancement (#1149), benchmark-stability fixes (#1119, #1120, #1131, #1133, #1134), and CI hardening (#1146, #1151, #1164).
+The v3.10.1-dev.80 series adds 11 native extractor ports (#1097–#1107), several language-specific fixes (#1109, #1122, #1123, #1124, #1127, #1128, #1158), a MCP enhancement (#1149), benchmark-stability fixes (#1119, #1120, #1131, #1133, #1134), and CI hardening (#1146, #1151, #1164).
 
 | Change | Test | Result |
 |--------|------|--------|
@@ -435,7 +435,7 @@ Either install into the right directory (the proposed fix) OR don't auto-install
 
 ## 12. Overall Assessment
 
-Codegraph v3.10.1-dev.80 is **a solid dev build** with 12 new native extractors landing at byte-identical parity to WASM, a useful MCP enhancement (`file_pattern` in `semantic_search`), and meaningful CI/benchmark hardening. The release-specific work is high quality — every change touched in the changelog held up to scrutiny.
+Codegraph v3.10.1-dev.80 is **a solid dev build** with 11 new native extractors landing at byte-identical parity to WASM, a useful MCP enhancement (`file_pattern` in `semantic_search`), and meaningful CI/benchmark hardening. The release-specific work is high quality — every change touched in the changelog held up to scrutiny.
 
 The two notable findings are:
 
@@ -465,3 +465,6 @@ The native receiver-edge gap (+36% vs WASM) is concerning per CLAUDE.md's "engin
 | Issue | [#1176](https://github.com/optave/ops-codegraph-tool/issues/1176) | bug: watch mode crashes with FOREIGN KEY constraint failed in rebuildFile | open |
 | Issue | [#1177](https://github.com/optave/ops-codegraph-tool/issues/1177) | bug: build command rejects --db flag, breaking workflow with non-default DB locations | open |
 | PR | [#1178](https://github.com/optave/ops-codegraph-tool/pull/1178) | fix(embed): install @huggingface/transformers into codegraph's host node_modules | open |
+| Issue[^1] | [#1181](https://github.com/optave/ops-codegraph-tool/issues/1181) | follow-up: complete jina-base (768d) embedding Hit@k benchmark for v3.10.1 dogfood report | open |
+
+[^1]: Filed post-session to track the deferred jina-base benchmark referenced in §8.
