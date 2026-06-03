@@ -22,6 +22,8 @@ import type {
   TypeMapEntry,
 } from '../../../../types.js';
 import { computeConfidence } from '../../resolve.js';
+import type { PointsToMap } from '../../resolver/points-to.js';
+import { buildPointsToMap, resolveViaPointsTo } from '../../resolver/points-to.js';
 import { enrichTypeMapWithTsc } from '../../resolver/ts-resolver.js';
 import {
   type CallNodeLookup,
@@ -562,6 +564,7 @@ function buildCallEdgesJS(
     const importedNames = buildImportedNamesMap(ctx, relPath, symbols, rootDir);
     const typeMap: Map<string, TypeMapEntry | string> = symbols.typeMap || new Map();
     const seenCallEdges = new Set<string>();
+    const ptsMap = buildPointsToMapForFile(symbols, importedNames);
 
     buildFileCallEdges(
       relPath,
@@ -572,6 +575,7 @@ function buildCallEdgesJS(
       lookup,
       allEdgeRows,
       typeMap,
+      ptsMap,
     );
     buildClassHierarchyEdges(ctx, relPath, symbols, allEdgeRows);
   }
@@ -616,6 +620,29 @@ function makeContextLookup(ctx: PipelineContext, getNodeIdStmt: NodeIdStmt): Cal
   };
 }
 
+/**
+ * Build a per-file points-to map for Phase 8.3 alias resolution.
+ * Returns null fast when the file has no function-reference bindings.
+ *
+ * Only callable definitions (function/method) are seeded as concrete targets.
+ * Class and interface names are intentionally excluded — aliasing a constructor
+ * (`const Svc = MyService`) is an uncommon pattern that would require tracking
+ * `new`-expression flows separately from the alias chain. That is left to Phase
+ * 8.2 call-assignment propagation, which already handles constructor assignments.
+ */
+function buildPointsToMapForFile(
+  symbols: ExtractorOutput,
+  importedNames: Map<string, string>,
+): PointsToMap | null {
+  if (!symbols.fnRefBindings?.length) return null;
+  const defNames = new Set(
+    symbols.definitions
+      .filter((d) => d.kind === 'function' || d.kind === 'method')
+      .map((d) => d.name),
+  );
+  return buildPointsToMap(symbols.fnRefBindings, defNames, importedNames);
+}
+
 function buildFileCallEdges(
   relPath: string,
   symbols: ExtractorOutput,
@@ -625,7 +652,15 @@ function buildFileCallEdges(
   lookup: CallNodeLookup,
   allEdgeRows: EdgeRowTuple[],
   typeMap: Map<string, TypeMapEntry | string>,
+  ptsMap?: PointsToMap | null,
 ): void {
+  // Tracks edges that were inserted by the pts fallback (edgeKey → allEdgeRows index).
+  // Kept separate from seenCallEdges so that a subsequent direct-call edge for the same
+  // caller→target pair can upgrade the confidence in-place rather than being silently
+  // dropped by the dedup guard. Once upgraded, the key moves to seenCallEdges and is
+  // no longer tracked here.
+  const ptsEdgeRows = new Map<string, number>();
+
   for (const call of symbols.calls) {
     if (call.receiver && BUILTIN_RECEIVERS.has(call.receiver)) continue;
 
@@ -641,10 +676,61 @@ function buildFileCallEdges(
 
     for (const t of targets) {
       const edgeKey = `${caller.id}|${t.id}`;
-      if (t.id !== caller.id && !seenCallEdges.has(edgeKey)) {
-        seenCallEdges.add(edgeKey);
+      if (t.id !== caller.id) {
         const confidence = computeConfidence(relPath, t.file, importedFrom ?? null);
-        allEdgeRows.push([caller.id, t.id, 'calls', confidence, isDynamic]);
+        if (seenCallEdges.has(edgeKey)) continue;
+        const ptsIdx = ptsEdgeRows.get(edgeKey);
+        if (ptsIdx !== undefined) {
+          // A pts-resolved edge already exists for this caller→target pair with a
+          // penalised confidence. Upgrade it to the direct-call confidence in-place,
+          // then promote to seenCallEdges so no further processing is needed.
+          const ptsRow = allEdgeRows[ptsIdx];
+          if (ptsRow) {
+            ptsRow[3] = confidence;
+            ptsRow[4] = isDynamic; // upgrade is_dynamic: direct call overrides the pts-alias dynamic flag
+          }
+          ptsEdgeRows.delete(edgeKey);
+          seenCallEdges.add(edgeKey);
+        } else {
+          seenCallEdges.add(edgeKey);
+          allEdgeRows.push([caller.id, t.id, 'calls', confidence, isDynamic]);
+        }
+      }
+    }
+
+    // Phase 8.3: points-to fallback for unresolved dynamic identifier calls.
+    // When primary resolution finds nothing and the call is flagged dynamic (i.e.
+    // it was emitted by extractCallbackReferenceCalls as a named function reference),
+    // check whether the call name is an alias in the pts map and retry resolution
+    // with each concrete target. Confidence is penalised by one hop to reflect the
+    // extra indirection.
+    //
+    // Note: pts edges are added to ptsEdgeRows (not seenCallEdges) so that a later
+    // direct call to the same target in the same function body can upgrade confidence
+    // rather than being silently dropped by the dedup guard.
+    if (targets.length === 0 && call.dynamic && !call.receiver && ptsMap) {
+      for (const alias of resolveViaPointsTo(call.name, ptsMap)) {
+        // Resolve the concrete alias target. Only `name` is needed here — receiver
+        // and line are not relevant for alias resolution (we are looking up the
+        // aliased function by name, not dispatching a method call).
+        const { targets: aliasTargets, importedFrom: aliasFrom } = resolveCallTargets(
+          lookup,
+          { name: alias },
+          relPath,
+          importedNames,
+          typeMap as Map<string, unknown>,
+        );
+        for (const t of aliasTargets) {
+          const edgeKey = `${caller.id}|${t.id}`;
+          if (t.id !== caller.id && !seenCallEdges.has(edgeKey) && !ptsEdgeRows.has(edgeKey)) {
+            const conf =
+              computeConfidence(relPath, t.file, aliasFrom ?? null) - PROPAGATION_HOP_PENALTY;
+            if (conf > 0) {
+              ptsEdgeRows.set(edgeKey, allEdgeRows.length);
+              allEdgeRows.push([caller.id, t.id, 'calls', conf, isDynamic]);
+            }
+          }
+        }
       }
     }
 
