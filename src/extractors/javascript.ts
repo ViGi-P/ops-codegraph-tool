@@ -639,9 +639,9 @@ function extractSymbolsWalk(tree: TreeSitterTree): ExtractorOutput {
   // Phase 8.3c: Extract call-site argument bindings for parameter-flow pts analysis
   extractParamBindingsWalk(tree.rootNode, ctx.paramBindings!);
   // Phase 8.3f: Extract object-destructuring rest-parameter bindings from function definitions
-  const objectRestParamBindingsWalk: ObjectRestParamBinding[] = [];
-  extractObjectRestParamBindingsWalk(tree.rootNode, objectRestParamBindingsWalk);
-  if (objectRestParamBindingsWalk.length) ctx.objectRestParamBindings = objectRestParamBindingsWalk;
+  const objectRestParamBindings: ObjectRestParamBinding[] = [];
+  extractObjectRestParamBindingsWalk(tree.rootNode, objectRestParamBindings);
+  if (objectRestParamBindings.length) ctx.objectRestParamBindings = objectRestParamBindings;
   // Phase 8.5: collect all `new X()` constructor names for RTA instantiation tracking
   const newExpressions: string[] = [];
   extractNewExpressionsWalk(tree.rootNode, newExpressions);
@@ -1604,7 +1604,7 @@ function handleVarDeclaratorTypeMap(
   // seeds `obj.e4 → e4`, `obj.handler → handler`. Only shorthand properties and
   // identifier-valued pairs are tracked; literal-valued properties (e.g. `{ x: 42 }`) are skipped.
   // This enables `eerest.e4()` resolution when `eerest` is a rest binding for an argument `obj`.
-  if (valueN?.type === 'object') {
+  if (valueN.type === 'object') {
     seedProtoProperties(nameN.text, valueN, typeMap);
   }
 }
