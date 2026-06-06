@@ -90,6 +90,13 @@ const BUILTIN_GLOBALS: Set<string> = new Set([
 const MAX_PROPAGATION_DEPTH = 3;
 /** Confidence penalty applied per propagation hop (1.0 → 0.9 → 0.8 → 0.7). */
 export const PROPAGATION_HOP_PENALTY = 0.1;
+/**
+ * Confidence for typeMap entries seeded from object-destructuring rest-parameter
+ * bindings (Phase 8.3f). Lower than direct-assignment confidence (0.85) because
+ * the binding is indirect: we know `rest` came from `obj` at a specific call site,
+ * but not which call site supplied the argument at runtime.
+ */
+export const REST_BINDING_CONFIDENCE = 0.65;
 
 /**
  * Extract symbols from a JS/TS parsed AST.

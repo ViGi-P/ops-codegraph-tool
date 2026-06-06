@@ -8,7 +8,10 @@ import path from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { getNodeId } from '../../../../db/index.js';
 import { setTypeMapEntry } from '../../../../extractors/helpers.js';
-import { PROPAGATION_HOP_PENALTY } from '../../../../extractors/javascript.js';
+import {
+  PROPAGATION_HOP_PENALTY,
+  REST_BINDING_CONFIDENCE,
+} from '../../../../extractors/javascript.js';
 import { debug } from '../../../../infrastructure/logger.js';
 import { loadNative } from '../../../../infrastructure/native.js';
 import type {
@@ -841,12 +844,20 @@ function buildCallEdgesJS(
     // rest parameter binding cross-referenced with call-site argument bindings.
     // e.g. function f({ a, ...rest }) called as f(obj) → typeMap['rest'] = { type: 'obj' }
     // so that `rest.method()` resolves via typeMap['obj.method'].
+    //
+    // Note: the `!typeMap.has(orpb.restName)` guard implements first-call-site-wins semantics.
+    // When the same function is called from multiple sites with different argument types
+    // (e.g. `f(objA)` then `f(objB)`), only the first matching argName seeds the typeMap.
+    // This is an accepted limitation of the single-typeMap-per-file model: we get correct
+    // edges for the first argument type; edges exercised only via the second argument's
+    // properties are not emitted. A multi-typeMap or constraint-based solver would be
+    // needed to cover all call sites.
     if (symbols.objectRestParamBindings?.length && symbols.paramBindings?.length) {
       for (const orpb of symbols.objectRestParamBindings) {
         for (const pb of symbols.paramBindings) {
           if (pb.callee === orpb.callee && pb.argIndex === orpb.argIndex) {
             if (!typeMap.has(orpb.restName)) {
-              typeMap.set(orpb.restName, { type: pb.argName, confidence: 0.65 });
+              typeMap.set(orpb.restName, { type: pb.argName, confidence: REST_BINDING_CONFIDENCE });
             }
           }
         }
