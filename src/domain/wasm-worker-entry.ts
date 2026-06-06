@@ -806,6 +806,10 @@ function serializeExtractorOutput(
     astNodes,
     ...(symbols.fnRefBindings?.length ? { fnRefBindings: symbols.fnRefBindings } : {}),
     ...(symbols.newExpressions?.length ? { newExpressions: symbols.newExpressions } : {}),
+    ...(symbols.returnTypeMap?.size
+      ? { returnTypeMap: Array.from(symbols.returnTypeMap.entries()) }
+      : {}),
+    ...(symbols.callAssignments?.length ? { callAssignments: symbols.callAssignments } : {}),
     ...(symbols.paramBindings?.length ? { paramBindings: symbols.paramBindings } : {}),
     ...(symbols.objectRestParamBindings?.length
       ? { objectRestParamBindings: symbols.objectRestParamBindings }
