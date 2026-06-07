@@ -674,13 +674,6 @@ export interface ExtractorOutput {
   /** Phase 8.3f: object-property bindings from `const obj = { fn }` patterns. */
   objectPropBindings?: ObjectPropBinding[];
   /**
-   * Object-destructuring rest-parameter bindings (Phase 8.3f).
-   * Records `function f({ a, ...rest })` patterns so the edge builder can seed
-   * typeMap[rest] = { type: argName } when `f(obj)` is called with an identifier,
-   * enabling `rest.method()` calls to resolve via the seeded object's typeMap entries.
-   */
-  objectRestParamBindings?: ObjectRestParamBinding[];
-  /**
    * Phase 8.5 (RTA): constructor names from all `new X()` expressions in the file,
    * including unassigned ones (e.g. `doSomething(new Foo())`). Used to build the
    * project-wide instantiated-types set for Rapid Type Analysis filtering.
