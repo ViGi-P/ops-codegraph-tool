@@ -1,0 +1,14 @@
+# HuggingFace model IDs used by the embedding benchmark.
+# Update this file when adding or removing models in codegraph's MODELS registry
+# (src/domain/search/models.ts) so the CI cache key stays aligned.
+jinaai/jina-embeddings-v2-base-code
+mixedbread-ai/mxbai-embed-large-v1
+mixedbread-ai/mxbai-embed-xsmall-v1
+nomic-ai/modernbert-embed-base
+nomic-ai/nomic-embed-text-v1.5
+Xenova/all-MiniLM-L6-v2
+Xenova/bge-large-en-v1.5
+Xenova/bge-m3
+Xenova/jina-embeddings-v2-base-en
+Xenova/jina-embeddings-v2-small-en
+Xenova/nomic-embed-text-v1
