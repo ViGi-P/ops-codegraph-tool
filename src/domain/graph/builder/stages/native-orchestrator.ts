@@ -531,13 +531,10 @@ function runPostNativeCha(
       if (row) gateAFired = true;
     }
 
-    // Gate B: calls from changed-file sources to class-kind targets (or
-    // constructor/function-kind targets in the older native engine fallback schema)?
-    // Mirrors the two-shape RTA seed: primary checks `tgt.kind = 'class'`; older
-    // native engine schemas record constructor calls against `constructor`/`function`
-    // kinds instead. Including all three kinds here prevents Gate B from silently
-    // passing on older-schema DBs, which would incorrectly set scopeToChangedFiles
-    // and miss CHA edges whose RTA evidence lives in the fallback-schema rows.
+    // Gate B: calls from changed-file sources to class/instantiable-kind targets
+    // (also covers older-schema fallback and future CHA extensions to struct/record).
+    // Includes class/interface/trait/struct/record (future CHA extension safety) and
+    // constructor/function (older native engine schema fallback).
     let gateBFired = false;
     if (!gateAFired) {
       for (let i = 0; i < changedFiles.length && !gateBFired; i += CHUNK_SIZE) {
@@ -549,7 +546,7 @@ function runPostNativeCha(
              JOIN nodes src ON e.source_id = src.id
              JOIN nodes tgt ON e.target_id = tgt.id
              WHERE e.kind = 'calls'
-             AND tgt.kind IN ('class', 'constructor', 'function')
+             AND tgt.kind IN ('class', 'interface', 'trait', 'struct', 'record', 'constructor', 'function')
              AND src.file IN (${ph})
              LIMIT 1`,
           )
@@ -665,6 +662,7 @@ function runPostNativeCha(
             method_file: string | null;
           }>;
           for (const methodNode of methodNodes) {
+            if (methodNode.id === source_id) continue; // skip self-loops
             const key = `${source_id}|${methodNode.id}`;
             if (seen.has(key)) continue;
             seen.add(key);
@@ -912,6 +910,7 @@ async function runPostNativeThisDispatch(
       );
 
       for (const t of targets) {
+        if (t.id === callerRow.id) continue; // skip self-loops
         const key = `${callerRow.id}|${t.id}`;
         if (seen.has(key)) continue;
         seen.add(key);
