@@ -15,7 +15,13 @@ import {
   MIGRATIONS,
   openDb,
 } from '../../../db/index.js';
-import { detectWorkspaces, loadConfig } from '../../../infrastructure/config.js';
+import {
+  computeConfigHash,
+  detectWorkspaces,
+  getLastAppliedGlobalPath,
+  loadConfig,
+  promptForConsentIfNeeded,
+} from '../../../infrastructure/config.js';
 import { debug, info, warn } from '../../../infrastructure/logger.js';
 import { loadNative } from '../../../infrastructure/native.js';
 import { toErrorMessage } from '../../../shared/errors.js';
@@ -114,6 +120,16 @@ function checkEngineSchemaMismatch(ctx: PipelineContext): void {
     );
     ctx.forceFullRebuild = true;
   }
+
+  // Config hash — promotes to full rebuild when build-relevant config changes
+  // (include/exclude/ignoreDirs/extensions/aliases/build.*).
+  // This closes the pre-existing config-change gap and covers the new global-config layer.
+  const currentConfigHash = computeConfigHash(ctx.config);
+  const prevConfigHash = meta('config_hash');
+  if (prevConfigHash && prevConfigHash !== currentConfigHash) {
+    info('Build-relevant config changed, promoting to full rebuild.');
+    ctx.forceFullRebuild = true;
+  }
 }
 
 function warnOnEmbeddingsWipe(ctx: PipelineContext): void {
@@ -172,7 +188,7 @@ function setupPipeline(ctx: PipelineContext): void {
   ctx.db = openDb(ctx.dbPath);
   initSchema(ctx.db);
 
-  ctx.config = loadConfig(ctx.rootDir);
+  ctx.config = loadConfig(ctx.rootDir, { userConfig: ctx.opts.userConfig });
   // Merge caller-supplied excludes on top of the file-config excludes so
   // programmatic callers (e.g. benchmark scripts) can extend exclusion
   // without mutating .codegraphrc.json. Native orchestrator picks this up
@@ -185,6 +201,35 @@ function setupPipeline(ctx: PipelineContext): void {
   }
   ctx.incremental =
     ctx.opts.incremental !== false && ctx.config.build && ctx.config.build.incremental !== false;
+
+  // ── Build-time global-config notice ──────────────────────────────
+  const appliedGlobalPath = getLastAppliedGlobalPath();
+  if (appliedGlobalPath) {
+    const buildAffectingKeys = [
+      'include',
+      'exclude',
+      'ignoreDirs',
+      'extensions',
+      'aliases',
+      'build',
+    ];
+    try {
+      const raw = JSON.parse(fs.readFileSync(appliedGlobalPath, 'utf-8')) as Record<
+        string,
+        unknown
+      >;
+      const globalData: Record<string, unknown> =
+        'appliesTo' in raw && raw.config ? (raw.config as Record<string, unknown>) : raw;
+      const injectedKeys = buildAffectingKeys.filter((k) => k in globalData);
+      if (injectedKeys.length > 0) {
+        process.stderr.write(
+          `ℹ global config applied (${appliedGlobalPath}) — injecting: ${injectedKeys.join(', ')} · --no-user-config to ignore\n`,
+        );
+      }
+    } catch {
+      // Non-critical — skip on any read error
+    }
+  }
 
   initializeEngine(ctx);
   checkEngineSchemaMismatch(ctx);
@@ -348,6 +393,12 @@ export async function buildGraph(
   ctx.rootDir = rootDir;
 
   try {
+    // Interactive consent prompt — only fires when the caller opts in (build
+    // command with TTY), a global file exists, and the repo is undecided.
+    if (opts.promptForConsent) {
+      await promptForConsentIfNeeded(rootDir);
+    }
+
     setupPipeline(ctx);
 
     // ── JS-side fast-skip for native incremental (#1054) ──────────────
