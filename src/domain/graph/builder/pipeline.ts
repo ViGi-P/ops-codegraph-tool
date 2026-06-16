@@ -18,6 +18,7 @@ import {
 import {
   computeConfigHash,
   detectWorkspaces,
+  getLastAppliedGlobalConfig,
   getLastAppliedGlobalPath,
   loadConfig,
   promptForConsentIfNeeded,
@@ -203,6 +204,8 @@ function setupPipeline(ctx: PipelineContext): void {
     ctx.opts.incremental !== false && ctx.config.build && ctx.config.build.incremental !== false;
 
   // ── Build-time global-config notice ──────────────────────────────
+  // Use the already-parsed and sanitized global config cached by loadConfig —
+  // avoids a second disk read and the TOCTOU window between loadConfig and here.
   const appliedGlobalPath = getLastAppliedGlobalPath();
   if (appliedGlobalPath) {
     const buildAffectingKeys = [
@@ -213,21 +216,14 @@ function setupPipeline(ctx: PipelineContext): void {
       'aliases',
       'build',
     ];
-    try {
-      const raw = JSON.parse(fs.readFileSync(appliedGlobalPath, 'utf-8')) as Record<
-        string,
-        unknown
-      >;
-      const globalData: Record<string, unknown> =
-        'appliesTo' in raw && raw.config ? (raw.config as Record<string, unknown>) : raw;
+    const globalData = getLastAppliedGlobalConfig();
+    if (globalData) {
       const injectedKeys = buildAffectingKeys.filter((k) => k in globalData);
       if (injectedKeys.length > 0) {
         process.stderr.write(
           `ℹ global config applied (${appliedGlobalPath}) — injecting: ${injectedKeys.join(', ')} · --no-user-config to ignore\n`,
         );
       }
-    } catch {
-      // Non-critical — skip on any read error
     }
   }
 

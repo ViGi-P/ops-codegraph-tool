@@ -215,17 +215,19 @@ export function resolveUserConfigPath(): string | null {
 
   const home = os.homedir();
 
+  // XDG_CONFIG_HOME takes priority on all platforms when explicitly set.
+  // Falls back to %APPDATA% on Windows, or ~/.config on Unix/macOS.
   let platformDefault: string;
-  if (process.platform === 'win32') {
+  const xdgConfig = process.env.XDG_CONFIG_HOME;
+  if (xdgConfig) {
+    platformDefault = path.join(xdgConfig, 'codegraph', 'config.json');
+  } else if (process.platform === 'win32') {
     const appdata = process.env.APPDATA;
     platformDefault = appdata
       ? path.join(appdata, 'codegraph', 'config.json')
       : path.join(home, '.config', 'codegraph', 'config.json');
   } else {
-    const xdgConfig = process.env.XDG_CONFIG_HOME;
-    platformDefault = xdgConfig
-      ? path.join(xdgConfig, 'codegraph', 'config.json')
-      : path.join(home, '.config', 'codegraph', 'config.json');
+    platformDefault = path.join(home, '.config', 'codegraph', 'config.json');
   }
 
   if (fs.existsSync(platformDefault)) return platformDefault;
@@ -390,10 +392,16 @@ function resolveConsent(
   return { applied: false, globalPath, consentDecision: undefined };
 }
 
-// Last applied global path — exposed so pipeline can emit the build-time notice.
+// Last applied global path and parsed data — exposed so pipeline.ts and
+// loadConfigWithProvenance can reuse the already-parsed file contents without a
+// second disk read (eliminating the TOCTOU window between loadConfig and callers).
 let _lastAppliedGlobalPath: string | null = null;
+let _lastAppliedGlobalConfig: Record<string, unknown> | null = null;
 export function getLastAppliedGlobalPath(): string | null {
   return _lastAppliedGlobalPath;
+}
+export function getLastAppliedGlobalConfig(): Record<string, unknown> | null {
+  return _lastAppliedGlobalConfig;
 }
 
 // ── Build-relevant config hash ──────────────────────────────────────────
@@ -508,10 +516,14 @@ export function loadConfig(cwd?: string, opts?: LoadConfigOpts): CodegraphConfig
 
   // Cache key includes applied global path and override flag so toggled consent is reflected
   const cacheKey = `${cwd}::${applied ? (globalPath ?? 'default') : 'none'}`;
+  // Always update _lastAppliedGlobalPath/_lastAppliedGlobalConfig before returning —
+  // on a cache hit the previous call may have been for a different repo or different
+  // opts, so stale values here would misbehave for programmatic callers making
+  // multiple buildGraph calls in the same process.
+  _lastAppliedGlobalPath = applied ? globalPath : null;
+  _lastAppliedGlobalConfig = null; // updated below if a global file is loaded
   const cached = _configCache.get(cacheKey);
   if (cached) return structuredClone(cached);
-
-  _lastAppliedGlobalPath = applied ? globalPath : null;
 
   // ── Layer 0: DEFAULTS ─────────────────────────────────────────────
   let merged = DEFAULTS as unknown as Record<string, unknown>;
@@ -522,6 +534,9 @@ export function loadConfig(cwd?: string, opts?: LoadConfigOpts): CodegraphConfig
     if (userFileData) {
       debug(`Applying global user config from ${globalPath}`);
       const sanitized = sanitizeUserLayer(userFileData.globalConfig);
+      // Cache the sanitized global data so pipeline.ts and loadConfigWithProvenance
+      // can use it without a second disk read (eliminates TOCTOU window).
+      _lastAppliedGlobalConfig = sanitized;
       merged = mergeConfig(merged, sanitized);
       merged = applyExcludeTestsShorthand(merged, sanitized);
     }
@@ -563,6 +578,10 @@ export function clearConfigCache(): void {
 /**
  * Load config and return it together with per-key provenance information.
  * Used by `codegraph config --explain`.
+ *
+ * Calls loadConfig first so _lastAppliedGlobalConfig is populated, then uses
+ * that cached data for the global-layer provenance — avoiding a second disk
+ * read and eliminating the TOCTOU window between the two reads.
  */
 export function loadConfigWithProvenance(
   cwd?: string,
@@ -576,30 +595,28 @@ export function loadConfigWithProvenance(
     opts?.registryPath,
   );
 
+  // Load (or return from cache) the merged config first — this also populates
+  // _lastAppliedGlobalConfig with the already-parsed and sanitized global layer.
+  const config = loadConfig(cwd, opts);
+
   // Build provenance by tracking which layer supplies each top-level key
   const provenance: Record<string, ConfigSource> = {};
 
   // Layer 0: defaults — everything starts as 'default'
   for (const k of Object.keys(DEFAULTS)) provenance[k] = 'default';
 
-  // Layer 1: global
-  let globalRaw: Record<string, unknown> | null = null;
-  if (applied && globalPath) {
-    const userFileData = loadUserConfigFile(globalPath);
-    if (userFileData) {
-      globalRaw = sanitizeUserLayer(userFileData.globalConfig);
-      for (const k of Object.keys(globalRaw)) provenance[k] = 'user';
-    }
+  // Layer 1: global — reuse the data loadConfig already parsed (no second disk read)
+  const globalRaw = applied && globalPath ? _lastAppliedGlobalConfig : null;
+  if (globalRaw) {
+    for (const k of Object.keys(globalRaw)) provenance[k] = 'user';
   }
 
   // Layer 2: project
-  let projectRaw: Record<string, unknown> | null = null;
   for (const name of CONFIG_FILES) {
     const filePath = path.join(cwd, name);
     if (fs.existsSync(filePath)) {
       try {
         const raw = JSON.parse(fs.readFileSync(filePath, 'utf-8')) as Record<string, unknown>;
-        projectRaw = raw;
         for (const k of Object.keys(raw)) provenance[k] = 'project';
         break;
       } catch {
@@ -614,10 +631,6 @@ export function loadConfigWithProvenance(
     provenance.llm = 'env';
   }
 
-  void globalRaw;
-  void projectRaw; // used for provenance tracking above
-
-  const config = loadConfig(cwd, opts);
   return { config, provenance, appliedGlobalPath: applied ? globalPath : null, consentDecision };
 }
 

@@ -137,15 +137,10 @@ export const command: CommandDefinition = {
     const consent = getUserConfigConsent(rootDir);
     const config = loadConfig(rootDir, { userConfig: ctx.program.opts().userConfig });
 
-    if (opts.json) {
-      process.stdout.write(`${JSON.stringify(config, null, 2)}\n`);
-      return;
-    }
-
-    // Print a short summary with a discovery hint if relevant
+    // Print effective config — always JSON; discovery hint only in non-JSON mode
     process.stdout.write(`${JSON.stringify(config, null, 2)}\n`);
 
-    if (globalPath && !consent) {
+    if (!opts.json && globalPath && !consent) {
       process.stderr.write(
         `\nℹ Global config found at ${globalPath} — not applied to this repo.\n` +
           `  Run \`codegraph config --enable-global\` to opt in, or\n` +
