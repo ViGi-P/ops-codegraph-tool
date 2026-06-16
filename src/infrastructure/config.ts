@@ -185,11 +185,15 @@ let _userConfigOverride: string | boolean | undefined;
 export function setUserConfigOverride(v: string | boolean | undefined): void {
   _userConfigOverride = v;
   _configCache.clear();
+  _globalConfigCache.clear();
 }
 
 // Per-cwd config cache — avoids re-reading the config file on every query call.
 // Key includes the applied global path so toggled flags/consent are reflected.
 const _configCache = new Map<string, CodegraphConfig>();
+// Parallel cache for the sanitized global layer — needed so loadConfigWithProvenance
+// can correctly attribute global-layer keys even on a _configCache hit.
+const _globalConfigCache = new Map<string, Record<string, unknown> | null>();
 
 // ── Global config file location ─────────────────────────────────────────
 
@@ -523,7 +527,11 @@ export function loadConfig(cwd?: string, opts?: LoadConfigOpts): CodegraphConfig
   _lastAppliedGlobalPath = applied ? globalPath : null;
   _lastAppliedGlobalConfig = null; // updated below if a global file is loaded
   const cached = _configCache.get(cacheKey);
-  if (cached) return structuredClone(cached);
+  if (cached) {
+    // Restore global config so loadConfigWithProvenance gets correct provenance on cache hits.
+    _lastAppliedGlobalConfig = _globalConfigCache.get(cacheKey) ?? null;
+    return structuredClone(cached);
+  }
 
   // ── Layer 0: DEFAULTS ─────────────────────────────────────────────
   let merged = DEFAULTS as unknown as Record<string, unknown>;
@@ -563,6 +571,7 @@ export function loadConfig(cwd?: string, opts?: LoadConfigOpts): CodegraphConfig
   // ── Layers 3–4: env overrides + secret resolution ─────────────────
   const result = resolveSecrets(applyEnvOverrides(merged as unknown as CodegraphConfig));
   _configCache.set(cacheKey, structuredClone(result));
+  _globalConfigCache.set(cacheKey, _lastAppliedGlobalConfig);
   return result;
 }
 
@@ -573,6 +582,7 @@ export function loadConfig(cwd?: string, opts?: LoadConfigOpts): CodegraphConfig
  */
 export function clearConfigCache(): void {
   _configCache.clear();
+  _globalConfigCache.clear();
 }
 
 /**

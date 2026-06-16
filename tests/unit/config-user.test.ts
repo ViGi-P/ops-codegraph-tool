@@ -319,6 +319,20 @@ describe('loadConfigWithProvenance', () => {
     const { provenance } = loadConfigWithProvenance(dir, { userConfig: globalFile });
     expect(provenance.exclude).toBe('project');
   });
+
+  it('returns correct user provenance even when loadConfig was called first (cache-hit path)', () => {
+    const globalFile = path.join(tmpDir, 'prov-cache-hit.json');
+    fs.writeFileSync(globalFile, JSON.stringify({ exclude: ['**/*.gen.*'] }));
+
+    const dir = fs.mkdtempSync(path.join(tmpDir, 'prov-cache-'));
+    const opts = { userConfig: globalFile };
+
+    // Prime the cache
+    loadConfig(dir, opts);
+    // Second call hits the cache — _lastAppliedGlobalConfig must be restored
+    const { provenance } = loadConfigWithProvenance(dir, opts);
+    expect(provenance.exclude).toBe('user');
+  });
 });
 
 // ── setUserConfigOverride integration ────────────────────────────────
