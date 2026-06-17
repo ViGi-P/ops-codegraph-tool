@@ -2035,8 +2035,6 @@ function collectFnRefBindings(
  *   1. Object.create({ ... }) — seeds composite pts keys from the prototype object (Phase 8.3e)
  *   2. Inter-procedural return-type propagation via returnTypeMap (Phase 8.2)
  *   3. Factory method heuristic: `const x = Foo.create()` → type Foo at confidence 0.7
- *
- * Returns true if the declarator was fully handled (caller should return).
  */
 function handleCallExprTypeMap(
   lhsName: string,
@@ -2044,7 +2042,7 @@ function handleCallExprTypeMap(
   typeMap: Map<string, TypeMapEntry>,
   returnTypeMap: Map<string, TypeMapEntry> | undefined,
   callAssignments: CallAssignment[] | undefined,
-): boolean {
+): void {
   const createFn = valueN.childForFieldName('function');
   // Phase 8.3e: Object.create({ f1, f2 }) — seed composite pts keys obj.f1 → f1, etc.
   if (createFn?.type === 'member_expression') {
@@ -2065,7 +2063,7 @@ function handleCallExprTypeMap(
           seedProtoProperties(lhsName, proto, typeMap);
         }
       }
-      return true;
+      return;
     }
   }
   // Phase 8.2: inter-procedural propagation — try to resolve return type from
@@ -2074,7 +2072,7 @@ function handleCallExprTypeMap(
     const result = resolveCallExprReturnType(valueN, typeMap, returnTypeMap, 0);
     if (result) {
       setTypeMapEntry(typeMap, lhsName, result.type, result.confidence);
-      return true;
+      return;
     }
   }
   // Record for cross-file resolution in build-edges.ts (imported functions)
@@ -2091,7 +2089,6 @@ function handleCallExprTypeMap(
       }
     }
   }
-  return false;
 }
 
 /**
