@@ -697,8 +697,16 @@ export function applyEnvOverrides(config: CodegraphConfig): CodegraphConfig {
   }
   // Engine selection: CODEGRAPH_ENGINE env always wins over config-file value.
   if (process.env.CODEGRAPH_ENGINE !== undefined) {
-    const val = process.env.CODEGRAPH_ENGINE as 'auto' | 'native' | 'wasm';
-    (config.build as Record<string, unknown>).engine = val;
+    const raw = process.env.CODEGRAPH_ENGINE;
+    const valid = ['auto', 'native', 'wasm'] as const;
+    if ((valid as readonly string[]).includes(raw)) {
+      (config.build as Record<string, unknown>).engine = raw as 'auto' | 'native' | 'wasm';
+    } else {
+      warn(
+        `CODEGRAPH_ENGINE="${raw}" is not a valid engine value (expected auto|native|wasm). Falling back to "auto".`,
+      );
+      (config.build as Record<string, unknown>).engine = 'auto';
+    }
   }
   // Fast-skip diagnostic flag.
   if (process.env.CODEGRAPH_FAST_SKIP_DIAG !== undefined) {
