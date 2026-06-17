@@ -157,17 +157,27 @@ interface ManifestoOpts {
   offset?: number;
 }
 
-function evaluateFunctionRules(
-  db: BetterSqlite3Database,
+interface EvaluateRulesContext {
+  defs: RuleDef[];
+  rows: Array<Record<string, unknown>>;
+}
+
+/**
+ * Shared rule-evaluation loop used by both evaluateFunctionRules and evaluateFileRules.
+ * Iterates rows, applies threshold checks for each active rule definition, and
+ * accumulates violations + per-rule worst-status tracking into ruleResults.
+ */
+function evaluateRules(
+  ctx: EvaluateRulesContext,
   rules: ResolvedRules,
-  opts: ManifestoOpts,
   violations: Violation[],
   ruleResults: RuleResult[],
 ): void {
-  const functionDefs = RULE_DEFS.filter((d) => d.level === 'function');
-  const activeDefs = functionDefs.filter((d) => isEnabled(rules[d.name]!));
+  const { defs, rows } = ctx;
+  const activeDefs = defs.filter((d) => isEnabled(rules[d.name]!));
+
   if (activeDefs.length === 0) {
-    for (const def of functionDefs) {
+    for (const def of defs) {
       ruleResults.push({
         name: def.name,
         level: def.level,
@@ -178,6 +188,51 @@ function evaluateFunctionRules(
     }
     return;
   }
+
+  const worst: Record<string, string> = {};
+  const counts: Record<string, number> = {};
+  for (const def of defs) {
+    worst[def.name] = 'pass';
+    counts[def.name] = 0;
+  }
+
+  for (const row of rows) {
+    for (const def of activeDefs) {
+      const value = row[def.metric] as number | null;
+      if (value == null) continue;
+      const meta = {
+        name: row.name as string,
+        file: row.file as string,
+        line: row.line as number,
+      };
+      const status = checkThreshold(def.name, rules[def.name]!, value, meta, violations);
+      if (status !== 'pass') {
+        counts[def.name] = (counts[def.name] ?? 0) + 1;
+        if (status === 'fail') worst[def.name] = 'fail';
+        else if (worst[def.name] !== 'fail') worst[def.name] = 'warn';
+      }
+    }
+  }
+
+  for (const def of defs) {
+    ruleResults.push({
+      name: def.name,
+      level: def.level,
+      status: worst[def.name]!,
+      thresholds: rules[def.name]!,
+      violationCount: counts[def.name] ?? 0,
+    });
+  }
+}
+
+function evaluateFunctionRules(
+  db: BetterSqlite3Database,
+  rules: ResolvedRules,
+  opts: ManifestoOpts,
+  violations: Violation[],
+  ruleResults: RuleResult[],
+): void {
+  const defs = RULE_DEFS.filter((d) => d.level === 'function');
 
   let where = "WHERE n.kind IN ('function','method')";
   const params: unknown[] = [];
@@ -208,41 +263,7 @@ function evaluateFunctionRules(
     rows = [];
   }
 
-  // Track worst status per rule
-  const worst: Record<string, string> = {};
-  const counts: Record<string, number> = {};
-  for (const def of functionDefs) {
-    worst[def.name] = 'pass';
-    counts[def.name] = 0;
-  }
-
-  for (const row of rows) {
-    for (const def of activeDefs) {
-      const value = row[def.metric] as number | null;
-      if (value == null) continue;
-      const meta = {
-        name: row.name as string,
-        file: row.file as string,
-        line: row.line as number,
-      };
-      const status = checkThreshold(def.name, rules[def.name]!, value, meta, violations);
-      if (status !== 'pass') {
-        counts[def.name] = (counts[def.name] ?? 0) + 1;
-        if (status === 'fail') worst[def.name] = 'fail';
-        else if (worst[def.name] !== 'fail') worst[def.name] = 'warn';
-      }
-    }
-  }
-
-  for (const def of functionDefs) {
-    ruleResults.push({
-      name: def.name,
-      level: def.level,
-      status: worst[def.name]!,
-      thresholds: rules[def.name]!,
-      violationCount: counts[def.name] ?? 0,
-    });
-  }
+  evaluateRules({ defs, rows }, rules, violations, ruleResults);
 }
 
 function evaluateFileRules(
@@ -252,20 +273,7 @@ function evaluateFileRules(
   violations: Violation[],
   ruleResults: RuleResult[],
 ): void {
-  const fileDefs = RULE_DEFS.filter((d) => d.level === 'file');
-  const activeDefs = fileDefs.filter((d) => isEnabled(rules[d.name]!));
-  if (activeDefs.length === 0) {
-    for (const def of fileDefs) {
-      ruleResults.push({
-        name: def.name,
-        level: def.level,
-        status: 'pass',
-        thresholds: rules[def.name]!,
-        violationCount: 0,
-      });
-    }
-    return;
-  }
+  const defs = RULE_DEFS.filter((d) => d.level === 'file');
 
   let where = "WHERE n.kind = 'file'";
   const params: unknown[] = [];
@@ -293,40 +301,7 @@ function evaluateFileRules(
     rows = [];
   }
 
-  const worst: Record<string, string> = {};
-  const counts: Record<string, number> = {};
-  for (const def of fileDefs) {
-    worst[def.name] = 'pass';
-    counts[def.name] = 0;
-  }
-
-  for (const row of rows) {
-    for (const def of activeDefs) {
-      const value = row[def.metric] as number | null;
-      if (value == null) continue;
-      const meta = {
-        name: row.name as string,
-        file: row.file as string,
-        line: row.line as number,
-      };
-      const status = checkThreshold(def.name, rules[def.name]!, value, meta, violations);
-      if (status !== 'pass') {
-        counts[def.name] = (counts[def.name] ?? 0) + 1;
-        if (status === 'fail') worst[def.name] = 'fail';
-        else if (worst[def.name] !== 'fail') worst[def.name] = 'warn';
-      }
-    }
-  }
-
-  for (const def of fileDefs) {
-    ruleResults.push({
-      name: def.name,
-      level: def.level,
-      status: worst[def.name]!,
-      thresholds: rules[def.name]!,
-      violationCount: counts[def.name] ?? 0,
-    });
-  }
+  evaluateRules({ defs, rows }, rules, violations, ruleResults);
 }
 
 function evaluateGraphRules(
