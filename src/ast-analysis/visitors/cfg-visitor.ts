@@ -113,9 +113,24 @@ function handleThrow(n: TreeSitterNode, b: CfgBlockInternal, S: FuncState): null
 }
 
 /**
+ * Lookup structure for statement dispatch.
+ * - `map`: O(1) lookup for single-type matchers (one concrete node-type string per handler).
+ * - `fallback`: short linear scan for multi-predicate entries (if/for/while/switch rules that
+ *   match multiple concrete type strings depending on the language).
+ */
+interface StatementDispatch {
+  map: Map<string, StatementHandler>;
+  fallback: StatementEntry[];
+}
+
+/**
  * Build a dispatch table for statement node types from cfgRules.
  * Built once per createCfgVisitor call; optional entries (doNode, infiniteLoopNode,
  * tryNode) are included only when the language rules define them.
+ *
+ * Single-type matchers go into a Map for O(1) lookup; multi-predicate entries
+ * (isIfNode, isForNode, isWhileNode, isSwitchNode) stay in a short fallback array
+ * scanned only on a map miss.
  */
 function buildStatementDispatch(
   cfgRules: AnyRules,
@@ -124,9 +139,28 @@ function buildStatementDispatch(
     b: CfgBlockInternal,
     S: FuncState,
   ) => CfgBlockInternal | null,
-): StatementEntry[] {
-  const required: StatementEntry[] = [
-    { match: (t) => t === cfgRules.labeledNode, handle: (n, b, S) => processLabeledFn(n, b, S) },
+): StatementDispatch {
+  const map = new Map<string, StatementHandler>();
+
+  // Single-type required matchers
+  if (cfgRules.labeledNode) map.set(cfgRules.labeledNode, (n, b, S) => processLabeledFn(n, b, S));
+  if (cfgRules.returnNode) map.set(cfgRules.returnNode, handleReturn);
+  if (cfgRules.throwNode) map.set(cfgRules.throwNode, handleThrow);
+  if (cfgRules.breakNode) map.set(cfgRules.breakNode, (n, b, S) => processBreak(n, b, S));
+  if (cfgRules.continueNode) map.set(cfgRules.continueNode, (n, b, S) => processContinue(n, b, S));
+
+  // Single-type optional matchers
+  if (cfgRules.doNode)
+    map.set(cfgRules.doNode, (n, b, S, r, ps) => processDoWhileLoop(n, b, S, r, ps));
+  if (cfgRules.infiniteLoopNode)
+    map.set(cfgRules.infiniteLoopNode, (n, b, S, r, ps) => processInfiniteLoop(n, b, S, r, ps));
+  if (cfgRules.tryNode)
+    map.set(cfgRules.tryNode, (n, b, S, r, ps) => processTryCatch(n, b, S, r, ps));
+
+  // Multi-predicate entries that can match several concrete type strings per language;
+  // also handles unlessNode/untilNode aliases for if/while which may collide with other
+  // single-type map keys.
+  const fallback: StatementEntry[] = [
     {
       match: (t) => isIfNode(t, cfgRules) || (!!cfgRules.unlessNode && t === cfgRules.unlessNode),
       handle: (n, b, S, r, ps) => processIf(n, b, S, r, ps),
@@ -143,36 +177,9 @@ function buildStatementDispatch(
       match: (t) => isSwitchNode(t, cfgRules),
       handle: (n, b, S, r, ps) => processSwitch(n, b, S, r, ps),
     },
-    { match: (t) => t === cfgRules.returnNode, handle: handleReturn },
-    { match: (t) => t === cfgRules.throwNode, handle: handleThrow },
-    { match: (t) => t === cfgRules.breakNode, handle: (n, b, S) => processBreak(n, b, S) },
-    { match: (t) => t === cfgRules.continueNode, handle: (n, b, S) => processContinue(n, b, S) },
   ];
 
-  const optional: StatementEntry[] = [];
-  if (cfgRules.doNode) {
-    const doNode = cfgRules.doNode;
-    optional.push({
-      match: (t) => t === doNode,
-      handle: (n, b, S, r, ps) => processDoWhileLoop(n, b, S, r, ps),
-    });
-  }
-  if (cfgRules.infiniteLoopNode) {
-    const loopNode = cfgRules.infiniteLoopNode;
-    optional.push({
-      match: (t) => t === loopNode,
-      handle: (n, b, S, r, ps) => processInfiniteLoop(n, b, S, r, ps),
-    });
-  }
-  if (cfgRules.tryNode) {
-    const tryNode = cfgRules.tryNode;
-    optional.push({
-      match: (t) => t === tryNode,
-      handle: (n, b, S, r, ps) => processTryCatch(n, b, S, r, ps),
-    });
-  }
-
-  return [...required, ...optional];
+  return { map, fallback };
 }
 
 // ─── Bound statement processors ──────────────────────────────────────────
@@ -228,8 +235,12 @@ function buildStatementProcessors(cfgRules: AnyRules): {
     const effNode = effectiveNode(stmt, cfgRules);
     const type = effNode.type;
 
-    const entry = dispatch.find((e) => e.match(type));
-    if (entry) return entry.handle(effNode, currentBlock, S, cfgRules, processStatements);
+    // O(1) map lookup first; fall back to the short multi-predicate array on a miss
+    const mapHandler = dispatch.map.get(type);
+    if (mapHandler) return mapHandler(effNode, currentBlock, S, cfgRules, processStatements);
+    const fallbackEntry = dispatch.fallback.find((e) => e.match(type));
+    if (fallbackEntry)
+      return fallbackEntry.handle(effNode, currentBlock, S, cfgRules, processStatements);
 
     if (!currentBlock.startLine) {
       currentBlock.startLine = stmt.startPosition.row + 1;
