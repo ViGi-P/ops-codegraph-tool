@@ -492,6 +492,8 @@ A user-level config file at `~/.config/codegraph/config.json` (XDG) or `~/.codeg
 | `--limit <n>` | Limit number of results |
 | `--offset <n>` | Skip first N results (pagination) |
 | `--rrf-k <n>` | RRF smoothing constant for multi-query search (default 60) |
+| `--user-config [path]` | Apply global user config for this run; optionally specify a custom path instead of the XDG default (`~/.config/codegraph/config.json`) |
+| `--no-user-config` | Skip global user config for this run (CI/non-interactive safe) |
 
 ## 🌐 Language Support
 
