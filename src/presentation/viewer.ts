@@ -150,80 +150,10 @@ export function buildLayoutOptions(cfg: PlotConfig): LayoutOptions {
   return opts;
 }
 
-// ─── HTML Renderer ───────────────────────────────────────────────────
+// ─── HTML Section Renderers ──────────────────────────────────────────
 
-export interface ViewerNode {
-  id: number | string;
-  label: string;
-  kind: string;
-  file: string;
-  line: number;
-  role: string | null;
-  fanIn: number;
-  fanOut: number;
-  cognitive: number | null;
-  cyclomatic: number | null;
-  maintainabilityIndex: number | null;
-  community: number | null;
-  directory: string | null;
-  risk: string[];
-}
-
-export interface ViewerEdge {
-  id: number | string;
-  from: number | string;
-  to: number | string;
-}
-
-export interface ViewerData {
-  nodes: ViewerNode[];
-  edges: ViewerEdge[];
-  seedNodeIds: (number | string)[];
-}
-
-interface ResolvedPlotConfig {
-  layoutOpts: LayoutOptions;
-  title: string;
-  layoutAlgorithm: string;
-  layoutDirection: string;
-  physicsEnabled: boolean;
-  sizeBy: string;
-  clusterBy: string;
-  effectiveColorBy: string;
-  effectiveRisk: boolean;
-}
-
-function resolvePlotConfig(cfg: PlotConfig): ResolvedPlotConfig {
-  return {
-    layoutOpts: buildLayoutOptions(cfg),
-    title: cfg.title || 'Codegraph',
-    layoutAlgorithm: cfg.layout?.algorithm || 'hierarchical',
-    layoutDirection: cfg.layout?.direction || 'LR',
-    physicsEnabled: cfg.physics?.enabled !== false,
-    sizeBy: cfg.sizeBy || 'uniform',
-    clusterBy: cfg.clusterBy || 'none',
-    effectiveColorBy:
-      cfg.overlays?.complexity && cfg.colorBy === 'kind' ? 'complexity' : cfg.colorBy || 'kind',
-    effectiveRisk: cfg.overlays?.risk || false,
-  };
-}
-
-export function renderPlotHTML(data: ViewerData, cfg: PlotConfig): string {
-  const {
-    layoutOpts,
-    title,
-    layoutAlgorithm,
-    layoutDirection,
-    physicsEnabled,
-    sizeBy,
-    clusterBy,
-    effectiveColorBy,
-    effectiveRisk,
-  } = resolvePlotConfig(cfg);
-
-  return `<!DOCTYPE html>
-<html lang="en">
-<head>
+function renderViewerHead(title: string): string {
+  return `<head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>${escapeHtml(title)}</title>
@@ -257,9 +187,13 @@ export function renderPlotHTML(data: ViewerData, cfg: PlotConfig): string {
   #legend div { display: flex; align-items: center; gap: 6px; margin: 2px 0; }
   #legend span.swatch { width: 14px; height: 14px; border-radius: 3px; display: inline-block; flex-shrink: 0; }
 </style>
-</head>
-<body>
-<div id="controls">
+</head>`;
+}
+
+function renderViewerControls(resolved: ResolvedPlotConfig): string {
+  const { layoutAlgorithm, physicsEnabled, effectiveColorBy, sizeBy, clusterBy, effectiveRisk } =
+    resolved;
+  return `<div id="controls">
   <label>Layout:
     <select id="layoutSelect">
       <option value="hierarchical"${layoutAlgorithm === 'hierarchical' ? ' selected' : ''}>Hierarchical</option>
@@ -293,16 +227,16 @@ export function renderPlotHTML(data: ViewerData, cfg: PlotConfig): string {
     </select>
   </label>
   <label>Risk: <input type="checkbox" id="riskToggle"${effectiveRisk ? ' checked' : ''}></label>
-</div>
-<div id="main">
-  <div id="graph"></div>
-  <div id="detail">
-    <span id="detailClose">&times;</span>
-    <div id="detailContent"></div>
-  </div>
-</div>
-<div id="legend"></div>
-<script>
+</div>`;
+}
+
+function renderViewerScript(
+  data: ViewerData,
+  cfg: PlotConfig,
+  resolved: ResolvedPlotConfig,
+): string {
+  const { layoutOpts, layoutDirection, clusterBy, effectiveColorBy } = resolved;
+  return `<script>
 /* ── Data ──────────────────────────────────────────────────────────── */
 var allNodes = ${JSON.stringify(data.nodes)};
 var allEdges = ${JSON.stringify(data.edges)};
@@ -698,7 +632,84 @@ document.getElementById('detailClose').addEventListener('click', hideDetail);
 refreshNodeAppearance();
 updateLegend(${JSON.stringify(effectiveColorBy)});
 ${clusterBy !== 'none' ? `applyClusterBy(${JSON.stringify(clusterBy)});` : ''}
-</script>
+</script>`;
+}
+
+// ─── HTML Renderer ───────────────────────────────────────────────────
+
+export interface ViewerNode {
+  id: number | string;
+  label: string;
+  kind: string;
+  file: string;
+  line: number;
+  role: string | null;
+  fanIn: number;
+  fanOut: number;
+  cognitive: number | null;
+  cyclomatic: number | null;
+  maintainabilityIndex: number | null;
+  community: number | null;
+  directory: string | null;
+  risk: string[];
+}
+
+export interface ViewerEdge {
+  id: number | string;
+  from: number | string;
+  to: number | string;
+}
+
+export interface ViewerData {
+  nodes: ViewerNode[];
+  edges: ViewerEdge[];
+  seedNodeIds: (number | string)[];
+}
+
+interface ResolvedPlotConfig {
+  layoutOpts: LayoutOptions;
+  title: string;
+  layoutAlgorithm: string;
+  layoutDirection: string;
+  physicsEnabled: boolean;
+  sizeBy: string;
+  clusterBy: string;
+  effectiveColorBy: string;
+  effectiveRisk: boolean;
+}
+
+function resolvePlotConfig(cfg: PlotConfig): ResolvedPlotConfig {
+  return {
+    layoutOpts: buildLayoutOptions(cfg),
+    title: cfg.title || 'Codegraph',
+    layoutAlgorithm: cfg.layout?.algorithm || 'hierarchical',
+    layoutDirection: cfg.layout?.direction || 'LR',
+    physicsEnabled: cfg.physics?.enabled !== false,
+    sizeBy: cfg.sizeBy || 'uniform',
+    clusterBy: cfg.clusterBy || 'none',
+    effectiveColorBy:
+      cfg.overlays?.complexity && cfg.colorBy === 'kind' ? 'complexity' : cfg.colorBy || 'kind',
+    effectiveRisk: cfg.overlays?.risk || false,
+  };
+}
+
+export function renderPlotHTML(data: ViewerData, cfg: PlotConfig): string {
+  const resolved = resolvePlotConfig(cfg);
+  const { title } = resolved;
+  return `<!DOCTYPE html>
+<html lang="en">
+${renderViewerHead(title)}
+<body>
+${renderViewerControls(resolved)}
+<div id="main">
+  <div id="graph"></div>
+  <div id="detail">
+    <span id="detailClose">&times;</span>
+    <div id="detailContent"></div>
+  </div>
+</div>
+<div id="legend"></div>
+${renderViewerScript(data, cfg, resolved)}
 </body>
 </html>`;
 }
