@@ -433,6 +433,7 @@ Flatten all targets from `sync.json → executionOrder[*].targets` and check eac
 const state = JSON.parse(fs.readFileSync('.codegraph/titan/titan-state.json','utf8'));
 const batchFiles = new Set((state.batches || []).flatMap(b => b.files || []));
 const allSyncTargets = sync.executionOrder.flatMap(e => e.targets);
+if (allSyncTargets.length === 0) { console.log('V9 FAIL: sync.json has no targets — execution plan is empty'); process.exit(1); }
 const missingCount = allSyncTargets.filter(t => !batchFiles.has(t)).length;
 const pct = missingCount / allSyncTargets.length;
 if (pct > 0.2) console.log('V9 WARN:', missingCount + '/' + allSyncTargets.length,
@@ -680,8 +681,9 @@ while iteration < maxIterations:
                          3. Fix the root cause — prefer targeted fixes over reverts
                          4. If Rust source changed: rebuild the native addon before running tests
                             npx napi build --platform --release --manifest-path crates/codegraph-core/Cargo.toml --output-dir .
-                            codesign --sign - --force node_modules/@optave/codegraph-darwin-arm64/codegraph-core.node
-                         5. Verify with: npx vitest run --config vitest.config.worktree.ts
+                            PLATFORM=$(node -e "const os=require('os');const arch=os.arch()==='arm64'?'arm64':'x64';console.log(os.platform()+'-'+arch)")
+                            if [[ "$(uname)" == "Darwin" ]]; then codesign --sign - --force "node_modules/@optave/codegraph-${PLATFORM}/codegraph-core.node"; fi
+                         5. Verify with: <testCmd>
                          6. Commit fixes with: 'fix: correct regressions from forge phase <N>'
                          7. Do NOT stage: package-lock.json, vitest.config.worktree.ts, tests/benchmarks/resolution/fixtures/python/__pycache__/
                          
@@ -691,7 +693,7 @@ while iteration < maxIterations:
                 Run: <testCmd> 2>&1
                 if tests still fail:
                     Print: "CRITICAL: Regression-fix agent could not resolve test failures after forge phase <nextPhase>. Manual intervention required."
-                    Print: "Consider reverting: git revert <headBefore>..<headAfter>"
+                    Print: "Consider reverting: git revert <headBefore>..HEAD"
                     Stop.
                 else:
                     Print: "V13: Regressions resolved by fix agent. Continuing pipeline."
@@ -815,8 +817,9 @@ while iteration < maxIterations:
                          3. Fix the root cause — prefer targeted fixes over reverts
                          4. If Rust source changed: rebuild the native addon before running tests
                             npx napi build --platform --release --manifest-path crates/codegraph-core/Cargo.toml --output-dir .
-                            codesign --sign - --force node_modules/@optave/codegraph-darwin-arm64/codegraph-core.node
-                         5. Verify with: npx vitest run --config vitest.config.worktree.ts
+                            PLATFORM=$(node -e "const os=require('os');const arch=os.arch()==='arm64'?'arm64':'x64';console.log(os.platform()+'-'+arch)")
+                            if [[ "$(uname)" == "Darwin" ]]; then codesign --sign - --force "node_modules/@optave/codegraph-${PLATFORM}/codegraph-core.node"; fi
+                         5. Verify with: <testCmd>
                          6. Commit fixes with: 'fix: correct regressions from grind phase <N>'
                          7. Do NOT stage: package-lock.json, vitest.config.worktree.ts, tests/benchmarks/resolution/fixtures/python/__pycache__/
                          
@@ -826,7 +829,7 @@ while iteration < maxIterations:
                 Run: <testCmd> 2>&1
                 if tests still fail:
                     Print: "CRITICAL: Regression-fix agent could not resolve test failures after grind phase <nextPhase>. Manual intervention required."
-                    Print: "Consider reverting: git revert <headBefore>..<headAfter>"
+                    Print: "Consider reverting: git revert <headBefore>..HEAD"
                     Stop.
                 else:
                     Print: "V17: Regressions resolved by fix agent. Continuing pipeline."
@@ -938,7 +941,7 @@ If the agent created PRs, print the PR URLs.
 
 **Commit hygiene check:** If `.claude/skills/` files were modified during this run (e.g., by a V13 regression-fix agent), they must NOT share a commit with `.codegraph/titan/` artifacts. Check:
 ```bash
-git status --short | grep -E "\.claude/skills/|generated/titan/"
+git status --short | grep -E "\.claude/skills/|generated/titan/|\.codegraph/titan/"
 ```
 If both are dirty, commit them separately before proceeding to the retrospective.
 
@@ -1003,7 +1006,9 @@ Keep skillRecs to 3-5 items max. Focus on structural issues (things that would a
 After the agent writes `retrospective.json`, read and print it:
 ```bash
 node -e "
-const r = JSON.parse(require('fs').readFileSync('.codegraph/titan/retrospective.json','utf8'));
+const fs = require('fs');
+if (!fs.existsSync('.codegraph/titan/retrospective.json')) { console.log('retrospective.json not written — skipping summary'); process.exit(0); }
+const r = JSON.parse(fs.readFileSync('.codegraph/titan/retrospective.json','utf8'));
 console.log('\n=== Titan Retrospective ===');
 console.log('\nWent well:');
 (r.wentWell || []).forEach(w => console.log('  ✓', w));
