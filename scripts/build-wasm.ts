@@ -217,7 +217,8 @@ const grammars = [
   // available in the WASM engine without the malicious devDependency. To rebuild the WASM
   // from a clean source (e.g. after a tree-sitter-erlang grammar update):
   //   1. npm install github:the-mikedavis/tree-sitter-erlang
-  //   2. Add this entry back to the grammars array temporarily
+  //   2. Add this entry temporarily to the grammars array:
+  //        { name: 'tree-sitter-erlang', pkg: 'tree-sitter-erlang', sub: null },
   //   3. Run `npm run build:wasm`, validate the output
   //   4. Remove the devDependency again; the committed grammars/tree-sitter-erlang.wasm stays
   { name: 'tree-sitter-solidity', pkg: 'tree-sitter-solidity', sub: null },
