@@ -93,7 +93,16 @@ export interface RoleClassificationNode {
   isExported: boolean;
   testOnlyFanIn?: number;
   productionFanIn?: number;
-  /** True when the same file contains at least one non-constant callable connected to the graph (fanIn > 0 or fanOut > 0). */
+  /**
+   * True when the same file contains at least one callable connected to the graph
+   * (fanIn > 0 or fanOut > 0) that is not itself an annotation-only kind.
+   * Annotation-only kinds are `constant` and all members of `TYPE_DEF_KINDS`
+   * (struct, enum, trait, type, interface, record) — these are excluded because
+   * they are consumed via references/type-annotations rather than call edges and
+   * would otherwise produce a circular dependency in the active-file heuristic.
+   * Populated only for `constant` and `TYPE_DEF_KINDS` nodes; `undefined` for
+   * regular callables (functions, methods, classes, etc.) which don't need it.
+   */
   hasActiveFileSiblings?: boolean;
 }
 

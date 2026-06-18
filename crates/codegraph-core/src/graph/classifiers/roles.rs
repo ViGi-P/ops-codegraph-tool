@@ -21,6 +21,13 @@ const LEAF_KINDS: &[&str] = &["parameter", "property", "constant"];
 /// If the same file has active callables, these types are almost certainly live.
 const TYPE_DEF_KINDS: &[&str] = &["struct", "enum", "trait", "type", "interface", "record"];
 
+/// All kinds that are consumed via references or type-annotations rather than call edges.
+/// Equals `TYPE_DEF_KINDS` ∪ `{"constant"}`.
+/// Used by `compute_active_files` to exclude annotation-only nodes when deciding whether
+/// a file has any actively-called symbols — mirrors `ANNOTATION_ONLY_KINDS` in the TS classifier.
+const ANNOTATION_ONLY_KINDS: &[&str] =
+    &["constant", "struct", "enum", "trait", "type", "interface", "record"];
+
 /// Path patterns indicating framework-dispatched entry points (matches JS
 /// `ENTRY_PATH_PATTERNS` in `graph/classifiers/roles.ts`).
 const ENTRY_PATH_PATTERNS: &[&str] = &[
@@ -456,11 +463,10 @@ fn test_file_filter_col(column: &str) -> String {
 ///   as the sole callable in its file must NOT count itself as an "active sibling"
 ///   and thereby promote itself to `leaf`.
 fn compute_active_files(rows: &[(i64, String, String, String, u32, u32)]) -> (std::collections::HashSet<String>, std::collections::HashSet<String>) {
-    let annotation_only: &[&str] = &["constant", "struct", "enum", "trait", "type", "interface", "record"];
     let mut active = std::collections::HashSet::new();
     let mut called_active = std::collections::HashSet::new();
     for (_id, _name, kind, file, fan_in, fan_out) in rows {
-        if !annotation_only.iter().any(|k| *k == kind.as_str()) {
+        if !ANNOTATION_ONLY_KINDS.iter().any(|k| *k == kind.as_str()) {
             if *fan_in > 0 || *fan_out > 0 {
                 active.insert(file.clone());
             }

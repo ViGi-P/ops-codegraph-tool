@@ -361,4 +361,23 @@ describe('classifyNodeRoles', () => {
     // doWork has fanIn=0, fanOut=1, sole callable in its file — must stay dead-unresolved
     expect(role).toBe('dead-unresolved');
   });
+
+  it('incremental path: does not classify exported interface as dead when used only as same-file type annotation (#1583)', () => {
+    // Exercises classifyNodeRolesIncremental (triggered by passing changedFiles).
+    // An exported=1 interface with no cross-file edges must be promoted to entry,
+    // not dead-unresolved, on the incremental path just as on the full path.
+    db.prepare('INSERT INTO nodes (name, kind, file, line, exported) VALUES (?, ?, ?, ?, ?)').run(
+      'IncrementalOpts',
+      'interface',
+      'src/helpers.ts',
+      30,
+      1,
+    );
+
+    // Pass the file as the changed-files list to trigger the incremental path.
+    classifyNodeRoles(db, ['src/helpers.ts']);
+    const role = db.prepare("SELECT role FROM nodes WHERE name = 'IncrementalOpts'").get();
+    // Should be entry (exported, fan-in 0), not dead-unresolved
+    expect(role.role).toBe('entry');
+  });
 });
