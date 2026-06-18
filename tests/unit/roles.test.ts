@@ -220,4 +220,37 @@ describe('classifyNodeRoles', () => {
     const role = db.prepare("SELECT role FROM nodes WHERE name = 'UnusedInterface'").get();
     expect(role.role).toBe('dead-unresolved');
   });
+
+  it('does not classify exported interface as dead when used only as same-file type annotation (#1583)', () => {
+    // Simulate: exported interface whose only usage is as a parameter type in the same file.
+    // No cross-file imports-type edge exists because same-file type annotations don't produce edges.
+    // The extractor marks the interface as exported=1. The classifier must honour that flag.
+    db.prepare('INSERT INTO nodes (name, kind, file, line, exported) VALUES (?, ?, ?, ?, ?)').run(
+      'MyOpts',
+      'interface',
+      'src/helpers.ts',
+      10,
+      1,
+    );
+
+    classifyNodeRoles(db);
+    const role = db.prepare("SELECT role FROM nodes WHERE name = 'MyOpts'").get();
+    // Should be entry (exported, fan-in 0), not dead-unresolved
+    expect(role.role).toBe('entry');
+  });
+
+  it('classifies non-exported interface with no callers as dead-unresolved (#1583 boundary)', () => {
+    // An interface without export keyword and without cross-file references is genuinely dead.
+    db.prepare('INSERT INTO nodes (name, kind, file, line, exported) VALUES (?, ?, ?, ?, ?)').run(
+      'InternalOpts',
+      'interface',
+      'src/helpers.ts',
+      20,
+      0,
+    );
+
+    classifyNodeRoles(db);
+    const role = db.prepare("SELECT role FROM nodes WHERE name = 'InternalOpts'").get();
+    expect(role.role).toBe('dead-unresolved');
+  });
 });
