@@ -399,7 +399,7 @@ pub(crate) fn do_classify_full(conn: &Connection) -> rusqlite::Result<RoleSummar
     let median_fan_out = median(&fan_out_vals);
 
     // 5b. Compute active files (files with non-constant callables connected to the graph)
-    let active_files = compute_active_files(&rows);
+    let (active_files, called_active_files) = compute_active_files(&rows);
 
     // 6. Classify and collect IDs by role
     let mut ids_by_role: HashMap<&str, Vec<i64>> = HashMap::new();
@@ -415,6 +415,7 @@ pub(crate) fn do_classify_full(conn: &Connection) -> rusqlite::Result<RoleSummar
         &exported_ids,
         &prod_fan_in,
         &active_files,
+        &called_active_files,
         median_fan_in,
         median_fan_out,
         &mut ids_by_role,
@@ -443,18 +444,32 @@ fn test_file_filter_col(column: &str) -> String {
         .join(" ")
 }
 
-/// Compute the set of files that have at least one callable connected to the graph,
-/// excluding annotation-only kinds (constants, type definitions) which are consumed
-/// via references/type-annotations rather than calls.
-fn compute_active_files(rows: &[(i64, String, String, String, u32, u32)]) -> std::collections::HashSet<String> {
+/// Compute two active-files sets from callable rows.
+///
+/// Returns `(active_files, called_active_files)`:
+/// - `active_files`: files with at least one non-annotation-only callable with
+///   `fan_in > 0 || fan_out > 0`. Used for annotation-only kinds (constants,
+///   type defs) which have no callers by design.
+/// - `called_active_files`: files with at least one non-annotation-only callable
+///   with `fan_in > 0` (strictly called). Used for method/function kinds to
+///   prevent a self-sibling false negative: a function with `fan_in=0, fan_out>0`
+///   as the sole callable in its file must NOT count itself as an "active sibling"
+///   and thereby promote itself to `leaf`.
+fn compute_active_files(rows: &[(i64, String, String, String, u32, u32)]) -> (std::collections::HashSet<String>, std::collections::HashSet<String>) {
     let annotation_only: &[&str] = &["constant", "struct", "enum", "trait", "type", "interface", "record"];
     let mut active = std::collections::HashSet::new();
+    let mut called_active = std::collections::HashSet::new();
     for (_id, _name, kind, file, fan_in, fan_out) in rows {
-        if (*fan_in > 0 || *fan_out > 0) && !annotation_only.iter().any(|k| *k == kind.as_str()) {
-            active.insert(file.clone());
+        if !annotation_only.iter().any(|k| *k == kind.as_str()) {
+            if *fan_in > 0 || *fan_out > 0 {
+                active.insert(file.clone());
+            }
+            if *fan_in > 0 {
+                called_active.insert(file.clone());
+            }
         }
     }
-    active
+    (active, called_active)
 }
 
 /// Compute global median fan-in and fan-out from the edge distribution.
@@ -525,6 +540,7 @@ fn classify_rows(
     exported_ids: &std::collections::HashSet<i64>,
     prod_fan_in: &HashMap<i64, u32>,
     active_files: &std::collections::HashSet<String>,
+    called_active_files: &std::collections::HashSet<String>,
     median_fan_in: f64,
     median_fan_out: f64,
     ids_by_role: &mut HashMap<&'static str, Vec<i64>>,
@@ -539,8 +555,15 @@ fn classify_rows(
         // the latter two can have fan_in == 0 due to untraced call-site patterns
         // (interface dispatch, logical-or defaults). The classifier interprets this
         // field differently per kind (see classify_node).
-        let has_active_siblings = if is_annotation_only || kind == "method" || kind == "function" {
+        //
+        // IMPORTANT: method/function use called_active_files (fan_in > 0 only) to
+        // prevent a self-sibling false negative: a function with fan_in=0, fan_out>0
+        // as the sole callable in its file must NOT see its own file as "active" and
+        // thereby promote itself to leaf.
+        let has_active_siblings = if is_annotation_only {
             active_files.contains(file)
+        } else if kind == "method" || kind == "function" {
+            called_active_files.contains(file)
         } else {
             false
         };
@@ -773,7 +796,7 @@ pub(crate) fn do_classify_incremental(
     );
     let prod_fan_in = query_id_counts(&tx, &prod_sql, &all_affected)?;
 
-    let active_files = compute_active_files(&rows);
+    let (active_files, called_active_files) = compute_active_files(&rows);
 
     let mut ids_by_role: HashMap<&str, Vec<i64>> = HashMap::new();
 
@@ -788,6 +811,7 @@ pub(crate) fn do_classify_incremental(
         &exported_ids,
         &prod_fan_in,
         &active_files,
+        &called_active_files,
         median_fan_in,
         median_fan_out,
         &mut ids_by_role,
