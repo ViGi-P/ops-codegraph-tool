@@ -481,6 +481,7 @@ function extractConstantsWalk(node: TreeSitterNode, definitions: Definition[]): 
     }
 
     extractConstDeclarators(declNode, definitions);
+    extractLetVarObjLiteralDeclarators(declNode, definitions);
 
     // Recurse into non-function, non-export-statement children (blocks, if-statements, etc.)
     if (child.type !== 'export_statement') {
@@ -582,6 +583,34 @@ function extractConstDeclarators(declNode: TreeSitterNode, definitions: Definiti
         extractObjectLiteralFunctions(valueN, nameN.text, definitions);
       }
     }
+  }
+}
+
+/**
+ * Extract qualified method definitions from `let`/`var` object-literal declarations.
+ * Mirrors `match_js_objlit_qualified_method_defs` in `javascript.rs`, which emits
+ * qualified definitions for `method_definition` (all declaration kinds) and
+ * `pair+arrow/function` (`let`/`var` only, since `const` is already handled by
+ * `extractConstDeclarators` → `extractObjectLiteralFunctions`).
+ *
+ * Called from extractConstantsWalk which already provides the function-scope guard.
+ * `var q1 = { m1() {} }` → emits Definition { name: 'q1.m1', kind: 'function' }
+ */
+function extractLetVarObjLiteralDeclarators(
+  declNode: TreeSitterNode,
+  definitions: Definition[],
+): void {
+  const t = declNode.type;
+  if (t !== 'lexical_declaration' && t !== 'variable_declaration') return;
+  if (declNode.text.startsWith('const ')) return; // handled by extractConstDeclarators
+
+  for (let j = 0; j < declNode.childCount; j++) {
+    const declarator = declNode.child(j);
+    if (declarator?.type !== 'variable_declarator') continue;
+    const nameN = declarator.childForFieldName('name');
+    const valueN = declarator.childForFieldName('value');
+    if (nameN?.type !== 'identifier' || !valueN || valueN.type !== 'object') continue;
+    extractObjectLiteralFunctions(valueN, nameN.text, definitions);
   }
 }
 
@@ -1043,6 +1072,18 @@ function handleVariableDecl(node: TreeSitterNode, ctx: ExtractorOutput): void {
           if (valueN.type === 'object') {
             extractObjectLiteralFunctions(valueN, nameN.text, ctx.definitions);
           }
+        } else if (
+          !isConst &&
+          nameN.type === 'identifier' &&
+          valueN.type === 'object' &&
+          !hasFunctionScopeAncestor(node)
+        ) {
+          // `let`/`var` object literals: extract qualified method definitions so that
+          // `obj.method()` calls resolve correctly. Mirrors Rust match_js_objlit_qualified_method_defs
+          // which emits method_definition qualified names for ALL declaration kinds and
+          // pair+arrow/function for let/var only (const is already handled above).
+          // Scope guard prevents local object properties from polluting the global index.
+          extractObjectLiteralFunctions(valueN, nameN.text, ctx.definitions);
         } else if (isConst && nameN.type === 'object_pattern' && !hasFunctionScopeAncestor(node)) {
           // Destructured bindings: const { handleToken, checkPermissions } = initAuth(...)
           // Each destructured property becomes a function definition so it can be
