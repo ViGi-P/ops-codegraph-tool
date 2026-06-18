@@ -184,6 +184,31 @@ interface Mutation {
   line: number;
 }
 
+// ── P1: Visitor internal shapes ───────────────────────────────────────────────
+// The visitor's finish() emits DataflowResultInternal with richer types than
+// the public DataflowResult in types.ts. We cast here to access paramName,
+// paramIndex, and referencedNames which the public type omits.
+
+interface VisitorParam {
+  funcName: string;
+  paramName: string;
+  paramIndex: number;
+  line: number;
+}
+
+interface VisitorReturn {
+  funcName: string;
+  expression: string;
+  referencedNames: string[];
+  line: number;
+}
+
+interface VisitorAssignment {
+  varName: string;
+  callerFunc: string;
+  line: number;
+}
+
 function insertDataflowEdges(
   insert: { run(...params: unknown[]): unknown },
   data: DataflowResult,
@@ -234,6 +259,113 @@ function insertDataflowEdges(
   }
 
   return edgeCount;
+}
+
+// ── P1: dataflow_vertices + intra def_use edges ───────────────────────────────
+
+function prepareVertexStmts(db: BetterSqlite3Database): {
+  insertVertex: ReturnType<BetterSqlite3Database['prepare']>;
+  insertIntraEdge: ReturnType<BetterSqlite3Database['prepare']>;
+  available: boolean;
+} {
+  try {
+    return {
+      insertVertex: db.prepare(
+        `INSERT INTO dataflow_vertices (func_id, kind, name, param_index, line, node_id)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      ),
+      insertIntraEdge: db.prepare(
+        `INSERT INTO dataflow
+           (source_id, target_id, kind, source_vertex, target_vertex, scope, expression, line, confidence)
+         VALUES (?, ?, 'def_use', ?, ?, 'intra', ?, ?, 1.0)`,
+      ),
+      available: true,
+    };
+  } catch {
+    return {
+      insertVertex: db.prepare('SELECT 1'),
+      insertIntraEdge: db.prepare('SELECT 1'),
+      available: false,
+    };
+  }
+}
+
+/**
+ * Build dataflow_vertices and intra def_use edges for one file.
+ * Called alongside insertDataflowEdges in the same transaction.
+ *
+ * Creates:
+ *  - 'param'  vertex per function parameter
+ *  - 'return' vertex per function that has at least one return statement
+ *  - 'local'  vertex per variable assigned from a function call return
+ *  - 'def_use' intra edges from param/local → return when the name
+ *    appears in a return expression's referenced identifiers
+ */
+function buildDataflowVerticesAndEdges(
+  vstmts: ReturnType<typeof prepareVertexStmts>,
+  data: DataflowResult,
+  resolveNode: (name: string) => { id: number } | null,
+): void {
+  if (!vstmts.available) return;
+
+  const params = data.parameters as unknown as VisitorParam[];
+  const returns = data.returns as unknown as VisitorReturn[];
+  const assignments = data.assignments as unknown as VisitorAssignment[];
+
+  // 1. param vertices
+  const paramVertexIds = new Map<string, number>(); // "funcName:paramName" → vertex id
+  for (const p of params) {
+    const fn = resolveNode(p.funcName);
+    if (!fn) continue;
+    const result = vstmts.insertVertex.run(fn.id, 'param', p.paramName, p.paramIndex, p.line, null);
+    paramVertexIds.set(
+      `${p.funcName}:${p.paramName}`,
+      (result as { lastInsertRowid: number }).lastInsertRowid,
+    );
+  }
+
+  // 2. return vertices (one per function that has a return statement)
+  const returnVertexIds = new Map<string, number>(); // funcName → vertex id
+  const returnFuncsSeen = new Set<string>();
+  for (const r of returns) {
+    if (returnFuncsSeen.has(r.funcName)) continue;
+    returnFuncsSeen.add(r.funcName);
+    const fn = resolveNode(r.funcName);
+    if (!fn) continue;
+    const result = vstmts.insertVertex.run(fn.id, 'return', null, null, r.line, null);
+    returnVertexIds.set(r.funcName, (result as { lastInsertRowid: number }).lastInsertRowid);
+  }
+
+  // 3. local vertices (from call-return assignments)
+  const localVertexIds = new Map<string, number>(); // "funcName:varName" → vertex id
+  const localsSeen = new Set<string>();
+  for (const a of assignments) {
+    const key = `${a.callerFunc}:${a.varName}`;
+    if (localsSeen.has(key)) continue;
+    localsSeen.add(key);
+    const fn = resolveNode(a.callerFunc);
+    if (!fn) continue;
+    const result = vstmts.insertVertex.run(fn.id, 'local', a.varName, null, a.line, null);
+    localVertexIds.set(key, (result as { lastInsertRowid: number }).lastInsertRowid);
+  }
+
+  // 4. intra def_use edges: param/local → return
+  for (const r of returns) {
+    const fn = resolveNode(r.funcName);
+    if (!fn) continue;
+    const returnVid = returnVertexIds.get(r.funcName);
+    if (!returnVid) continue;
+    for (const name of r.referencedNames) {
+      const paramVid = paramVertexIds.get(`${r.funcName}:${name}`);
+      if (paramVid) {
+        vstmts.insertIntraEdge.run(fn.id, fn.id, paramVid, returnVid, r.expression, r.line);
+      }
+      const localVid = localVertexIds.get(`${r.funcName}:${name}`);
+      if (localVid) {
+        vstmts.insertIntraEdge.run(fn.id, fn.id, localVid, returnVid, r.expression, r.line);
+      }
+    }
+  }
 }
 
 // ── buildDataflowEdges ──────────────────────────────────────────────────────
@@ -373,6 +505,7 @@ export async function buildDataflowEdges(
   );
 
   const stmts = prepareNodeResolvers(db);
+  const vstmts = prepareVertexStmts(db);
   let totalEdges = 0;
 
   const tx = db.transaction(() => {
@@ -383,7 +516,9 @@ export async function buildDataflowEdges(
       const data = getDataflowForFile(symbols, relPath, rootDir, extToLang, parsers, getParserFn);
       if (!data) continue;
 
-      totalEdges += insertDataflowEdges(insert, data, makeNodeResolver(stmts, relPath));
+      const resolver = makeNodeResolver(stmts, relPath);
+      totalEdges += insertDataflowEdges(insert, data, resolver);
+      buildDataflowVerticesAndEdges(vstmts, data, resolver);
     }
   });
 
