@@ -253,9 +253,9 @@ function handleSwiftCallExpression(node: TreeSitterNode, ctx: ExtractorOutput): 
   if (funcNode.type === 'navigation_expression') {
     // obj.method(...) — Swift's tree-sitter grammar wraps the suffix in a
     // `navigation_suffix` node: navigation_expression > [simple_identifier, navigation_suffix].
-    // We must descend into navigation_suffix to get the bare method name.
-    // Mirrors Rust match_swift_node which reads node_text of the last child directly
-    // (which equals ".method") and the receiver from child(0).
+    // We must descend into navigation_suffix to get the bare method name (e.g. "save" not ".save").
+    // Mirrors Rust match_swift_node which also descends into navigation_suffix via find_child
+    // to extract the inner simple_identifier, with a trim_start_matches('.') fallback.
     const lastChild = funcNode.child(funcNode.childCount - 1);
     const firstChild = funcNode.child(0);
     if (lastChild && firstChild) {
