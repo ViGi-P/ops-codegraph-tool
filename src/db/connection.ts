@@ -2,6 +2,7 @@ import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { loadConfig } from '../infrastructure/config.js';
 import { debug, warn } from '../infrastructure/logger.js';
 import { getNative, isNativeAvailable } from '../infrastructure/native.js';
 import { DbError, toErrorMessage } from '../shared/errors.js';
@@ -379,9 +380,11 @@ export function openRepo(
     return { repo: opts.repo, close() {} };
   }
 
-  // Respect explicit engine selection: opts.engine > CODEGRAPH_ENGINE env > auto.
+  // Respect explicit engine selection: opts.engine > config.build.engine > auto.
+  // config.build.engine is already populated from CODEGRAPH_ENGINE env by applyEnvOverrides,
+  // so this covers both the env-var path and the .codegraphrc.json config-file path.
   // This ensures --engine wasm and benchmark workers bypass the native path.
-  const engine = opts.engine || process.env.CODEGRAPH_ENGINE || 'auto';
+  const engine = opts.engine ?? loadConfig().build.engine ?? 'auto';
 
   // Try native rusqlite path first (Phase 6.14)
   if (engine !== 'wasm' && isNativeAvailable()) {
@@ -425,7 +428,9 @@ export function openReadonlyWithNative(customPath?: string): {
   const db = openReadonlyOrFail(customPath);
 
   // Respect explicit engine selection, consistent with openRepo().
-  const engine = process.env.CODEGRAPH_ENGINE || 'auto';
+  // config.build.engine covers both CODEGRAPH_ENGINE env (via applyEnvOverrides)
+  // and the .codegraphrc.json config-file path.
+  const engine = loadConfig().build.engine ?? 'auto';
 
   let nativeDb: NativeDatabase | undefined;
   if (engine !== 'wasm' && isNativeAvailable()) {
