@@ -631,7 +631,14 @@ function buildClassifierInput(
     fanOut: r.fan_out,
     isExported: exportedIds.has(r.id),
     productionFanIn: prodFanInMap.get(r.id) || 0,
-    hasActiveFileSiblings: ANNOTATION_ONLY_KINDS.has(r.kind) ? activeFiles.has(r.file) : undefined,
+    // Set hasActiveFileSiblings for annotation-only kinds (constants, type defs)
+    // AND for method/function — the latter two can have fanIn === 0 due to
+    // untraced call-site patterns (interface dispatch, logical-or defaults).
+    // The classifier interprets this field differently per kind (see classifyUnreferencedNode).
+    hasActiveFileSiblings:
+      ANNOTATION_ONLY_KINDS.has(r.kind) || r.kind === 'method' || r.kind === 'function'
+        ? activeFiles.has(r.file)
+        : undefined,
   }));
 }
 

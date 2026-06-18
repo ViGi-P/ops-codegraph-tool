@@ -159,6 +159,23 @@ fn classify_node(
             if TYPE_DEF_KINDS.iter().any(|k| *k == kind) {
                 return "leaf";
             }
+            // Methods implementing interfaces are dispatched via conditional property
+            // access e.g. `if (v.enterFunction) v.enterFunction(...)`. Codegraph
+            // resolves the call to the property accessor rather than to the concrete
+            // method implementation, so the method has no inbound call edge. All
+            // methods with active file siblings are almost certainly interface
+            // implementations — classify as leaf.
+            if kind == "method" {
+                return "leaf";
+            }
+            // Functions referenced as logical-or fallback defaults — e.g.
+            // `const fn = options._fetchLatest || fetchLatestVersion` — appear as
+            // value references, not call sites, so no call edge is produced. We
+            // require `fan_out > 0` as evidence that the function is non-trivial
+            // (i.e. it calls something), ruling out truly inert dead helpers.
+            if kind == "function" && fan_out > 0 {
+                return "leaf";
+            }
         }
         return classify_dead_sub_role(name, kind, file);
     }
@@ -518,7 +535,11 @@ fn classify_rows(
         let prod_fi = prod_fan_in.get(id).copied().unwrap_or(0);
         let is_annotation_only = kind == "constant"
             || TYPE_DEF_KINDS.iter().any(|k| *k == kind.as_str());
-        let has_active_siblings = if is_annotation_only {
+        // Set has_active_siblings for annotation-only kinds AND for method/function —
+        // the latter two can have fan_in == 0 due to untraced call-site patterns
+        // (interface dispatch, logical-or defaults). The classifier interprets this
+        // field differently per kind (see classify_node).
+        let has_active_siblings = if is_annotation_only || kind == "method" || kind == "function" {
             active_files.contains(file)
         } else {
             false
