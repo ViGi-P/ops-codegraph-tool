@@ -581,9 +581,10 @@ function extractConstDeclarators(declNode: TreeSitterNode, definitions: Definiti
 
 /**
  * Extract qualified method definitions from `let`/`var` object-literal declarations.
- * Mirrors Rust match_js_objlit_qualified_method_defs which emits qualified definitions
- * for method_definition (all declaration kinds) and pair+arrow/function (let/var only,
- * since const is already handled by extractConstDeclarators → extractObjectLiteralFunctions).
+ * Mirrors `match_js_objlit_qualified_method_defs` in `javascript.rs`, which emits
+ * qualified definitions for `method_definition` (all declaration kinds) and
+ * `pair+arrow/function` (`let`/`var` only, since `const` is already handled by
+ * `extractConstDeclarators` → `extractObjectLiteralFunctions`).
  *
  * Called from extractConstantsWalk which already provides the function-scope guard.
  * `var q1 = { m1() {} }` → emits Definition { name: 'q1.m1', kind: 'function' }
