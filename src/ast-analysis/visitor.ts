@@ -152,6 +152,96 @@ function collectResults(visitors: Visitor[]): WalkResults {
   return results;
 }
 
+interface WalkState {
+  visitors: Visitor[];
+  allFuncTypes: Set<string>;
+  nestingNodeTypes: Set<string>;
+  getFunctionName: (node: TreeSitterNode) => string | null;
+  context: VisitorContext;
+  scopeStack: ScopeEntry[];
+  skipDepths: Map<number, number>;
+}
+
+/** Build walk state from options: resolve function types, init visitors, create shared context. */
+function buildWalkState(visitors: Visitor[], langId: string, options: WalkOptions): WalkState {
+  const {
+    functionNodeTypes = new Set<string>(),
+    nestingNodeTypes = new Set<string>(),
+    getFunctionName = () => null,
+  } = options;
+
+  const allFuncTypes = mergeFunctionNodeTypes(visitors, functionNodeTypes);
+  initVisitors(visitors, langId);
+
+  const scopeStack: ScopeEntry[] = [];
+  const context: VisitorContext = {
+    nestingLevel: 0,
+    currentFunction: null,
+    langId,
+    scopeStack,
+  };
+
+  return {
+    visitors,
+    allFuncTypes,
+    nestingNodeTypes,
+    getFunctionName,
+    context,
+    scopeStack,
+    skipDepths: new Map<number, number>(),
+  };
+}
+
+/** Single DFS step: dispatch enter/exit hooks and recurse into children. */
+function walkNode(state: WalkState, node: TreeSitterNode | null, depth: number): void {
+  if (!node) return;
+  if (depth > MAX_WALK_DEPTH) {
+    debug(`walkWithVisitors: AST depth limit (${MAX_WALK_DEPTH}) hit — subtree truncated`);
+    return;
+  }
+
+  const {
+    visitors,
+    allFuncTypes,
+    nestingNodeTypes,
+    getFunctionName,
+    context,
+    scopeStack,
+    skipDepths,
+  } = state;
+  const type = node.type;
+  const isFuncBoundary = allFuncTypes.has(type);
+  let funcName: string | null = null;
+
+  if (isFuncBoundary) {
+    funcName = getFunctionName(node);
+    context.currentFunction = node;
+    scopeStack.push({ funcName, funcNode: node, params: new Map(), locals: new Map() });
+    dispatchEnterFunction(visitors, skipDepths, node, funcName, context, depth);
+  }
+
+  dispatchEnterNode(visitors, skipDepths, node, context, depth);
+
+  const addsNesting = nestingNodeTypes.has(type);
+  if (addsNesting) context.nestingLevel++;
+
+  for (let i = 0; i < node.childCount; i++) {
+    walkNode(state, node.child(i), depth + 1);
+  }
+
+  if (addsNesting) context.nestingLevel--;
+
+  dispatchExitNode(visitors, skipDepths, node, context, depth);
+  clearSkipFlags(skipDepths, visitors.length, depth);
+
+  if (isFuncBoundary) {
+    dispatchExitFunction(visitors, skipDepths, node, funcName, context, depth);
+    scopeStack.pop();
+    context.currentFunction =
+      scopeStack.length > 0 ? scopeStack[scopeStack.length - 1]!.funcNode : null;
+  }
+}
+
 /**
  * Walk an AST root with multiple visitors in a single DFS pass.
  *
@@ -170,67 +260,7 @@ export function walkWithVisitors(
   langId: string,
   options: WalkOptions = {},
 ): WalkResults {
-  const {
-    functionNodeTypes = new Set<string>(),
-    nestingNodeTypes = new Set<string>(),
-    getFunctionName = () => null,
-  } = options;
-
-  const allFuncTypes = mergeFunctionNodeTypes(visitors, functionNodeTypes);
-  initVisitors(visitors, langId);
-
-  // Shared context object (mutated during walk)
-  const scopeStack: ScopeEntry[] = [];
-  const context: VisitorContext = {
-    nestingLevel: 0,
-    currentFunction: null,
-    langId,
-    scopeStack,
-  };
-
-  const skipDepths = new Map<number, number>();
-
-  function walk(node: TreeSitterNode | null, depth: number): void {
-    if (!node) return;
-    if (depth > MAX_WALK_DEPTH) {
-      debug(`walkWithVisitors: AST depth limit (${MAX_WALK_DEPTH}) hit — subtree truncated`);
-      return;
-    }
-
-    const type = node.type;
-    const isFuncBoundary = allFuncTypes.has(type);
-    let funcName: string | null = null;
-
-    if (isFuncBoundary) {
-      funcName = getFunctionName(node);
-      context.currentFunction = node;
-      scopeStack.push({ funcName, funcNode: node, params: new Map(), locals: new Map() });
-      dispatchEnterFunction(visitors, skipDepths, node, funcName, context, depth);
-    }
-
-    dispatchEnterNode(visitors, skipDepths, node, context, depth);
-
-    const addsNesting = nestingNodeTypes.has(type);
-    if (addsNesting) context.nestingLevel++;
-
-    for (let i = 0; i < node.childCount; i++) {
-      walk(node.child(i), depth + 1);
-    }
-
-    if (addsNesting) context.nestingLevel--;
-
-    dispatchExitNode(visitors, skipDepths, node, context, depth);
-    clearSkipFlags(skipDepths, visitors.length, depth);
-
-    if (isFuncBoundary) {
-      dispatchExitFunction(visitors, skipDepths, node, funcName, context, depth);
-      scopeStack.pop();
-      context.currentFunction =
-        scopeStack.length > 0 ? scopeStack[scopeStack.length - 1]!.funcNode : null;
-    }
-  }
-
-  walk(rootNode, 0);
-
+  const state = buildWalkState(visitors, langId, options);
+  walkNode(state, rootNode, 0);
   return collectResults(visitors);
 }

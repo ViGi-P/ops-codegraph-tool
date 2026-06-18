@@ -1327,6 +1327,26 @@ export interface CodegraphConfig {
      * Default: false.
      */
     typescriptResolver: boolean;
+    /**
+     * Engine selection override. Values: `'auto'` (default), `'native'`, `'wasm'`.
+     *
+     * **Current wiring (partial):** This field is populated by `applyEnvOverrides`
+     * from `CODEGRAPH_ENGINE` env var — env var → `config.build.engine`. The
+     * `--engine` CLI flag is also forwarded. However, `connection.ts` and
+     * `pipeline.ts` still read `process.env.CODEGRAPH_ENGINE` / `ctx.opts.engine`
+     * directly, so a value set only in `.codegraphrc.json` (not via env var or CLI)
+     * is silently ignored by the pipeline.
+     *
+     * Full config-file wiring is tracked in issue #1596.
+     */
+    engine: 'auto' | 'native' | 'wasm';
+    /**
+     * Enable diagnostic logging for the native fast-skip pre-flight check.
+     * Equivalent to `CODEGRAPH_FAST_SKIP_DIAG=1`. When true, logs why the
+     * fast-skip gate was skipped (e.g. forceFullRebuild, engineName mismatch).
+     * Default: false.
+     */
+    fastSkipDiag: boolean;
   };
 
   query: {
@@ -1405,6 +1425,13 @@ export interface CodegraphConfig {
      * constant of 50.  See TODO in `src/infrastructure/config.ts`.
      */
     pointsToMaxIterations: number;
+    /**
+     * Confidence score for a return type inferred from `return new Constructor()`
+     * with no explicit TypeScript annotation.
+     * Mirrors `INFERRED_RETURN_TYPE_CONFIDENCE` in `src/extractors/javascript.ts`.
+     * @reserved — not yet wired; see TODO in `src/infrastructure/config.ts`.
+     */
+    typeInferenceConfidence: number;
   };
 
   community: {

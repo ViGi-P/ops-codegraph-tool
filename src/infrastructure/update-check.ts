@@ -62,6 +62,33 @@ function saveCache(cache: UpdateCache, cachePath: string = CACHE_PATH): void {
 }
 
 /**
+ * Collect the full response body from an IncomingMessage stream.
+ * Resolves with the body string, or null on parse/status error.
+ */
+function collectResponseBody(res: import('node:http').IncomingMessage): Promise<string | null> {
+  return new Promise((resolve) => {
+    if (res.statusCode !== 200) {
+      res.resume();
+      resolve(null);
+      return;
+    }
+    let body = '';
+    res.setEncoding('utf-8');
+    res.on('data', (chunk: string) => {
+      body += chunk;
+    });
+    res.on('end', () => {
+      try {
+        const data = JSON.parse(body);
+        resolve(typeof data.version === 'string' ? data.version : null);
+      } catch {
+        resolve(null);
+      }
+    });
+  });
+}
+
+/**
  * Fetch the latest version string from the npm registry.
  * Returns the version string or null on failure.
  */
@@ -71,24 +98,7 @@ function fetchLatestVersion(): Promise<string | null> {
       REGISTRY_URL,
       { timeout: FETCH_TIMEOUT_MS, headers: { Accept: 'application/json' } },
       (res) => {
-        if (res.statusCode !== 200) {
-          res.resume();
-          resolve(null);
-          return;
-        }
-        let body = '';
-        res.setEncoding('utf-8');
-        res.on('data', (chunk: string) => {
-          body += chunk;
-        });
-        res.on('end', () => {
-          try {
-            const data = JSON.parse(body);
-            resolve(typeof data.version === 'string' ? data.version : null);
-          } catch {
-            resolve(null);
-          }
-        });
+        collectResponseBody(res).then(resolve);
       },
     );
     req.on('error', () => resolve(null));
@@ -107,6 +117,32 @@ interface UpdateResult {
 interface CheckForUpdatesOptions {
   cachePath?: string;
   _fetchLatest?: () => Promise<string | null>;
+}
+
+/**
+ * Return the latest version from cache if fresh, or fetch it from the registry.
+ * Persists the fetched version to the cache only when a network fetch occurs
+ * (i.e. the cache is stale or missing). Returns the cached value directly
+ * without updating the cache when the cache is still within `CACHE_TTL_MS`.
+ * Returns null when the network fetch fails or the cache is corrupt.
+ */
+async function resolveLatestVersion(
+  cachePath: string,
+  fetchFn: () => Promise<string | null>,
+): Promise<string | null> {
+  const cache = loadCache(cachePath);
+
+  if (cache && Date.now() - cache.lastCheckedAt < CACHE_TTL_MS) {
+    // Cache is fresh — use stored value directly
+    return cache.latestVersion;
+  }
+
+  // Cache is stale or missing — fetch from registry
+  const latest = await fetchFn();
+  if (!latest) return null;
+
+  saveCache({ lastCheckedAt: Date.now(), latestVersion: latest }, cachePath);
+  return latest;
 }
 
 /**
@@ -129,22 +165,8 @@ export async function checkForUpdates(
   const fetchFn = options._fetchLatest || fetchLatestVersion;
 
   try {
-    const cache = loadCache(cachePath);
-
-    // Cache is fresh — use it
-    if (cache && Date.now() - cache.lastCheckedAt < CACHE_TTL_MS) {
-      if (semverCompare(currentVersion, cache.latestVersion) < 0) {
-        return { current: currentVersion, latest: cache.latestVersion };
-      }
-      return null;
-    }
-
-    // Cache is stale or missing — fetch
-    const latest = await fetchFn();
+    const latest = await resolveLatestVersion(cachePath, fetchFn);
     if (!latest) return null;
-
-    // Update cache regardless of result
-    saveCache({ lastCheckedAt: Date.now(), latestVersion: latest }, cachePath);
 
     if (semverCompare(currentVersion, latest) < 0) {
       return { current: currentVersion, latest };

@@ -220,4 +220,99 @@ describe('classifyNodeRoles', () => {
     const role = db.prepare("SELECT role FROM nodes WHERE name = 'UnusedInterface'").get();
     expect(role.role).toBe('dead-unresolved');
   });
+
+  it('does not classify exported interface as dead when used only as same-file type annotation (#1583)', () => {
+    // Simulate: exported interface whose only usage is as a parameter type in the same file.
+    // No cross-file imports-type edge exists because same-file type annotations don't produce edges.
+    // The extractor marks the interface as exported=1. The classifier must honour that flag.
+    db.prepare('INSERT INTO nodes (name, kind, file, line, exported) VALUES (?, ?, ?, ?, ?)').run(
+      'MyOpts',
+      'interface',
+      'src/helpers.ts',
+      10,
+      1,
+    );
+
+    classifyNodeRoles(db);
+    const role = db.prepare("SELECT role FROM nodes WHERE name = 'MyOpts'").get();
+    // Should be entry (exported, fan-in 0), not dead-unresolved
+    expect(role.role).toBe('entry');
+  });
+
+  it('classifies non-exported interface with no callers as dead-unresolved (#1583 boundary)', () => {
+    // An interface without export keyword and without cross-file references is genuinely dead.
+    db.prepare('INSERT INTO nodes (name, kind, file, line, exported) VALUES (?, ?, ?, ?, ?)').run(
+      'InternalOpts',
+      'interface',
+      'src/helpers.ts',
+      20,
+      0,
+    );
+
+    classifyNodeRoles(db);
+    const role = db.prepare("SELECT role FROM nodes WHERE name = 'InternalOpts'").get();
+    expect(role.role).toBe('dead-unresolved');
+  });
+
+  it('does not classify struct/enum/trait as dead when file has active callables (#1584)', () => {
+    // Simulate a Rust file with struct definitions used as type parameters.
+    // The structs have fan_in=0 (no call edges — type annotations don't produce edges),
+    // but the file has active functions. The structs are almost certainly live.
+    insertNode('build_edges.rs', 'file', 'build_edges.rs', 0);
+    // An external caller that makes build_graph "active" (fan_in > 0)
+    const externalCaller = insertNode('main', 'function', 'main.rs', 1);
+    const fn1 = insertNode('build_graph', 'function', 'build_edges.rs', 10);
+    const fn2 = insertNode('resolve_imports', 'function', 'build_edges.rs', 50);
+    insertNode('NodeInfo', 'struct', 'build_edges.rs', 5);
+    insertNode('CallInfo', 'struct', 'build_edges.rs', 15);
+    insertNode('EdgeKind', 'enum', 'build_edges.rs', 25);
+    insertNode('Resolvable', 'trait', 'build_edges.rs', 35);
+
+    // The file has active callables: fn1 is called externally, fn1 calls fn2
+    insertEdge(externalCaller, fn1, 'calls');
+    insertEdge(fn1, fn2, 'calls');
+    // Structs have no call edges (they are used as type annotations only)
+
+    classifyNodeRoles(db);
+
+    const getRole = (name) => db.prepare('SELECT role FROM nodes WHERE name = ?').get(name)?.role;
+
+    // Functions are classified normally (they have edges)
+    expect(getRole('build_graph')).not.toMatch(/^dead/);
+    // Struct/enum/trait with active file siblings should be leaf, not dead
+    expect(getRole('NodeInfo')).toBe('leaf');
+    expect(getRole('CallInfo')).toBe('leaf');
+    expect(getRole('EdgeKind')).toBe('leaf');
+    expect(getRole('Resolvable')).toBe('leaf');
+  });
+
+  it('classifies struct with no active file siblings as dead (#1584 boundary)', () => {
+    // A struct in a file with no other active callables is genuinely dead.
+    insertNode('orphan.rs', 'file', 'orphan.rs', 0);
+    insertNode('OrphanStruct', 'struct', 'orphan.rs', 5);
+
+    classifyNodeRoles(db);
+    const role = db.prepare("SELECT role FROM nodes WHERE name = 'OrphanStruct'").get();
+    // No active callables in the file — the struct is dead (dead-ffi for .rs files)
+    expect(role.role).toMatch(/^dead/);
+  });
+
+  it('incremental path: does not classify exported interface as dead when used only as same-file type annotation (#1583)', () => {
+    // Exercises classifyNodeRolesIncremental (triggered by passing changedFiles).
+    // An exported=1 interface with no cross-file edges must be promoted to entry,
+    // not dead-unresolved, on the incremental path just as on the full path.
+    db.prepare('INSERT INTO nodes (name, kind, file, line, exported) VALUES (?, ?, ?, ?, ?)').run(
+      'IncrementalOpts',
+      'interface',
+      'src/helpers.ts',
+      30,
+      1,
+    );
+
+    // Pass the file as the changed-files list to trigger the incremental path.
+    classifyNodeRoles(db, ['src/helpers.ts']);
+    const role = db.prepare("SELECT role FROM nodes WHERE name = 'IncrementalOpts'").get();
+    // Should be entry (exported, fan-in 0), not dead-unresolved
+    expect(role.role).toBe('entry');
+  });
 });

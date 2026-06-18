@@ -242,19 +242,18 @@ interface PrunedEntry {
  *
  * When `dryRun` is true, entries are identified but not removed from disk.
  */
-export function pruneRegistry(
-  registryPath: string = REGISTRY_PATH,
-  ttlDays: number = DEFAULT_TTL_DAYS,
-  excludeNames: string[] = [],
-  dryRun = false,
+/**
+ * Walk `registry.repos`, identify entries that are missing on disk or have
+ * exceeded the TTL, and optionally delete them (when `dryRun` is false).
+ * Returns the list of entries that were (or would be) pruned.
+ */
+function pruneRepoEntries(
+  registry: Registry,
+  cutoff: number,
+  excludeSet: Set<string>,
+  dryRun: boolean,
 ): PrunedEntry[] {
-  const registry = loadRegistry(registryPath);
   const pruned: PrunedEntry[] = [];
-  const cutoff = Date.now() - ttlDays * 24 * 60 * 60 * 1000;
-  const excludeSet = new Set(
-    excludeNames.filter((n) => typeof n === 'string' && n.trim().length > 0),
-  );
-
   for (const [name, entry] of Object.entries(registry.repos)) {
     if (excludeSet.has(name)) continue;
     if (!fs.existsSync(entry.path)) {
@@ -268,18 +267,43 @@ export function pruneRegistry(
       if (!dryRun) delete registry.repos[name];
     }
   }
+  return pruned;
+}
 
-  // Prune consent entries whose repo paths no longer exist on disk.
-  // Consent entries are TTL-exempt — only the missing-path rule applies.
-  let consentChanged = false;
-  if (!dryRun && registry.userConfig?.consent) {
-    for (const p of Object.keys(registry.userConfig.consent)) {
-      if (!fs.existsSync(p)) {
-        delete registry.userConfig.consent[p];
-        consentChanged = true;
-      }
+/**
+ * Prune consent entries whose repo paths no longer exist on disk.
+ * Consent entries are TTL-exempt — only the missing-path rule applies.
+ * Returns true when at least one entry was removed.
+ */
+function pruneConsentEntries(consent: Record<string, ConsentDecision>): boolean {
+  let changed = false;
+  for (const p of Object.keys(consent)) {
+    if (!fs.existsSync(p)) {
+      delete consent[p];
+      changed = true;
     }
   }
+  return changed;
+}
+
+export function pruneRegistry(
+  registryPath: string = REGISTRY_PATH,
+  ttlDays: number = DEFAULT_TTL_DAYS,
+  excludeNames: string[] = [],
+  dryRun = false,
+): PrunedEntry[] {
+  const registry = loadRegistry(registryPath);
+  const cutoff = Date.now() - ttlDays * 24 * 60 * 60 * 1000;
+  const excludeSet = new Set(
+    excludeNames.filter((n) => typeof n === 'string' && n.trim().length > 0),
+  );
+
+  const pruned = pruneRepoEntries(registry, cutoff, excludeSet, dryRun);
+
+  const consentChanged =
+    !dryRun && registry.userConfig?.consent
+      ? pruneConsentEntries(registry.userConfig.consent)
+      : false;
 
   if (!dryRun && (pruned.length > 0 || consentChanged)) {
     saveRegistry(registry, registryPath);
