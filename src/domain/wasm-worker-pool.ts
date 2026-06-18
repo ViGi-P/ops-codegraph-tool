@@ -86,11 +86,14 @@ interface PendingJob {
  */
 const WORKER_PARSE_TIMEOUT_MS = 60_000;
 
-function deserializeResult(ser: SerializedExtractorOutput | null): ExtractorOutput | null {
-  if (!ser) return null;
+/** Deserialize the core fields and metadata scalars from a serialized result. */
+function deserializeCoreFields(
+  ser: SerializedExtractorOutput,
+): Pick<ExtractorOutput, 'definitions' | 'calls' | 'imports' | 'classes' | 'exports' | 'typeMap'> &
+  Partial<Pick<ExtractorOutput, '_langId' | '_lineCount' | 'dataflow' | 'astNodes'>> {
   const typeMap = new Map<string, TypeMapEntry>();
   for (const [k, v] of ser.typeMap) typeMap.set(k, v);
-  const out: ExtractorOutput = {
+  const out: ReturnType<typeof deserializeCoreFields> = {
     definitions: ser.definitions,
     calls: ser.calls,
     imports: ser.imports,
@@ -106,6 +109,11 @@ function deserializeResult(ser: SerializedExtractorOutput | null): ExtractorOutp
   // {line, kind, name, text?, receiver?} shape — see engine.ts:822 where the
   // visitor output is cast the same way.
   if (ser.astNodes !== undefined) out.astNodes = ser.astNodes as unknown as ASTNodeRow[];
+  return out;
+}
+
+/** Deserialize the simple array binding fields (present when non-empty). */
+function deserializeBindingFields(ser: SerializedExtractorOutput, out: ExtractorOutput): void {
   if (ser.fnRefBindings?.length) out.fnRefBindings = ser.fnRefBindings;
   if (ser.paramBindings?.length) out.paramBindings = ser.paramBindings;
   if (ser.arrayElemBindings?.length) out.arrayElemBindings = ser.arrayElemBindings;
@@ -117,6 +125,11 @@ function deserializeResult(ser: SerializedExtractorOutput | null): ExtractorOutp
   if (ser.objectPropBindings?.length) out.objectPropBindings = ser.objectPropBindings;
   if (ser.thisCallBindings?.length) out.thisCallBindings = ser.thisCallBindings;
   if (ser.newExpressions?.length) out.newExpressions = ser.newExpressions;
+  if (ser.callAssignments?.length) out.callAssignments = ser.callAssignments;
+}
+
+/** Deserialize the Map-typed fields that require entry-by-entry reconstruction. */
+function deserializeMapFields(ser: SerializedExtractorOutput, out: ExtractorOutput): void {
   if (ser.definePropertyReceivers?.length) {
     const m = new Map<string, string>();
     for (const [k, v] of ser.definePropertyReceivers) m.set(k, v);
@@ -127,7 +140,17 @@ function deserializeResult(ser: SerializedExtractorOutput | null): ExtractorOutp
     for (const [k, v] of ser.returnTypeMap) returnTypeMap.set(k, v);
     out.returnTypeMap = returnTypeMap;
   }
-  if (ser.callAssignments?.length) out.callAssignments = ser.callAssignments;
+}
+
+function deserializeResult(ser: SerializedExtractorOutput | null): ExtractorOutput | null {
+  if (!ser) return null;
+  // deserializeCoreFields supplies all required ExtractorOutput fields (definitions,
+  // calls, imports, classes, exports, typeMap). The cast is safe: every required field
+  // is present in the returned Pick. If a new required field is added to ExtractorOutput,
+  // add it to deserializeCoreFields' return Pick and body to keep the cast honest.
+  const out = { ...deserializeCoreFields(ser) } as ExtractorOutput;
+  deserializeBindingFields(ser, out);
+  deserializeMapFields(ser, out);
   return out;
 }
 

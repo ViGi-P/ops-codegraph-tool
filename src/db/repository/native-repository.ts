@@ -163,6 +163,61 @@ function toComplexityMetrics(r: NativeComplexityMetrics): ComplexityMetrics {
   };
 }
 
+// ── fnDeps conversion helpers ────────────────────────────────────────────
+
+/**
+ * Convert a native transitive-callers array (array of `{ depth, callers[] }`)
+ * into the JS `Record<number, FnDepsNode[]>` shape the Repository interface expects.
+ */
+function mapTransitiveCallers(groups: any[]): Record<number, FnDepsNode[]> {
+  const result: Record<number, FnDepsNode[]> = {};
+  for (const group of groups ?? []) {
+    result[group.depth] = (group.callers ?? []).map(
+      (c: any): FnDepsNode => ({
+        name: c.name,
+        kind: c.kind,
+        file: c.file,
+        line: c.line ?? null,
+      }),
+    );
+  }
+  return result;
+}
+
+/**
+ * Convert a single raw native fnDeps entry into the typed `FnDepsEntry` shape.
+ * Handles napi-rs camelCase → Repository snake_case field aliasing.
+ */
+function mapFnDepsEntry(entry: any): FnDepsEntry {
+  return {
+    name: entry.name,
+    kind: entry.kind,
+    file: entry.file,
+    line: entry.line ?? null,
+    endLine: entry.endLine ?? entry.end_line ?? null,
+    role: entry.role ?? null,
+    fileHash: entry.fileHash ?? entry.file_hash ?? null,
+    callees: (entry.callees ?? []).map(
+      (c: any): FnDepsNode => ({
+        name: c.name,
+        kind: c.kind,
+        file: c.file,
+        line: c.line ?? null,
+      }),
+    ),
+    callers: (entry.callers ?? []).map(
+      (c: any): FnDepsCallerNode => ({
+        name: c.name,
+        kind: c.kind,
+        file: c.file,
+        line: c.line ?? null,
+        viaHierarchy: c.viaHierarchy ?? c.via_hierarchy ?? undefined,
+      }),
+    ),
+    transitiveCallers: mapTransitiveCallers(entry.transitiveCallers),
+  };
+}
+
 // ── NativeRepository ────────────────────────────────────────────────────
 
 export class NativeRepository extends Repository {
@@ -485,46 +540,7 @@ export class NativeRepository extends Repository {
     // to JS format (transitiveCallers as Record<number, Array>)
     return {
       name: raw.name,
-      results: raw.results.map((entry: any): FnDepsEntry => {
-        const transitiveCallers: Record<number, FnDepsNode[]> = {};
-        for (const group of entry.transitiveCallers ?? []) {
-          transitiveCallers[group.depth] = (group.callers ?? []).map(
-            (c: any): FnDepsNode => ({
-              name: c.name,
-              kind: c.kind,
-              file: c.file,
-              line: c.line ?? null,
-            }),
-          );
-        }
-        return {
-          name: entry.name,
-          kind: entry.kind,
-          file: entry.file,
-          line: entry.line ?? null,
-          endLine: entry.endLine ?? entry.end_line ?? null,
-          role: entry.role ?? null,
-          fileHash: entry.fileHash ?? entry.file_hash ?? null,
-          callees: (entry.callees ?? []).map(
-            (c: any): FnDepsNode => ({
-              name: c.name,
-              kind: c.kind,
-              file: c.file,
-              line: c.line ?? null,
-            }),
-          ),
-          callers: (entry.callers ?? []).map(
-            (c: any): FnDepsCallerNode => ({
-              name: c.name,
-              kind: c.kind,
-              file: c.file,
-              line: c.line ?? null,
-              viaHierarchy: c.viaHierarchy ?? c.via_hierarchy ?? undefined,
-            }),
-          ),
-          transitiveCallers,
-        };
-      }),
+      results: raw.results.map(mapFnDepsEntry),
     };
   }
 }

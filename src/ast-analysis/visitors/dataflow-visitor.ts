@@ -287,6 +287,28 @@ function handleAssignment(
   }
 }
 
+/** Unwrap argument wrapper and spread nodes to get the core argument node. */
+function unwrapArg(
+  arg: TreeSitterNode,
+  rules: AnyRules,
+): { unwrapped: TreeSitterNode; raw: TreeSitterNode } {
+  let raw = arg;
+  if (rules.argumentWrapperType && arg.type === rules.argumentWrapperType) {
+    raw = arg.namedChildren[0] || arg;
+  }
+  const unwrapped =
+    rules.spreadType && raw.type === rules.spreadType ? raw.namedChildren[0] || raw : raw;
+  return { unwrapped, raw };
+}
+
+/** Resolve the tracked name for a call argument (identifier or member receiver). */
+function resolveArgTrackedName(node: TreeSitterNode, rules: AnyRules): string | null {
+  const argName = isIdent(node.type, rules) ? node.text : null;
+  const argMember =
+    rules.memberNode && node.type === rules.memberNode ? memberReceiver(node, rules) : null;
+  return argName || argMember;
+}
+
 function handleCallExpr(
   node: TreeSitterNode,
   rules: AnyRules,
@@ -299,24 +321,14 @@ function handleCallExpr(
   if (!callee || !argsNode || !scope?.funcName) return;
 
   let argIndex = 0;
-  for (let arg of argsNode.namedChildren) {
-    if (rules.argumentWrapperType && arg.type === rules.argumentWrapperType) {
-      arg = arg.namedChildren[0] || arg;
-    }
-    const unwrapped =
-      rules.spreadType && arg.type === rules.spreadType ? arg.namedChildren[0] || arg : arg;
+  for (const arg of argsNode.namedChildren) {
+    const { unwrapped, raw } = unwrapArg(arg, rules);
     if (!unwrapped) {
       argIndex++;
       continue;
     }
 
-    const argName = isIdent(unwrapped.type, rules) ? unwrapped.text : null;
-    const argMember =
-      rules.memberNode && unwrapped.type === rules.memberNode
-        ? memberReceiver(unwrapped, rules)
-        : null;
-    const trackedName = argName || argMember;
-
+    const trackedName = resolveArgTrackedName(unwrapped, rules);
     if (trackedName) {
       const binding = findBinding(trackedName, scopeStack);
       if (binding) {
@@ -327,7 +339,7 @@ function handleCallExpr(
           argName: trackedName,
           binding,
           confidence: bindingConfidence(binding),
-          expression: truncate(arg.text),
+          expression: truncate(raw.text),
           line: node.startPosition.row + 1,
         });
       }
@@ -336,17 +348,11 @@ function handleCallExpr(
   }
 }
 
-function handleExprStmtMutation(
-  node: TreeSitterNode,
+/** Resolve the method name and receiver from a call expression node. */
+function resolveMutationCallParts(
+  expr: TreeSitterNode,
   rules: AnyRules,
-  scopeStack: ScopeEntry[],
-  mutations: DataflowMutation[],
-  isCallNode: (t: string) => boolean,
-): void {
-  if (rules.mutatingMethods.size === 0) return;
-  const expr = node.namedChildren[0];
-  if (!expr || !isCall(expr, isCallNode)) return;
-
+): { methodName: string | null; receiver: string | null } {
   let methodName: string | null = null;
   let receiver: string | null = null;
 
@@ -366,6 +372,21 @@ function handleExprStmtMutation(
     }
   }
 
+  return { methodName, receiver };
+}
+
+function handleExprStmtMutation(
+  node: TreeSitterNode,
+  rules: AnyRules,
+  scopeStack: ScopeEntry[],
+  mutations: DataflowMutation[],
+  isCallNode: (t: string) => boolean,
+): void {
+  if (rules.mutatingMethods.size === 0) return;
+  const expr = node.namedChildren[0];
+  if (!expr || !isCall(expr, isCallNode)) return;
+
+  const { methodName, receiver } = resolveMutationCallParts(expr, rules);
   if (!methodName || !rules.mutatingMethods.has(methodName)) return;
 
   const scope = currentScope(scopeStack);

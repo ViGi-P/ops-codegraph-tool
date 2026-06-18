@@ -29,29 +29,20 @@ export function toSymbolRef(row: { name: string; kind: string; file: string; lin
   return { name: row.name, kind: row.kind, file: row.file, line: row.line };
 }
 
+const KIND_ICONS: Readonly<Record<string, string>> = {
+  function: 'f',
+  class: '*',
+  method: 'o',
+  file: '#',
+  interface: 'I',
+  type: 'T',
+  parameter: 'p',
+  property: '.',
+  constant: 'C',
+};
+
 export function kindIcon(kind: string): string {
-  switch (kind) {
-    case 'function':
-      return 'f';
-    case 'class':
-      return '*';
-    case 'method':
-      return 'o';
-    case 'file':
-      return '#';
-    case 'interface':
-      return 'I';
-    case 'type':
-      return 'T';
-    case 'parameter':
-      return 'p';
-    case 'property':
-      return '.';
-    case 'constant':
-      return 'C';
-    default:
-      return '-';
-  }
+  return KIND_ICONS[kind] ?? '-';
 }
 
 export interface NormalizedSymbol {

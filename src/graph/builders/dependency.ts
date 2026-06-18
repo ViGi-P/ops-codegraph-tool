@@ -78,6 +78,37 @@ interface MinConfidenceEdgeRow {
   target_id: number;
 }
 
+/**
+ * Fetch call edges from `dbOrRepo`, optionally filtered by a minimum confidence
+ * threshold. When `minConfidence` is unset, all call edges are returned.
+ */
+function resolveCallEdges(
+  dbOrRepo: BetterSqlite3Database | Repository,
+  isRepo: boolean,
+  minConfidence?: number,
+): CallEdgeRow[] | MinConfidenceEdgeRow[] {
+  if (minConfidence == null) {
+    return isRepo
+      ? (dbOrRepo as Repository).getCallEdges()
+      : getCallEdges(dbOrRepo as BetterSqlite3Database);
+  }
+  if (isRepo) {
+    // Trade-off: Repository.getCallEdges() returns all call edges, so we
+    // filter in JS. This is O(all call edges) rather than the SQL path's
+    // indexed WHERE clause. Acceptable for current data sizes; a dedicated
+    // getCallEdgesByMinConfidence(threshold) method on the Repository
+    // interface would be the proper fix if this becomes a bottleneck.
+    return (dbOrRepo as Repository)
+      .getCallEdges()
+      .filter((e) => e.confidence != null && e.confidence >= minConfidence);
+  }
+  return (dbOrRepo as BetterSqlite3Database)
+    .prepare<MinConfidenceEdgeRow>(
+      "SELECT source_id, target_id FROM edges WHERE kind = 'calls' AND confidence >= ?",
+    )
+    .all(minConfidence);
+}
+
 function buildFunctionLevelGraph(
   dbOrRepo: BetterSqlite3Database | Repository,
   noTests: boolean,
@@ -86,7 +117,9 @@ function buildFunctionLevelGraph(
   const graph = new CodeGraph();
   const isRepo = dbOrRepo instanceof Repository;
 
-  let nodes: CallableNodeRow[] = isRepo ? dbOrRepo.getCallableNodes() : getCallableNodes(dbOrRepo);
+  let nodes: CallableNodeRow[] = isRepo
+    ? (dbOrRepo as Repository).getCallableNodes()
+    : getCallableNodes(dbOrRepo as BetterSqlite3Database);
   if (noTests) nodes = nodes.filter((n) => !isTestFile(n.file));
 
   const nodeIds = new Set<number>();
@@ -100,28 +133,7 @@ function buildFunctionLevelGraph(
     nodeIds.add(n.id);
   }
 
-  let edges: CallEdgeRow[] | MinConfidenceEdgeRow[];
-  if (minConfidence != null) {
-    if (isRepo) {
-      // Trade-off: Repository.getCallEdges() returns all call edges, so we
-      // filter in JS. This is O(all call edges) rather than the SQL path's
-      // indexed WHERE clause. Acceptable for current data sizes; a dedicated
-      // getCallEdgesByMinConfidence(threshold) method on the Repository
-      // interface would be the proper fix if this becomes a bottleneck.
-      edges = dbOrRepo
-        .getCallEdges()
-        .filter((e) => e.confidence != null && e.confidence >= minConfidence);
-    } else {
-      edges = (dbOrRepo as BetterSqlite3Database)
-        .prepare<MinConfidenceEdgeRow>(
-          "SELECT source_id, target_id FROM edges WHERE kind = 'calls' AND confidence >= ?",
-        )
-        .all(minConfidence);
-    }
-  } else {
-    edges = isRepo ? dbOrRepo.getCallEdges() : getCallEdges(dbOrRepo);
-  }
-
+  const edges = resolveCallEdges(dbOrRepo, isRepo, minConfidence);
   for (const e of edges) {
     if (!nodeIds.has(e.source_id) || !nodeIds.has(e.target_id)) continue;
     const src = String(e.source_id);
