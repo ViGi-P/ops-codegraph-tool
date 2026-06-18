@@ -7,7 +7,7 @@ export { cachedStmt } from './cached-stmt.js';
 export { deleteCfgForNode, getCfgBlocks, getCfgEdges, hasCfgTables } from './cfg.js';
 export { getCoChangeMeta, hasCoChanges, upsertCoChangeMeta } from './cochange.js';
 export { getComplexityForNode } from './complexity.js';
-export { hasDataflowTable } from './dataflow.js';
+export { hasDataflowTable, hasDataflowVertices } from './dataflow.js';
 export {
   countCrossFileCallers,
   findAllIncomingEdges,

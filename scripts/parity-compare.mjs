@@ -39,6 +39,8 @@ function usage() {
       '                  e.g. javascript,pts-javascript,python)',
       '  --hybrid        Also build via the hybrid path (JS pipeline + native',
       '                  buildCallEdges) and compare it against the wasm baseline',
+      '  --dataflow      Enable dataflow extraction and compare dataflow_vertices',
+      '                  multisets (requires migration v18)',
       '  --json          Machine-readable report on stdout (logs stay on stderr)',
       '  -h, --help      Show this help',
     ].join('\n'),
@@ -50,6 +52,7 @@ function usage() {
 const args = process.argv.slice(2);
 let langsFilter = null;
 let hybrid = false;
+let dataflow = false;
 let json = false;
 for (let i = 0; i < args.length; i++) {
   const a = args[i];
@@ -66,6 +69,8 @@ for (let i = 0; i < args.length; i++) {
       .filter(Boolean);
   } else if (a === '--hybrid') {
     hybrid = true;
+  } else if (a === '--dataflow') {
+    dataflow = true;
   } else if (a === '--json') {
     json = true;
   } else if (a === '-h' || a === '--help') {
@@ -127,12 +132,11 @@ if (langsFilter) {
 
 // ── Build + read helpers ──────────────────────────────────────────────────
 
-// dataflow/cfg/ast are out of scope for the node+edge parity surface; the
-// rest of the options stay at CLI defaults so the comparison reflects what a
-// real `codegraph build` produces.
+// cfg/ast are out of scope for the node+edge parity surface. dataflow is
+// opt-in via --dataflow to also compare dataflow_vertices multisets.
 const BUILD_OPTS = {
   incremental: false,
-  dataflow: false,
+  dataflow,
   cfg: false,
   ast: false,
   skipRegistry: true,
@@ -163,7 +167,32 @@ function bump(map, key) {
   map.set(key, (map.get(key) ?? 0) + 1);
 }
 
-function readMultisets(dir) {
+function readDataflowVerticesMultiset(db) {
+  const vertices = new Map();
+  try {
+    const rows = db
+      .prepare(
+        `SELECT dv.kind, dv.name, dv.param_index, dv.line,
+                n.name AS func_name, n.file AS func_file
+         FROM dataflow_vertices dv
+         JOIN nodes n ON n.id = dv.func_id`,
+      )
+      .all();
+    for (const r of rows) {
+      bump(
+        vertices,
+        `${r.func_file}:${r.func_name}|${r.kind}|${r.name ?? ''}|pi=${r.param_index ?? ''}|line=${r.line ?? ''}`,
+      );
+    }
+    vertices.set('__TOTAL_ROWS__', rows.length);
+  } catch {
+    // table absent in pre-v18 DBs; empty multiset = no diffs
+    vertices.set('__TOTAL_ROWS__', 0);
+  }
+  return vertices;
+}
+
+function readMultisets(dir, includeDataflow = false) {
   const db = new Database(join(dir, '.codegraph', 'graph.db'), { readonly: true });
   try {
     const nodes = new Map();
@@ -190,7 +219,9 @@ function readMultisets(dir) {
       );
     }
     edges.set('__TOTAL_ROWS__', edgeRows.length);
-    return { nodes, edges };
+
+    const dfVertices = includeDataflow ? readDataflowVerticesMultiset(db) : new Map();
+    return { nodes, edges, dfVertices };
   } finally {
     db.close();
   }
@@ -221,7 +252,7 @@ for (const fixture of fixtures) {
 
   try {
     const wasmDir = await buildEngine(fixtureDir, 'wasm', `${fixture}-wasm`, tempDirs);
-    const base = readMultisets(wasmDir);
+    const base = readMultisets(wasmDir, dataflow);
 
     const nativeDir = await buildEngine(fixtureDir, 'native', `${fixture}-native`, tempDirs);
     const variants = [['native', nativeDir]];
@@ -231,10 +262,11 @@ for (const fixture of fixtures) {
     }
 
     for (const [variantName, dir] of variants) {
-      const other = readMultisets(dir);
+      const other = readMultisets(dir, dataflow);
       const nodeDiffs = diffMultisets(base.nodes, other.nodes);
       const edgeDiffs = diffMultisets(base.edges, other.edges);
-      const ok = nodeDiffs.length === 0 && edgeDiffs.length === 0;
+      const dfVertexDiffs = dataflow ? diffMultisets(base.dfVertices, other.dfVertices) : [];
+      const ok = nodeDiffs.length === 0 && edgeDiffs.length === 0 && dfVertexDiffs.length === 0;
       if (!ok) report.ok = false;
       entry.comparisons.push({
         baseline: 'wasm',
@@ -242,26 +274,34 @@ for (const fixture of fixtures) {
         ok,
         nodeCount: base.nodes.get('__TOTAL_ROWS__'),
         edgeCount: base.edges.get('__TOTAL_ROWS__'),
+        dfVertexCount: dataflow ? base.dfVertices.get('__TOTAL_ROWS__') : undefined,
         nodeDiffs,
         edgeDiffs,
+        dfVertexDiffs,
       });
 
       if (!json) {
+        const dfSuffix = dataflow
+          ? `, ${base.dfVertices.get('__TOTAL_ROWS__')} df-vertices`
+          : '';
         if (ok) {
           console.log(
             `=== ${fixture}: wasm vs ${variantName} OK ` +
-              `(${base.nodes.get('__TOTAL_ROWS__')} nodes, ${base.edges.get('__TOTAL_ROWS__')} edges)`,
+              `(${base.nodes.get('__TOTAL_ROWS__')} nodes, ${base.edges.get('__TOTAL_ROWS__')} edges${dfSuffix})`,
           );
         } else {
           console.log(
             `=== ${fixture}: wasm vs ${variantName} DIVERGED ` +
-              `(${nodeDiffs.length} node diffs, ${edgeDiffs.length} edge diffs)`,
+              `(${nodeDiffs.length} node diffs, ${edgeDiffs.length} edge diffs${dataflow ? `, ${dfVertexDiffs.length} df-vertex diffs` : ''})`,
           );
           for (const d of nodeDiffs) {
             console.log(`  [node] ${d.key}  wasm=${d.base} ${variantName}=${d.other}`);
           }
           for (const d of edgeDiffs) {
             console.log(`  [edge] ${d.key}  wasm=${d.base} ${variantName}=${d.other}`);
+          }
+          for (const d of dfVertexDiffs) {
+            console.log(`  [df-vertex] ${d.key}  wasm=${d.base} ${variantName}=${d.other}`);
           }
         }
       }

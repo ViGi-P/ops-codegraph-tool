@@ -269,6 +269,62 @@ const MIGRATIONS: &[Migration] = &[
       CREATE INDEX IF NOT EXISTS idx_edges_kind_source ON edges(kind, source_id);
     "#,
     },
+    Migration {
+        version: 17,
+        up: r#"
+      ALTER TABLE edges ADD COLUMN technique TEXT;
+      CREATE INDEX IF NOT EXISTS idx_edges_technique ON edges(technique);
+    "#,
+    },
+    Migration {
+        version: 18,
+        up: r#"
+      CREATE TABLE IF NOT EXISTS dataflow_vertices (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        func_id     INTEGER NOT NULL REFERENCES nodes(id),
+        kind        TEXT NOT NULL,
+        name        TEXT,
+        param_index INTEGER,
+        line        INTEGER,
+        node_id     INTEGER REFERENCES nodes(id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_dfv_func ON dataflow_vertices(func_id);
+      CREATE INDEX IF NOT EXISTS idx_dfv_func_kind ON dataflow_vertices(func_id, kind);
+      CREATE INDEX IF NOT EXISTS idx_dfv_node ON dataflow_vertices(node_id);
+
+      ALTER TABLE dataflow ADD COLUMN source_vertex INTEGER REFERENCES dataflow_vertices(id);
+      ALTER TABLE dataflow ADD COLUMN target_vertex INTEGER REFERENCES dataflow_vertices(id);
+      ALTER TABLE dataflow ADD COLUMN scope TEXT;
+      ALTER TABLE dataflow ADD COLUMN call_edge_id INTEGER REFERENCES edges(id);
+
+      CREATE INDEX IF NOT EXISTS idx_dataflow_sv ON dataflow(source_vertex);
+      CREATE INDEX IF NOT EXISTS idx_dataflow_tv ON dataflow(target_vertex);
+      CREATE INDEX IF NOT EXISTS idx_dataflow_scope ON dataflow(scope);
+
+      CREATE TABLE IF NOT EXISTS dataflow_summary (
+        func_id     INTEGER NOT NULL REFERENCES nodes(id),
+        param_index INTEGER NOT NULL,
+        flows_to_return INTEGER NOT NULL DEFAULT 0,
+        is_mutated  INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY(func_id, param_index)
+      );
+      CREATE INDEX IF NOT EXISTS idx_dfs_func ON dataflow_summary(func_id);
+
+      CREATE VIEW IF NOT EXISTS dataflow_fn AS
+        SELECT
+          sv.func_id AS source_id,
+          tv.func_id AS target_id,
+          d.kind,
+          d.param_index,
+          d.expression,
+          d.line,
+          d.confidence
+        FROM dataflow d
+        JOIN dataflow_vertices sv ON d.source_vertex = sv.id
+        JOIN dataflow_vertices tv ON d.target_vertex = tv.id
+        WHERE sv.func_id != tv.func_id;
+    "#,
+    },
 ];
 
 // ── napi types ──────────────────────────────────────────────────────────

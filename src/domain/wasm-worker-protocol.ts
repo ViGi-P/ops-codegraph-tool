@@ -77,6 +77,8 @@ export interface SerializedExtractorOutput {
   definePropertyReceivers?: Array<[string, string]>;
   returnTypeMap?: Array<[string, TypeMapEntry]>;
   callAssignments?: CallAssignment[];
+  /** Variable-level dataflow vertices extracted during parsing (P1+). */
+  dataflowVertices?: import('../types.js').DataflowVertex[];
 }
 
 export interface WorkerParseResponseOk {

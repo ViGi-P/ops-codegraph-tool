@@ -71,6 +71,7 @@ export {
   hasCfgTables,
   hasCoChanges,
   hasDataflowTable,
+  hasDataflowVertices,
   hasEmbeddings,
   InMemoryRepository,
   iterateFunctionNodes,

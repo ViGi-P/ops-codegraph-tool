@@ -5,6 +5,9 @@ interface PurgeStmts {
   cfgEdges: SqliteStatement | null;
   cfgBlocks: SqliteStatement | null;
   dataflow: SqliteStatement | null;
+  dataflowByVertex: SqliteStatement | null;
+  dataflowSummary: SqliteStatement | null;
+  dataflowVertices: SqliteStatement | null;
   complexity: SqliteStatement | null;
   nodeMetrics: SqliteStatement | null;
   astNodes: SqliteStatement | null;
@@ -44,6 +47,16 @@ function preparePurgeStmts(db: BetterSqlite3Database): PurgeStmts {
     dataflow: tryPrepare(
       'DELETE FROM dataflow WHERE source_id IN (SELECT id FROM nodes WHERE file = ?) OR target_id IN (SELECT id FROM nodes WHERE file = ?)',
     ),
+    dataflowByVertex: tryPrepare(
+      `DELETE FROM dataflow WHERE source_vertex IN (SELECT id FROM dataflow_vertices WHERE func_id IN (SELECT id FROM nodes WHERE file = ?))
+         OR target_vertex IN (SELECT id FROM dataflow_vertices WHERE func_id IN (SELECT id FROM nodes WHERE file = ?))`,
+    ),
+    dataflowSummary: tryPrepare(
+      'DELETE FROM dataflow_summary WHERE func_id IN (SELECT id FROM nodes WHERE file = ?)',
+    ),
+    dataflowVertices: tryPrepare(
+      'DELETE FROM dataflow_vertices WHERE func_id IN (SELECT id FROM nodes WHERE file = ?)',
+    ),
     complexity: tryPrepare(
       'DELETE FROM function_complexity WHERE node_id IN (SELECT id FROM nodes WHERE file = ?)',
     ),
@@ -80,6 +93,9 @@ function runPurge(stmts: PurgeStmts, file: string, opts: PurgeOpts = {}): void {
   stmts.cfgEdges?.run(file);
   stmts.cfgBlocks?.run(file);
   stmts.dataflow?.run(file, file);
+  stmts.dataflowByVertex?.run(file, file);
+  stmts.dataflowSummary?.run(file);
+  stmts.dataflowVertices?.run(file);
   stmts.complexity?.run(file);
   stmts.nodeMetrics?.run(file);
   stmts.astNodes?.run(file);
