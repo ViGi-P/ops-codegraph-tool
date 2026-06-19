@@ -185,8 +185,11 @@ function readDataflowVerticesMultiset(db) {
       );
     }
     vertices.set('__TOTAL_ROWS__', rows.length);
-  } catch {
-    // table absent in pre-v18 DBs; empty multiset = no diffs
+  } catch (err) {
+    // Only suppress "no such table" — that means a pre-v18 DB that hasn't been
+    // migrated yet; anything else (schema drift, corrupt DB, malformed query)
+    // is a real error and must propagate so divergences aren't silently hidden.
+    if (!String(err).includes('no such table')) throw err;
     vertices.set('__TOTAL_ROWS__', 0);
   }
   return vertices;
@@ -265,8 +268,13 @@ for (const fixture of fixtures) {
       const other = readMultisets(dir, dataflow);
       const nodeDiffs = diffMultisets(base.nodes, other.nodes);
       const edgeDiffs = diffMultisets(base.edges, other.edges);
-      const dfVertexDiffs = dataflow ? diffMultisets(base.dfVertices, other.dfVertices) : [];
-      const ok = nodeDiffs.length === 0 && edgeDiffs.length === 0 && dfVertexDiffs.length === 0;
+      const dfVertexDiffs = dataflow
+        ? diffMultisets(base.dfVertices, other.dfVertices)
+        : undefined;
+      const ok =
+        nodeDiffs.length === 0 &&
+        edgeDiffs.length === 0 &&
+        (dfVertexDiffs === undefined || dfVertexDiffs.length === 0);
       if (!ok) report.ok = false;
       entry.comparisons.push({
         baseline: 'wasm',

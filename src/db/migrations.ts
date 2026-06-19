@@ -297,6 +297,11 @@ export const MIGRATIONS: Migration[] = [
       );
       CREATE INDEX IF NOT EXISTS idx_dfs_func ON dataflow_summary(func_id);
 
+      -- dataflow_fn exposes only vertex-linked (v18+) interprocedural flows.
+      -- The INNER JOINs intentionally exclude pre-v18 rows where source_vertex
+      -- and target_vertex are NULL — this is NOT a backward-compat replacement
+      -- for querying the dataflow table directly; legacy consumers must continue
+      -- to query dataflow directly to avoid silently dropping historical rows.
       CREATE VIEW IF NOT EXISTS dataflow_fn AS
         SELECT
           sv.func_id AS source_id,
