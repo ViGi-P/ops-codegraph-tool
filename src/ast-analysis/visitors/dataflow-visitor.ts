@@ -426,17 +426,23 @@ function handleReturn(
   }
 }
 
-/** Collect parameter entries for a function and push a new scope onto the stack. */
+/**
+ * Collect parameter entries for a function and push a new scope onto the stack.
+ *
+ * Returns `true` if a scope was pushed, `false` if the node was skipped (i.e.
+ * `nameExtractor` rejected it). Callers must pop the stack only when this
+ * returns `true` to keep push/pop symmetric.
+ */
 function enterFunctionScope(
   funcNode: TreeSitterNode,
   rules: AnyRules,
   scopeStack: ScopeEntry[],
   parameters: DataflowParam[],
-): void {
+): boolean {
   // When nameExtractor is set it acts as a gate: null means this node is not a function
   // definition. Needed for languages (Elixir, Clojure) where functionNodes includes generic
   // node types (call/list_lit) that are only sometimes function definitions.
-  if (rules.nameExtractor && !rules.nameExtractor(funcNode)) return;
+  if (rules.nameExtractor && !rules.nameExtractor(funcNode)) return false;
   const name = functionName(funcNode, rules);
   const paramsNode = rules.getParamListNode
     ? rules.getParamListNode(funcNode)
@@ -455,6 +461,7 @@ function enterFunctionScope(
     }
   }
   scopeStack.push({ funcName: name, funcNode, params: paramMap, locals: new Map() });
+  return true;
 }
 
 interface DataflowDispatchCtx {
@@ -516,6 +523,11 @@ export function createDataflowVisitor(rules: AnyRules): Visitor {
   const argFlows: DataflowArgFlow[] = [];
   const mutations: DataflowMutation[] = [];
   const scopeStack: ScopeEntry[] = [];
+  // Parallel stack that records whether each enterFunction call actually pushed a
+  // scope frame.  exitFunction pops scopeStack only when the matching entry is true,
+  // keeping push/pop symmetric even for languages (Elixir, Clojure) where
+  // enterFunctionScope may return early without pushing.
+  const pushRecord: boolean[] = [];
 
   const dispatchCtx: DataflowDispatchCtx = {
     rules,
@@ -536,7 +548,7 @@ export function createDataflowVisitor(rules: AnyRules): Visitor {
       _funcName: string | null,
       _context: VisitorContext,
     ): void {
-      enterFunctionScope(funcNode, rules, scopeStack, parameters);
+      pushRecord.push(enterFunctionScope(funcNode, rules, scopeStack, parameters));
     },
 
     exitFunction(
@@ -544,7 +556,7 @@ export function createDataflowVisitor(rules: AnyRules): Visitor {
       _funcName: string | null,
       _context: VisitorContext,
     ): void {
-      scopeStack.pop();
+      if (pushRecord.pop()) scopeStack.pop();
     },
 
     enterNode(node: TreeSitterNode, _context: VisitorContext): EnterNodeResult | undefined {
