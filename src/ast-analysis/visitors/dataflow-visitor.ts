@@ -433,6 +433,10 @@ function enterFunctionScope(
   scopeStack: ScopeEntry[],
   parameters: DataflowParam[],
 ): void {
+  // When nameExtractor is set it acts as a gate: null means this node is not a function
+  // definition. Needed for languages (Elixir, Clojure) where functionNodes includes generic
+  // node types (call/list_lit) that are only sometimes function definitions.
+  if (rules.nameExtractor && !rules.nameExtractor(funcNode)) return;
   const name = functionName(funcNode, rules);
   const paramsNode = rules.getParamListNode
     ? rules.getParamListNode(funcNode)

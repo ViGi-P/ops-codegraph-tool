@@ -4,6 +4,10 @@ import type {
   DataflowRulesConfig,
   HalsteadRules,
 } from '../../types.js';
+import * as b2 from './b2.js';
+import * as b3 from './b3.js';
+import * as b4 from './b4.js';
+import * as b5 from './b5.js';
 import * as c from './c.js';
 import * as csharp from './csharp.js';
 import * as go from './go.js';
@@ -77,6 +81,30 @@ export const DATAFLOW_RULES: Map<string, DataflowRulesConfig> = new Map([
   ['cpp', c.dataflowCpp],
   ['objc', c.dataflow], // ObjC C-compatible functions; ObjC methods TODO
   ['cuda', c.dataflowCpp], // CUDA inherits C++ grammar
+  // P5 Batch B2: JVM/mobile languages
+  ['kotlin', b2.dataflowKotlin],
+  ['swift', b2.dataflowSwift],
+  ['scala', b2.dataflowScala],
+  ['dart', b2.dataflowDart],
+  ['groovy', b2.dataflowGroovy],
+  // P5 Batch B3: scripting/dynamic languages
+  ['lua', b3.dataflowLua],
+  ['r', b3.dataflowR],
+  ['julia', b3.dataflowJulia],
+  ['bash', b3.dataflowBash],
+  // P5 Batch B4: functional languages
+  ['haskell', b4.dataflowHaskell],
+  ['ocaml', b4.dataflowOCaml],
+  ['ocaml-interface', b4.dataflowOCaml],
+  ['fsharp', b4.dataflowFSharp],
+  ['fsharp-signature', b4.dataflowFSharp],
+  ['gleam', b4.dataflowGleam],
+  ['elixir', b4.dataflowElixir],
+  ['erlang', b4.dataflowErlang],
+  ['clojure', b4.dataflowClojure],
+  // P5 Batch B5: systems/blockchain languages
+  ['zig', b5.dataflowZig],
+  ['solidity', b5.dataflowSolidity],
 ]);
 
 // ─── AST Node Type Maps ──────────────────────────────────────────────────

@@ -625,16 +625,27 @@ async function collectCallerStitchCandidates(
   // Find distinct caller files that have flows_to edges targeting any changed
   // function and are NOT already in the changed file set (those are handled by
   // the main per-file loop).
-  const placeholders = changedFuncIds.map(() => '?').join(',');
-  const callerFileRows = db
-    .prepare(
-      `SELECT DISTINCT n.file AS caller_file
-       FROM dataflow d
-       JOIN nodes n ON n.id = d.source_id
-       WHERE d.target_id IN (${placeholders})
-         AND d.kind = 'flows_to'`,
-    )
-    .all(...changedFuncIds) as { caller_file: string }[];
+  //
+  // Chunk the query to avoid exceeding SQLite's SQLITE_MAX_VARIABLE_NUMBER
+  // (999 on older builds, 32766 on SQLite ≥ 3.32).  500 is a safe batch size
+  // that works across all SQLite versions.
+  const CHUNK_SIZE = 500;
+  const callerFileSet = new Set<string>();
+  for (let i = 0; i < changedFuncIds.length; i += CHUNK_SIZE) {
+    const chunk = changedFuncIds.slice(i, i + CHUNK_SIZE);
+    const placeholders = chunk.map(() => '?').join(',');
+    const rows = db
+      .prepare(
+        `SELECT DISTINCT n.file AS caller_file
+         FROM dataflow d
+         JOIN nodes n ON n.id = d.source_id
+         WHERE d.target_id IN (${placeholders})
+           AND d.kind = 'flows_to'`,
+      )
+      .all(...chunk) as { caller_file: string }[];
+    for (const r of rows) callerFileSet.add(r.caller_file);
+  }
+  const callerFileRows = [...callerFileSet].map((f) => ({ caller_file: f }));
 
   const callerFiles = callerFileRows
     .map((r) => r.caller_file)
@@ -659,6 +670,10 @@ async function collectCallerStitchCandidates(
 
   for (const callerFile of callerFiles) {
     // Read the caller file from disk without touching its existing DB rows.
+    // definitions: [] is an intentional stub — P4 only needs argFlow/assignment
+    // data from the visitor, not pre-loaded symbol definitions.  extractDataflow
+    // does not currently use _definitions, so this is safe.  If that changes,
+    // the stub must be replaced with the actual symbol list for the caller file.
     const stub: FileSymbolsDataflow = { definitions: [], _langId: null, _tree: null };
     const data = getDataflowForFile(
       stub,
@@ -870,7 +885,14 @@ export async function buildDataflowEdges(
   // the changed functions were not in fileSymbols, so their arg_in edges were
   // deleted by the purge but never reconstructed. Re-collect stitch candidates
   // from those caller files now (read from disk, no DB writes).
-  if (vstmts.available) {
+  //
+  // Skip P4 on full builds: when fileSymbols covers every file in the DB there
+  // are no unchanged callers, and collectFuncIdsForFiles would issue one SELECT
+  // per file for nothing.  A single COUNT query is cheaper than N per-file SELECTs.
+  const totalFilesInDb = (
+    db.prepare(`SELECT COUNT(DISTINCT file) AS n FROM nodes`).get() as { n: number }
+  ).n;
+  if (vstmts.available && fileSymbols.size < totalFilesInDb) {
     const changedRelPaths = new Set<string>(fileSymbols.keys());
     const changedFuncIds = collectFuncIdsForFiles(db, changedRelPaths);
     const extra = await collectCallerStitchCandidates(
