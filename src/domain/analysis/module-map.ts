@@ -211,12 +211,20 @@ function computeQualityMetrics(
   const totalCallEdges = (
     db.prepare("SELECT COUNT(*) as c FROM edges WHERE kind = 'calls'").get() as { c: number }
   ).c;
+  // Exclude sink edges (confidence=0.0) from the confidence ratio: they flag
+  // unresolvable dynamic calls (eval/computed-key) and are not resolution
+  // attempts — including them in the denominator unfairly penalises the metric.
+  const resolvedCallEdges = (
+    db.prepare("SELECT COUNT(*) as c FROM edges WHERE kind = 'calls' AND confidence > 0").get() as {
+      c: number;
+    }
+  ).c;
   const highConfCallEdges = (
     db
       .prepare("SELECT COUNT(*) as c FROM edges WHERE kind = 'calls' AND confidence >= 0.7")
       .get() as { c: number }
   ).c;
-  const callConfidence = totalCallEdges > 0 ? highConfCallEdges / totalCallEdges : 0;
+  const callConfidence = resolvedCallEdges > 0 ? highConfCallEdges / resolvedCallEdges : 0;
 
   const falsePositiveWarnings = buildFalsePositiveWarnings(queryFalsePositiveRows(db, fpThreshold));
 
@@ -239,7 +247,7 @@ function computeQualityMetrics(
     callConfidence: {
       ratio: callConfidence,
       highConf: highConfCallEdges,
-      total: totalCallEdges,
+      total: resolvedCallEdges,
     },
     falsePositiveWarnings,
   };
@@ -427,15 +435,20 @@ function buildStatsFromNative(
 
   const callerCoverage =
     s.quality.callableTotal > 0 ? s.quality.callableWithCallers / s.quality.callableTotal : 0;
+  // s.quality.callEdges is now the resolved (confidence>0) edge count — sink
+  // edges (confidence=0.0) are excluded so they don't dilute the ratio.
   const callConfidence =
     s.quality.callEdges > 0 ? s.quality.highConfCallEdges / s.quality.callEdges : 0;
 
-  // False-positive analysis still uses JS (needs FALSE_POSITIVE_NAMES set)
+  // False-positive analysis still uses JS (needs FALSE_POSITIVE_NAMES set).
+  // FP ratio uses the *total* calls count (including sinks) as denominator so
+  // it reflects the full edge set rather than just the resolved subset.
+  const totalCallEdgesForFp = edgesByKind['calls'] ?? s.quality.callEdges;
   const fpThreshold = config.analysis?.falsePositiveCallers ?? FALSE_POSITIVE_CALLER_THRESHOLD;
   const falsePositiveWarnings = buildFalsePositiveWarnings(queryFalsePositiveRows(db, fpThreshold));
   let fpEdgeCount = 0;
   for (const fp of falsePositiveWarnings) fpEdgeCount += fp.callerCount;
-  const falsePositiveRatio = s.quality.callEdges > 0 ? fpEdgeCount / s.quality.callEdges : 0;
+  const falsePositiveRatio = totalCallEdgesForFp > 0 ? fpEdgeCount / totalCallEdgesForFp : 0;
   const score = computeQualityScore(callerCoverage, callConfidence, falsePositiveRatio);
   const testFilter = testFilterSQL('n.file', noTests);
   const byTechnique = countCallEdgesByTechnique(db, testFilter);

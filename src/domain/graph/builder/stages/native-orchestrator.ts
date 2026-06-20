@@ -1759,8 +1759,27 @@ async function backfillNativeDroppedFiles(
 }
 
 /**
+ * Minimum confidence assigned to `ts-native` resolved edges.
+ *
+ * The proximity heuristic (`computeConfidence`) returns 0.3 for cross-module
+ * calls where no import-path evidence is available.  For ts-native edges the
+ * native engine performed actual name-based symbol lookup, which is stronger
+ * evidence than pure file-proximity.  Clamping to 0.5 places these edges at
+ * the same level as same-parent-directory calls — a conservative but correct
+ * floor that avoids dragging down the call-confidence metric.
+ *
+ * Sink edges (confidence = 0.0) are intentionally excluded: they flag
+ * unresolvable dynamic calls and must stay at 0.0 so they remain below
+ * DEFAULT_MIN_CONFIDENCE and never appear in normal query results.
+ */
+const TS_NATIVE_CONFIDENCE_FLOOR = 0.5;
+
+/**
  * Backfill the `technique` column on `calls` edges written by the native Rust
- * orchestrator, which does not write the column itself.
+ * orchestrator, which does not write the column itself.  Also lifts any
+ * resolved ts-native edge whose confidence is below TS_NATIVE_CONFIDENCE_FLOOR
+ * to that floor value so that the name-lookup quality of the native resolver is
+ * reflected in the call-confidence metric.
  *
  * For full builds, all `calls` edges in the DB are new so a global UPDATE is
  * correct.  For incremental builds, only changed-file source nodes are updated
@@ -1781,6 +1800,12 @@ function backfillEdgeTechniquesAfterNativeOrchestrator(
     db.prepare(
       "UPDATE edges SET technique = 'ts-native' WHERE kind = 'calls' AND technique IS NULL",
     ).run();
+    // Lift resolved ts-native edges below the confidence floor.
+    db.prepare(
+      `UPDATE edges SET confidence = ?
+       WHERE kind = 'calls' AND technique = 'ts-native'
+         AND confidence > 0 AND confidence < ?`,
+    ).run(TS_NATIVE_CONFIDENCE_FLOOR, TS_NATIVE_CONFIDENCE_FLOOR);
     return;
   }
   // Incremental: scope to source nodes whose file is one of the changed files.
@@ -1797,6 +1822,15 @@ function backfillEdgeTechniquesAfterNativeOrchestrator(
            SELECT id FROM nodes WHERE file IN (${placeholders})
          )`,
       ).run(...chunk);
+      // Lift resolved ts-native edges below the confidence floor for this chunk.
+      db.prepare(
+        `UPDATE edges SET confidence = ?
+         WHERE kind = 'calls' AND technique = 'ts-native'
+           AND confidence > 0 AND confidence < ?
+           AND source_id IN (
+             SELECT id FROM nodes WHERE file IN (${placeholders})
+           )`,
+      ).run(TS_NATIVE_CONFIDENCE_FLOOR, TS_NATIVE_CONFIDENCE_FLOOR, ...chunk);
     }
   });
   tx();
