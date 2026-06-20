@@ -221,15 +221,54 @@ function printQuality(data: StatsData): void {
   }
 }
 
+// Dead sub-role metadata: label and whether the category is actionable.
+const DEAD_SUB_ROLE_META: Record<string, { label: string; actionable: boolean }> = {
+  'dead-leaf': { label: 'dead-leaf (params/props/constants)', actionable: false },
+  'dead-unresolved': { label: 'dead-unresolved (resolution gaps)', actionable: false },
+  'dead-ffi': { label: 'dead-ffi (native/FFI boundary)', actionable: false },
+  'dead-entry': { label: 'dead-entry (CLI/MCP entry points)', actionable: false },
+  'dead-callable': { label: 'dead-callable (actionable)', actionable: true },
+};
+
 function printRoles(data: StatsData): void {
-  if (data.roles && Object.keys(data.roles).length > 0) {
-    const total = Object.values(data.roles).reduce((a, b) => a + b, 0);
-    console.log(`\nRoles:     ${total} classified symbols`);
-    const roleEntries = Object.entries(data.roles).sort((a, b) => b[1] - a[1]) as [
-      string,
-      number,
-    ][];
-    printCountGrid(roleEntries, 18);
+  if (!data.roles || Object.keys(data.roles).length === 0) return;
+
+  // The roles object contains both the synthetic 'dead' aggregate key and
+  // individual 'dead-*' sub-role keys. Exclude the aggregate from the total
+  // to avoid double-counting.
+  const nonAggregateEntries = Object.entries(data.roles).filter(([k]) => k !== 'dead') as [
+    string,
+    number,
+  ][];
+  const total = nonAggregateEntries.reduce((a, [, v]) => a + v, 0);
+  console.log(`\nRoles:     ${total} classified symbols`);
+
+  // Split into dead sub-roles and all other roles.
+  const deadEntries = nonAggregateEntries.filter(([k]) => k.startsWith('dead-'));
+  const otherEntries = nonAggregateEntries
+    .filter(([k]) => !k.startsWith('dead-'))
+    .sort((a, b) => b[1] - a[1]);
+
+  if (otherEntries.length > 0) {
+    printCountGrid(otherEntries, 18);
+  }
+
+  if (deadEntries.length > 0) {
+    const deadTotal = deadEntries.reduce((a, [, v]) => a + v, 0);
+    console.log(`\n  Dead symbols: ${deadTotal}`);
+    // Sort: non-actionable first (largest first within group), actionable last.
+    const sorted = deadEntries.sort((a, b) => {
+      const aActionable = DEAD_SUB_ROLE_META[a[0]]?.actionable ?? false;
+      const bActionable = DEAD_SUB_ROLE_META[b[0]]?.actionable ?? false;
+      if (aActionable !== bActionable) return aActionable ? 1 : -1;
+      return b[1] - a[1];
+    });
+    for (const [role, count] of sorted) {
+      const meta = DEAD_SUB_ROLE_META[role];
+      const label = meta ? meta.label : role;
+      const actionableTag = meta?.actionable ? '  ← actionable' : '';
+      console.log(`    ${label.padEnd(38)} ${String(count).padStart(6)}${actionableTag}`);
+    }
   }
 }
 
