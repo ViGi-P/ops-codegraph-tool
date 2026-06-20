@@ -312,10 +312,9 @@ function dispatchQueryMatch(
   } else if (c.exp_node) {
     handleExportCapture(c, exps, imports);
   } else if (c.callfn_node) {
-    calls.push({
-      name: c.callfn_name!.text,
-      line: nodeStartLine(c.callfn_node),
-    });
+    // Route through extractCallInfo so special identifier calls (eval) get classified.
+    const callfnInfo = extractCallInfo(c.callfn_name!, c.callfn_node);
+    if (callfnInfo) calls.push(callfnInfo);
     calls.push(...extractCallbackReferenceCalls(c.callfn_node));
   } else if (c.callmem_node) {
     const callInfo = extractCallInfo(c.callmem_fn!, c.callmem_node);
@@ -328,10 +327,20 @@ function dispatchQueryMatch(
     if (callInfo) calls.push(callInfo);
     calls.push(...extractCallbackReferenceCalls(c.callsub_node));
   } else if (c.newfn_node) {
-    calls.push({
-      name: c.newfn_name!.text,
-      line: nodeStartLine(c.newfn_node),
-    });
+    if (c.newfn_name!.text === 'Function') {
+      // new Function(body) — dynamic code execution; classify as eval kind
+      calls.push({
+        name: '<dynamic:eval>',
+        line: nodeStartLine(c.newfn_node),
+        dynamic: true,
+        dynamicKind: 'eval',
+      });
+    } else {
+      calls.push({
+        name: c.newfn_name!.text,
+        line: nodeStartLine(c.newfn_node),
+      });
+    }
   } else if (c.newmem_node) {
     const callInfo = extractCallInfo(c.newmem_fn!, c.newmem_node);
     if (callInfo) calls.push(callInfo);
