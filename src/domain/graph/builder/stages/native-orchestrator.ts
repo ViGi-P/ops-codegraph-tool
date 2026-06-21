@@ -2055,19 +2055,23 @@ export async function tryNativeOrchestrator(
     // exec may not exist on very old addon versions — safe to ignore
   }
 
-  const resultJson = ctx.nativeDb.buildGraph(
-    ctx.rootDir,
-    JSON.stringify(ctx.config),
-    JSON.stringify(ctx.aliases),
-    JSON.stringify(ctx.opts),
-  );
-
-  // Restore FK enforcement immediately after buildGraph() so any subsequent
-  // writes to this connection (gap-repair, structure patch) retain FK protection.
+  let resultJson: string;
   try {
-    ctx.nativeDb.exec('PRAGMA foreign_keys = ON');
-  } catch {
-    // safe to ignore on very old addon versions
+    resultJson = ctx.nativeDb.buildGraph(
+      ctx.rootDir,
+      JSON.stringify(ctx.config),
+      JSON.stringify(ctx.aliases),
+      JSON.stringify(ctx.opts),
+    );
+  } finally {
+    // Restore FK enforcement so any subsequent writes to this connection
+    // (gap-repair, structure patch) retain FK protection — even if buildGraph()
+    // throws.
+    try {
+      ctx.nativeDb.exec('PRAGMA foreign_keys = ON');
+    } catch {
+      // safe to ignore on very old addon versions
+    }
   }
 
   const result = JSON.parse(resultJson) as NativeOrchestratorResult;
