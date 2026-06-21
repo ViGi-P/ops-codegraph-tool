@@ -328,8 +328,8 @@ fn handle_cpp_call_expression(node: &Node, source: &[u8], symbols: &mut FileSymb
             "identifier" | "qualified_identifier" | "scoped_identifier" => {
                 let fn_name = node_text(&fn_node, source);
                 // dlsym(handle, "symbol") — dynamic symbol loading via C ABI.
-                // String-literal argument: resolves as reflection (extern "C" symbols are not mangled).
-                // Variable argument: flagged as unresolved-dynamic.
+                // String-literal second arg: resolves as reflection (C symbols are unmangled, name-match works).
+                // Variable second arg: flagged as unresolved-dynamic.
                 if fn_name == "dlsym" || fn_name == "dlvsym" {
                     let args = node.child_by_field_name("arguments")
                         .or_else(|| find_child(node, "argument_list"));

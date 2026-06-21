@@ -147,6 +147,11 @@ const THRESHOLDS: Record<string, { precision: number; recall: number }> = {
   // Phase 4 scripting fixtures: Ruby send/public_send + PHP call_user_func/variable calls.
   'dynamic-ruby': { precision: 1.0, recall: 1.0 },
   'dynamic-php': { precision: 1.0, recall: 1.0 },
+  // Phase 6: Long-tail languages — C#, Swift, Elixir, Lua.
+  'dynamic-csharp': { precision: 0.0, recall: 0.0 },
+  'dynamic-swift': { precision: 1.0, recall: 1.0 },
+  'dynamic-elixir': { precision: 0.0, recall: 0.0 },
+  'dynamic-lua': { precision: 1.0, recall: 1.0 },
   // Phase 5: Go + C/C++ dynamic dispatch patterns.
   'dynamic-go': { precision: 1.0, recall: 1.0 },
   'dynamic-c': { precision: 1.0, recall: 1.0 },

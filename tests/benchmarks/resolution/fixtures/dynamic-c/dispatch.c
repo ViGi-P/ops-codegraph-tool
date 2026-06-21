@@ -18,7 +18,7 @@ void runFunctionPointer(void (*fp)(const char *)) {
     (*fp)("world");
 }
 
-/* dlsym(handle, "symbol") — dynamic symbol loading; flagged */
+/* dlsym(handle, "greet") — string literal resolves as reflection; fn pointer call flagged */
 void runDlsym(void *handle) {
     void (*fn)(const char *) = dlsym(handle, "greet");
     if (fn) fn("world");

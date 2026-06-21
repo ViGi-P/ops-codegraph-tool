@@ -192,7 +192,7 @@ function handlePyCall(node: TreeSitterNode, ctx: ExtractorOutput): void {
       const argIter = iterPyArgs(node);
       const firstArg = argIter.next().value as TreeSitterNode | undefined;
       const secondArg = argIter.next().value as TreeSitterNode | undefined;
-      const receiver = firstArg?.text;
+      const receiver = firstArg?.type === 'identifier' ? firstArg.text : undefined;
       if (secondArg) {
         const st = secondArg.type;
         if (st === 'string' || st === 'concatenated_string') {
