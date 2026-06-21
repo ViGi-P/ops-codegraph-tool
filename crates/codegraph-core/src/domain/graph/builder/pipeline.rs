@@ -242,6 +242,9 @@ fn resolve_pipeline_imports(
         let abs_file = Path::new(root_dir).join(rel_path);
         let abs_str = abs_file.to_str().unwrap_or("").replace('\\', "/");
         for imp in &symbols.imports {
+            // Skip CJS require bindings — they feed imported_names for receiver-edge
+            // resolution but must not produce DB import edges (#1678).
+            if imp.cjs_require.unwrap_or(false) { continue; }
             batch_inputs.push(ImportResolutionInput {
                 from_file: abs_str.clone(),
                 import_source: imp.source.clone(),
@@ -1285,6 +1288,16 @@ fn collect_imported_names_for_file(
         let resolved_path = import_ctx.get_resolved(abs_str, &imp.source);
         for name in &imp.names {
             let clean_name = name.strip_prefix("* as ").unwrap_or(name).to_string();
+            // CJS require bindings are included in imported_names so the receiver-edge
+            // resolver treats them as import artifacts (not locally-defined symbols).
+            // We use an empty target_file so the import-aware call-target lookup
+            // (`nodes_by_name_and_file.get(&(name, ""))`) always misses and falls
+            // through to the same-file shadow node — matching WASM call-resolution
+            // behaviour where CJS bindings are not in importedNamesMap (#1678).
+            if imp.cjs_require.unwrap_or(false) {
+                imported_names.push(ImportedName { name: clean_name, file: String::new() });
+                continue;
+            }
             let mut target_file = resolved_path.clone();
             if import_ctx.is_barrel_file(&resolved_path) {
                 let mut visited = HashSet::new();

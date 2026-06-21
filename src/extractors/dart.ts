@@ -264,7 +264,7 @@ function handleDartSelector(node: TreeSitterNode, ctx: ExtractorOutput): void {
   //      the next holds argument_part (the call args) — method name is in the previous sibling
   const unconditional = findChild(node, 'unconditional_assignable_selector');
   let methodName: string | null = null;
-  let receiverText: string | null = null;
+  let _receiverText: string | null = null;
 
   if (unconditional) {
     const id = findChild(unconditional, 'identifier');
@@ -283,7 +283,7 @@ function handleDartSelector(node: TreeSitterNode, ctx: ExtractorOutput): void {
             if (id2) methodName = id2.text;
           }
         } else {
-          receiverText = sibling?.text ?? null;
+          _receiverText = sibling?.text ?? null;
         }
       }
     }
