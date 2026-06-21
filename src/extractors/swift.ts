@@ -293,28 +293,51 @@ function handleSwiftCallExpression(node: TreeSitterNode, ctx: ExtractorOutput): 
     return;
   }
 
-  // NSSelectorFromString("name") — selector from literal string
+  // NSSelectorFromString("name") — selector from literal string.
+  // Only inspect the direct argument to the call (not the whole subtree) to avoid
+  // false positives from nested calls like NSSelectorFromString(generateSelector("greet")).
   if (call.name === 'NSSelectorFromString') {
-    // Search the call_expression subtree for a string literal (BFS)
-    const queue: TreeSitterNode[] = [node];
     let literal: string | null = null;
-    while (queue.length > 0 && !literal) {
-      const curr = queue.shift()!;
-      if (curr.type === 'line_string_literal' || curr.type === 'string_literal') {
-        // Look for inner string_content node
-        for (let i = 0; i < curr.childCount; i++) {
-          const ch = curr.child(i);
-          if (ch?.type === 'string_content') {
-            literal = ch.text;
-            break;
+    // Find the argument_list child of the call_expression
+    const argList =
+      node.childForFieldName('arguments') ??
+      findChild(node, 'call_suffix') ??
+      findChild(node, 'value_arguments');
+    if (argList) {
+      for (let i = 0; i < argList.childCount; i++) {
+        const arg = argList.child(i);
+        if (!arg) continue;
+        const t = arg.type;
+        if (t === '(' || t === ')' || t === ',' || t === '_:' || t === 'labeled_argument') {
+          // For labeled_argument, inspect its value child
+          if (t === 'labeled_argument') {
+            const val = arg.childForFieldName('value') ?? arg.child(arg.childCount - 1);
+            if (val && (val.type === 'line_string_literal' || val.type === 'string_literal')) {
+              for (let j = 0; j < val.childCount; j++) {
+                const ch = val.child(j);
+                if (ch?.type === 'string_content') {
+                  literal = ch.text;
+                  break;
+                }
+              }
+              if (!literal) literal = val.text.replace(/^["']|["']$/g, '');
+            }
           }
+          continue;
         }
-        if (!literal) literal = curr.text.replace(/^["']|["']$/g, '');
+        if (t === 'line_string_literal' || t === 'string_literal') {
+          for (let j = 0; j < arg.childCount; j++) {
+            const ch = arg.child(j);
+            if (ch?.type === 'string_content') {
+              literal = ch.text;
+              break;
+            }
+          }
+          if (!literal) literal = arg.text.replace(/^["']|["']$/g, '');
+          break;
+        }
+        // First real non-string argument — not a literal selector
         break;
-      }
-      for (let i = 0; i < curr.childCount; i++) {
-        const ch = curr.child(i);
-        if (ch) queue.push(ch);
       }
     }
     ctx.calls.push({
