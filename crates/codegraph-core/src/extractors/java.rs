@@ -297,8 +297,10 @@ fn handle_method_invocation(node: &Node, source: &[u8], symbols: &mut FileSymbol
     let call_line = start_line(node);
 
     match method_name {
-        // Method.invoke(target, args) — runtime reflection; target not statically knowable
-        "invoke" => {
+        // Method.invoke(target, args) — runtime reflection; target not statically knowable.
+        // Require a non-null receiver to avoid false positives on user-defined `invoke`
+        // methods (executor services, command/strategy objects, Mockito stubs, etc.).
+        "invoke" if receiver.is_some() => {
             symbols.calls.push(Call {
                 name: "<dynamic:unresolved>".to_string(),
                 line: call_line,
@@ -308,8 +310,11 @@ fn handle_method_invocation(node: &Node, source: &[u8], symbols: &mut FileSymbol
                 ..Default::default()
             });
         }
-        // clazz.getMethod("name") / getDeclaredMethod("name") — resolvable if literal
-        "getMethod" | "getDeclaredMethod" => {
+        // clazz.getMethod("name") / getDeclaredMethod("name") — resolvable if literal.
+        // Require a non-null receiver to avoid false positives on gRPC ServiceDescriptor.getMethod(),
+        // Spring AnnotationUtils.getDeclaredMethod(), proto-generated descriptors, and any other
+        // API that exposes a method by this name unrelated to java.lang.Class reflection.
+        "getMethod" | "getDeclaredMethod" if receiver.is_some() => {
             let literal = get_first_string_arg_java(node, source);
             match literal {
                 Some(name) => {
@@ -335,8 +340,10 @@ fn handle_method_invocation(node: &Node, source: &[u8], symbols: &mut FileSymbol
                 }
             }
         }
-        // Class.forName("pkg.ClassName") — dynamic class loading; flag
-        "forName" => {
+        // Class.forName("pkg.ClassName") — dynamic class loading; flag.
+        // Guard on receiver == "Class" to avoid false positives from user-defined
+        // forName() factory methods (e.g. Currency.forName("USD"), Enum.forName(...)).
+        "forName" if receiver.as_deref() == Some("Class") => {
             let literal = get_first_string_arg_java(node, source);
             symbols.calls.push(Call {
                 name: "<dynamic:unresolved>".to_string(),
