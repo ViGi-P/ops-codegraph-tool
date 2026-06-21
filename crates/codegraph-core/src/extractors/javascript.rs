@@ -1355,9 +1355,11 @@ fn handle_var_decl(node: &Node, source: &[u8], symbols: &mut FileSymbols) {
                                     .replace(&['\'', '"'][..], "");
                                 let names = collect_object_pattern_names(&name_n, source);
                                 if !names.is_empty() {
-                                    symbols.imports.push(Import::new(
+                                    let mut imp = Import::new(
                                         mod_path, names, start_line(node),
-                                    ));
+                                    );
+                                    imp.cjs_require = Some(true);
+                                    symbols.imports.push(imp);
                                 }
                             }
                         }
