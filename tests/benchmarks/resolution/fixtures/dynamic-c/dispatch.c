@@ -1,6 +1,6 @@
 /* Fixture: C dynamic dispatch patterns
- * (*fp)(args) → flagged as unresolved-dynamic
- * dlsym(handle, "symbol") → flagged as unresolved-dynamic (cross-lib)
+ * (*fp)(args) → flagged as unresolved-dynamic (function pointer; target unknown)
+ * dlsym(handle, "symbol") → resolved as reflection (string literal matches symbol in DB)
  */
 #include <stdio.h>
 #include <dlfcn.h>
