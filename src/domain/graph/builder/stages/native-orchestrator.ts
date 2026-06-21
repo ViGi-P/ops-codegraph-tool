@@ -2099,6 +2099,20 @@ export async function tryNativeOrchestrator(
 
   if (!ctx.nativeDb?.buildGraph) return undefined;
 
+  // The previous full build's clear_all_graph_data() sets PRAGMA foreign_keys = ON
+  // on the native connection. Older native binaries (< v3.14) do not delete
+  // dataflow_vertices / dataflow_summary / call_edge_id rows before purging
+  // nodes/edges during incremental builds, so FK enforcement causes the purge
+  // statements to fail silently — leaving stale nodes and edges that then get
+  // duplicated when the barrel-candidate re-parse re-inserts them (issue #1644).
+  // Disabling FK before buildGraph() lets the purge succeed. FK enforcement is
+  // restored automatically when this connection is closed after the build.
+  try {
+    ctx.nativeDb.exec('PRAGMA foreign_keys = OFF');
+  } catch {
+    // exec may not exist on very old addon versions — safe to ignore
+  }
+
   const resultJson = ctx.nativeDb.buildGraph(
     ctx.rootDir,
     JSON.stringify(ctx.config),
