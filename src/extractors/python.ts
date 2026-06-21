@@ -196,7 +196,7 @@ function handlePyCall(node: TreeSitterNode, ctx: ExtractorOutput): void {
       if (secondArg) {
         const st = secondArg.type;
         if (st === 'string' || st === 'concatenated_string') {
-          const attrName = secondArg.text.replace(/^['"]|['"]$/g, '');
+          const attrName = secondArg.text.replace(/^['"]{1,3}|['"]{1,3}$/g, '');
           if (attrName && !attrName.includes('{')) {
             ctx.calls.push({
               name: attrName,
