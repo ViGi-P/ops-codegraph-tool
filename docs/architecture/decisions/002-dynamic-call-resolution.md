@@ -1,7 +1,7 @@
 # ADR-002: Dynamic Call Resolution — Taxonomy, Flagged-Edge Sink, and Static Resolution
 
 **Date:** 2026-06-21
-**Status:** Accepted
+**Status:** Implemented
 **Context:** Dynamic call sites (computed property access, eval, reflection) were silently dropped from the graph — invisible to every query, impact analysis, and dead-code detector. This ADR documents the architectural decisions for surfacing them.
 
 ---
@@ -93,21 +93,21 @@ New constraints land in `src/domain/graph/resolver/points-to.ts` and the Rust `b
 
 ---
 
-## Delivery Sequence
+## Delivery
 
-| Phase | Concern |
-|-------|---------|
-| **Phase 0** | Foundation: `DynamicKind` data model, `dynamic_kind` DB column (migration v18), sink-edge emission, JS extractor classification, `--dynamic` listing, fixtures |
-| **Phase 1** | JS/TS/TSX: TS/TSX idioms (`Reflect.*`, decorator dispatch) + fixtures |
-| **Phase 2** | JVM (Java, Kotlin, Scala, Groovy): `Method.invoke`, `getMethod`, Groovy `"$dyn"()` |
-| **Phase 3** | Python: `getattr`, dispatch dicts, `eval`/`exec`, `functools.partial` |
-| **Phase 4** | Scripting (Ruby, PHP): `send`, `method(:x).call`, `$obj->$m()`, `call_user_func` |
-| **Phase 5** | Go + C/C++: method values, func-typed struct fields, function pointers, `dlsym` |
-| **Phase 6** | Long tail (C#, Rust, Swift, ObjC, Elixir, Lua, Dart, …): per-language idioms; languages with no idiomatic dynamic dispatch noted explicitly |
-| **RES-1** | Constant-string-key propagation: `const m='foo'; obj[m]()` → `obj.foo` |
-| **RES-2** | Dispatch-table expansion: `{a:fnA,b:fnB}[k]()` → `{fnA,fnB}` at penalized confidence |
-| **RES-3** | Literal-name reflection per family |
-| **Docs** | Rewrite `README.md` limitation; update ROADMAP/BACKLOG; raise recall floors |
+| Phase | Concern | Status |
+|-------|---------|--------|
+| **Phase 0** | Foundation: `DynamicKind` data model, `dynamic_kind` DB column (migration v18), sink-edge emission, JS extractor classification, `--dynamic` listing, fixtures | ✅ PR #1629 |
+| **Phase 1** | JS/TS/TSX: TS/TSX idioms (`Reflect.*`, decorator dispatch) + fixtures | ✅ PR #1637 |
+| **Phase 2** | JVM (Java, Kotlin, Scala, Groovy): `Method.invoke`, `getMethod`, Groovy `"$dyn"()` | ✅ PR #1646 |
+| **Phase 3** | Python: `getattr`, dispatch dicts, `eval`/`exec`, `functools.partial` | ✅ PR #1653 |
+| **Phase 4** | Scripting (Ruby, PHP): `send`, `method(:x).call`, `$obj->$m()`, `call_user_func` | ✅ PR #1654 |
+| **Phase 5** | Go + C/C++: method values, func-typed struct fields, function pointers, `dlsym` | ✅ PR #1655 |
+| **Phase 6** | Long tail (C#, Rust, Swift, ObjC, Elixir, Lua, Dart, …): per-language idioms | ✅ PR #1657; ObjC `performSelector` / Dart `Function.apply` added as follow-ons |
+| **RES-1** | Constant-string-key propagation: `const m='foo'; obj[m]()` → `obj.foo` | ✅ Folded into Phase 0 `computed-literal` detection and resolution |
+| **RES-2** | Dispatch-table expansion: `{a:fnA,b:fnB}[k]()` → `{fnA,fnB}` at penalized confidence | ✅ Standalone (9a6b882) |
+| **RES-3** | Literal-name reflection per family | ✅ Standalone (b130b099) — JVM `getMethod` type-aware lookup |
+| **Docs** | Rewrite `README.md` limitation; update ROADMAP/BACKLOG; raise recall floors | ✅ PR #1617; recall floors raised incrementally per phase |
 
 ---
 
@@ -124,6 +124,6 @@ New constraints land in `src/domain/graph/resolver/points-to.ts` and the Rust `b
 
 ## Decision Outcome
 
-Dynamic call sites are never silently dropped. The `DynamicKind` taxonomy, `dynamic_kind` DB column, and sink-edge pattern are the canonical representation for this class of call. Resolution phases (RES-1/2/3) land on top of the detection foundation without changing the data model. Both WASM and native engines must produce identical sink edges, gated by `/parity` on every phase PR.
+Dynamic call sites are never silently dropped. The `DynamicKind` taxonomy, `dynamic_kind` DB column, and sink-edge pattern are the canonical representation for this class of call. Resolution phases (RES-1/2/3) landed on top of the detection foundation without changing the data model. Both WASM and native engines produce identical sink edges, gated by `/parity` on every phase PR.
 
 The `javascript` fixture's precision-1.0 floor is the false-positive canary; `pts-javascript` is where dispatch-table expansion is tested under relaxed precision expectations.

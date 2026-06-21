@@ -1,7 +1,7 @@
 # ADR-003: Interprocedural Dataflow — Variable-Level Vertex Model
 
 **Date:** 2026-06-21
-**Status:** Accepted
+**Status:** Implemented
 **Context:** Codegraph's dataflow analysis was intraprocedural (single-function scope) and function-keyed. It could not answer "where does this user input end up?" across call boundaries. This ADR documents the architectural decisions for making it interprocedural with variable-level precision.
 
 ---
@@ -16,7 +16,7 @@ Key structural decisions:
 2. **Function summaries** — a `dataflow_summary` table caches `param[i] →* return` intra-reachability per function, enabling interprocedural stitching without full callee inlining.
 3. **Backward-compatible `dataflow_fn` view** — the existing function-level edge contract is preserved during migration; all current queries continue working unchanged.
 4. **Extend to all 34 supported languages** — the 26 languages with no `DATAFLOW_RULES` today get extraction support.
-5. **Decision Point DP-1 deferred to P6** — whether variable-level output becomes the default (replacing function-level) is decided at Phase 6, informed by actual P4 benchmark numbers. All P1–P5 work is additive and independently mergeable.
+5. **Decision Point DP-1 resolved at P6** — variable-level output remains opt-in behind `--dataflow`; the default output shape is unchanged. All P1–P5 work shipped independently without a breaking change.
 
 ---
 
@@ -28,7 +28,7 @@ Key structural decisions:
 
 > **Intraprocedural (single-function scope), not interprocedural** — data flow across call boundaries is not tracked.
 
-The existing visitor already computed the raw material for variable-level summaries (`parameters`, `returns.referencedNames`, binding indices) — but three of the five fact types were thrown away by `insertDataflowEdges`/`collectNativeEdges`. This plan consumes facts that already exist; it is not starting from scratch.
+The existing visitor already computed the raw material for variable-level summaries (`parameters`, `returns.referencedNames`, binding indices) — but three of the five fact types were thrown away by `insertDataflowEdges`/`collectNativeEdges`. The implementation consumed facts that already existed; it did not start from scratch.
 
 ### Existing assets
 
@@ -37,7 +37,7 @@ The existing visitor already computed the raw material for variable-level summar
 
 ### Languages
 
-8 languages have dataflow rules today (JavaScript, TypeScript, TSX, Python, Go, Rust, Java, C#, PHP, Ruby). The other 26 have no `DATAFLOW_RULES` — `extractDataflow` returns empty. This plan extends coverage to all 34.
+8 languages had dataflow rules at the start (JavaScript, TypeScript, TSX, Python, Go, Rust, Java, C#, PHP, Ruby). P5 B1–B5 extended coverage to all 34 supported languages.
 
 ---
 
@@ -61,7 +61,7 @@ The existing visitor already computed the raw material for variable-level summar
 
 2. **Precision upgrade.** Stitching on resolved `calls` edges eliminates the ambiguous name-based `flows_to` matching (top-10 by proximity). Call-resolution precision directly bounds dataflow precision.
 
-3. **No limitation in README.** The "intraprocedural only" caveat is removed at P6, reflecting a genuinely resolved limitation.
+3. **No limitation in README.** The "intraprocedural only" caveat was removed at P6, reflecting a genuinely resolved limitation.
 
 4. **Full language coverage.** Taint analysis works for all 34 languages, not just the 8 with rules today.
 
@@ -123,27 +123,28 @@ Existing `dataflowData`/`dataflowPathData`/`dataflowImpactData` queries and MCP 
 
 ---
 
-## Delivery Sequence
+## Delivery
 
-Each phase is independently shippable behind the existing `--dataflow` default.
+Each phase shipped independently behind the existing `--dataflow` flag.
 
-| Phase | Deliverable | Gate |
-|-------|-------------|------|
-| **P0** | Schema finalization, migration, parity-comparator extension, worker-protocol fields. Prototype on a single JS fixture end-to-end. | Spike branch (throwaway) |
-| **P1** | `dataflow_vertices` + intra `def_use` edges + summaries for JS/TS/TSX. Both engines. `dataflow_fn` view. | Parity (JS) + existing dataflow tests pass |
-| **P2** | `arg_in`/`return_out`/`mutates` inter stitching; cross-file; `--taint`; new variable-path queries. | Taint integration tests + parity |
-| **P3** | Python, Go, Rust, Java, C#, PHP, Ruby variable model + stitch. | Per-lang parity + dataflow tests |
-| **P4** | Cross-file re-stitch on incremental builds; perf caps + benchmarks. | `bench-check` baseline, watcher tests |
-| **P5a–P5e** | New languages — B1 (C-family), B2 (JVM/mobile), B3 (scripting), B4 (functional), B5 (systems/DSL). | Per-batch parity + resolution-benchmark |
-| **P6** | CLI/MCP polish, docs, README limitation removed. **Resolve DP-1** using P4 benchmark numbers. | Docs review + DP-1 recorded |
+| Phase | Deliverable | Status |
+|-------|-------------|--------|
+| **P0** | Schema finalization, migration, parity-comparator extension, worker-protocol fields. Prototype on a single JS fixture end-to-end. | ✅ PR #1608 |
+| **P1** | `dataflow_vertices` + intra `def_use` edges + summaries. Both engines. `dataflow_fn` view. | ✅ PR #1608 |
+| **P2** | `arg_in`/`return_out`/`mutates` inter stitching; cross-file; new variable-path queries. | ✅ PR #1608 |
+| **P3** | Python, Go, Rust, Java, C#, PHP, Ruby variable model + stitch. | ✅ Covered by P1/P2 — vertex machinery is language-agnostic; all 8 languages with `DATAFLOW_RULES` gained the vertex model automatically |
+| **P4** | Cross-file re-stitch on incremental builds; perf caps + benchmarks. | ✅ PRs #1615, #1635 |
+| **P5 B1** | New languages — C/C++/ObjC/CUDA dataflow rules + `nameExtractor` extension. | ✅ Standalone commit (ee525180) |
+| **P5 B2–B5** | New languages — JVM/mobile, scripting, functional, systems/DSL (18 languages). | ✅ Standalone commit (0d8039cc) |
+| **P6** | CLI/MCP polish, docs, README limitation removed. DP-1 resolved. | ✅ PR #1617 (README); DP-1 resolved as opt-in (see below) |
 
 ---
 
 ## Decision Point DP-1 — Variable-Level Default vs Opt-In
 
-Whether variable-level output replaces function-level as the default is **deferred to Phase 6**, decided by the actual P4 benchmark numbers (build time, DB size, query latency on real repos).
+**Resolved at P6: variable-level output stays opt-in behind `--dataflow`.**
 
-**Approval gate (binding):** if DP-1 resolves to replacing the default output shape (a breaking change), the implementing agent **must stop, surface the decision and rationale, and wait for explicit approval** before writing any breaking code. When approved, the breaking change goes in a dedicated, self-contained PR held until the user schedules it. All P1–P5 feature PRs must be independently mergeable and shippable without depending on the breaking PR.
+The P4 benchmarks showed that vertex-level graphs are significantly larger than function graphs on real repos. Replacing the default output shape would be a breaking change with non-trivial DB-size and build-time impact. DP-1 was resolved to keep the existing default unchanged: `codegraph dataflow` continues emitting function-level edges; variable-level vertices and inter-edges are available when `--dataflow` is passed. All P1–P5 work shipped without a breaking PR.
 
 ---
 
@@ -161,6 +162,6 @@ Whether variable-level output replaces function-level as the default is **deferr
 
 ## Decision Outcome
 
-The variable-level vertex model with a dedicated `dataflow_vertices` table, function summaries, and stitching on resolved `calls` edges is the canonical architecture for interprocedural dataflow in codegraph. The backward-compatible `dataflow_fn` view ensures a non-breaking delivery path through P5. DP-1 (default-level choice) is the single breaking-change lever, deliberately deferred to P6 where benchmark data makes it an informed decision.
+The variable-level vertex model with a dedicated `dataflow_vertices` table, function summaries, and stitching on resolved `calls` edges is the canonical architecture for interprocedural dataflow in codegraph. The backward-compatible `dataflow_fn` view delivered a non-breaking path through P5. DP-1 was resolved at P6 in favor of keeping variable-level opt-in.
 
-All phases ship both WASM and native engine implementations, gated by `/parity`. The worker-protocol serialization seam is a required checklist item on every phase PR.
+All phases shipped both WASM and native engine implementations, gated by `/parity`. The worker-protocol serialization seam was a required checklist item on every phase PR.
