@@ -282,8 +282,11 @@ function handleJavaMethodInvocation(node: TreeSitterNode, ctx: ExtractorOutput):
   const methodName = nameNode.text;
   const receiver = obj?.text;
 
-  // Method.invoke(target, args) — runtime reflection, target not statically knowable
-  if (methodName === 'invoke') {
+  // Method.invoke(target, args) — runtime reflection, target not statically knowable.
+  // Require a non-null receiver to avoid false positives on user-defined `invoke` methods
+  // (e.g. executor services, command/strategy objects, Kotlin lambdas). The Java Reflection
+  // API always calls this on a `java.lang.reflect.Method` object, never bare.
+  if (methodName === 'invoke' && receiver !== undefined) {
     pushCall(ctx, node, '<dynamic:unresolved>', {
       dynamic: true,
       dynamicKind: 'unresolved-dynamic',
@@ -292,8 +295,14 @@ function handleJavaMethodInvocation(node: TreeSitterNode, ctx: ExtractorOutput):
     return;
   }
 
-  // clazz.getMethod("name") / getDeclaredMethod("name") — resolvable if literal arg
-  if (methodName === 'getMethod' || methodName === 'getDeclaredMethod') {
+  // clazz.getMethod("name") / getDeclaredMethod("name") — resolvable if literal arg.
+  // Require a non-null receiver to avoid false positives on gRPC ServiceDescriptor.getMethod(),
+  // Spring AnnotationUtils.getDeclaredMethod(), proto-generated descriptors, and any other API
+  // that exposes a method by this name unrelated to java.lang.Class reflection.
+  if (
+    (methodName === 'getMethod' || methodName === 'getDeclaredMethod') &&
+    receiver !== undefined
+  ) {
     const literal = getFirstStringArgJava(node);
     if (literal) {
       pushCall(ctx, node, literal, {
@@ -317,8 +326,10 @@ function handleJavaMethodInvocation(node: TreeSitterNode, ctx: ExtractorOutput):
   }
 
   // Class.forName("pkg.ClassName") — dynamic class loading; flag as unresolved
-  // (loading a class is not the same as calling it — don't emit a call edge)
-  if (methodName === 'forName') {
+  // (loading a class is not the same as calling it — don't emit a call edge).
+  // Guard on receiver === 'Class' to avoid false positives from user-defined
+  // `forName()` factory methods (e.g. Currency.forName("USD"), Enum.forName(...)).
+  if (methodName === 'forName' && receiver === 'Class') {
     const literal = getFirstStringArgJava(node);
     pushCall(ctx, node, '<dynamic:unresolved>', {
       dynamic: true,
