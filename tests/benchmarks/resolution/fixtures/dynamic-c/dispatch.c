@@ -1,6 +1,6 @@
 /* Fixture: C dynamic dispatch patterns
- * (*fp)(args) → flagged as unresolved-dynamic
- * dlsym(handle, "symbol") → flagged as unresolved-dynamic (cross-lib)
+ * (*fp)(args) → flagged as unresolved-dynamic (function pointer; target unknown)
+ * dlsym(handle, "symbol") → resolved as reflection (string literal matches symbol in DB)
  */
 #include <stdio.h>
 #include <dlfcn.h>
@@ -18,7 +18,7 @@ void runFunctionPointer(void (*fp)(const char *)) {
     (*fp)("world");
 }
 
-/* dlsym(handle, "symbol") — dynamic symbol loading; flagged */
+/* dlsym(handle, "greet") — string literal resolves as reflection; fn pointer call flagged */
 void runDlsym(void *handle) {
     void (*fn)(const char *) = dlsym(handle, "greet");
     if (fn) fn("world");

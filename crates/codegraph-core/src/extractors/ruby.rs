@@ -137,8 +137,10 @@ fn handle_singleton_method(node: &Node, source: &[u8], symbols: &mut FileSymbols
 }
 
 /// Get the first non-punctuation argument from a Ruby call node's argument list.
+/// Tries `child_by_field_name("arguments")` first, then falls back to `argument_list`.
 fn get_first_ruby_arg<'a>(node: &Node<'a>) -> Option<Node<'a>> {
-    let args = node.child_by_field_name("arguments")?;
+    let args = node.child_by_field_name("arguments")
+        .or_else(|| find_child(node, "argument_list"))?;
     for i in 0..args.child_count() {
         let child = args.child(i)?;
         match child.kind() {

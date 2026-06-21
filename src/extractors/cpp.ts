@@ -193,6 +193,22 @@ function handleCppTypedef(node: TreeSitterNode, ctx: ExtractorOutput): void {
   });
 }
 
+/** Get the nth non-punctuation argument from a call_expression argument list. */
+function getCppArg(node: TreeSitterNode, index: number): TreeSitterNode | null {
+  const args = node.childForFieldName('arguments');
+  if (!args) return null;
+  let count = 0;
+  for (let i = 0; i < args.childCount; i++) {
+    const child = args.child(i);
+    if (!child) continue;
+    const t = child.type;
+    if (t === '(' || t === ')' || t === ',' || t === 'comment') continue;
+    if (count === index) return child;
+    count++;
+  }
+  return null;
+}
+
 function handleCppInclude(node: TreeSitterNode, ctx: ExtractorOutput): void {
   const pathNode = node.childForFieldName('path');
   if (!pathNode) return;
@@ -271,9 +287,24 @@ function handleCppCallExpression(node: TreeSitterNode, ctx: ExtractorOutput): vo
   }
 
   const fnName = funcNode.text;
-  // dlsym(handle, "symbol") — dynamic symbol loading
+  // dlsym(handle, "symbol") — dynamic symbol loading via C ABI.
+  // String-literal argument: resolves as reflection (extern "C" symbols are not mangled).
+  // Variable argument: flagged as unresolved-dynamic.
   if (fnName === 'dlsym' || fnName === 'dlvsym') {
-    // For simplicity, flag as unresolved (symbol might not be in the codebase)
+    const nameArg = getCppArg(node, 1); // second arg is the symbol name
+    if (nameArg && (nameArg.type === 'string_literal' || nameArg.type === 'string_content')) {
+      const sym = nameArg.text.replace(/['"]/g, '');
+      if (sym) {
+        ctx.calls.push({
+          name: sym,
+          line: callLine,
+          dynamic: true,
+          dynamicKind: 'reflection',
+          keyExpr: nameArg.text,
+        });
+        return;
+      }
+    }
     ctx.calls.push({
       name: '<dynamic:unresolved>',
       line: callLine,
