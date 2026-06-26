@@ -135,10 +135,10 @@ So treat the summary as a **source of findings, not a single comment to reply to
 
 ```bash
 # Greptile summary as an issue comment (the usual location):
-gh api repos/optave/ops-codegraph-tool/issues/<number>/comments --paginate \
+gh api repos/optave/codegraph/issues/<number>/comments --paginate \
   --jq '.[] | select(.user.login|test("greptile";"i")) | .body'
 # …and as a review body (Greptile sometimes posts the summary here instead):
-gh api repos/optave/ops-codegraph-tool/pulls/<number>/reviews --paginate \
+gh api repos/optave/codegraph/pulls/<number>/reviews --paginate \
   --jq '.[] | select(.user.login|test("greptile";"i")) | .body'
 ```
 
