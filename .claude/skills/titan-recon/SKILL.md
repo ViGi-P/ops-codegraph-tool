@@ -55,6 +55,14 @@ codegraph embed -m minilm
 
 This enables `codegraph search` for duplicate code detection in downstream phases. If it fails (e.g., missing model), note it and continue — DRY checks will be grep-only.
 
+**Verify, don't assume.** `.codegraph/` is gitignored — `graph.db` (and its embeddings) is local filesystem state, per worktree. It is never carried over by `git merge`, a branch switch, or a snapshot restore. Before setting `embeddingsAvailable` in `titan-state.json`, smoke-test the current worktree's DB directly:
+
+```bash
+codegraph search "test query" --json
+```
+
+Only set `embeddingsAvailable: true` if this returns results (or a valid empty match, not an error/`ENGINE_UNAVAILABLE`). Alongside the flag, record `embeddingsWorktreePath` in `titan-state.json` as the output of `git rev-parse --show-toplevel` — this gives downstream phases a deterministic identity to compare against instead of having to re-derive trust from a smoke test alone. If a downstream phase (e.g. GAUNTLET) ends up operating in a **different worktree** than the one RECON ran `codegraph embed` in — including via "merge the other worktree's branch into mine" — its `graph.db` will not have embeddings even though a stale `titan-state.json` from elsewhere claims `embeddingsAvailable: true`; a mismatch between `embeddingsWorktreePath` and that worktree's own `git rev-parse --show-toplevel` is the unambiguous signal for this. Re-run `codegraph embed -m minilm` for the worktree actually being used, update both `embeddingsAvailable` and `embeddingsWorktreePath`, and re-verify with the smoke-test above, whenever the operating worktree changes.
+
 ---
 
 ## Step 3 — Collect baseline metrics
@@ -236,6 +244,7 @@ Include the preserved `phaseTimestamps` in the state file below.
     "lastBatch": null
   },
   "embeddingsAvailable": true,
+  "embeddingsWorktreePath": "<git rev-parse --show-toplevel>",
   "stats": {
     "totalFiles": 0,
     "totalNodes": 0,
