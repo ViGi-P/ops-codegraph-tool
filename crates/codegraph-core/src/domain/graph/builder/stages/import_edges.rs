@@ -258,17 +258,39 @@ fn load_symbol_node_ids(
     map
 }
 
-/// Walk type-only imports in `ctx.file_symbols` and return the distinct
-/// `(name, file)` pairs that `build_import_edges` will need to look up.
-/// Resolves barrel files the same way the edge-building loop does so the
-/// pre-computed set matches the actual lookup keys.
-fn collect_type_only_lookup_pairs(ctx: &ImportEdgeContext) -> HashSet<(String, String)> {
+/// True for a named (non-wildcard) re-export — `export { X } from 'Y'` or
+/// `export { X as Z } from 'Y'`. Wildcard re-exports (`export * from 'Y'`)
+/// carry no specific names, so they're excluded here and handled instead by
+/// the file-level `reexports` edge + the query layer's full-export fallback.
+fn is_named_reexport(imp: &crate::types::Import) -> bool {
+    imp.reexport.unwrap_or(false) && !imp.wildcard_reexport.unwrap_or(false)
+}
+
+/// True for a genuine wildcard re-export (`export * from 'Y'`). Emitted as a
+/// distinct file-level marker edge (`reexports-wildcard`) alongside the
+/// generic `reexports` edge so the query layer can tell a target reached
+/// only by named specifiers apart from one that's also reached by a
+/// wildcard — even when a *different* statement in the same file names
+/// specific symbols from that exact target (#1849 review). Mirrors
+/// `is_wildcard_reexport` in build_edges.rs (FFI fallback path).
+fn is_wildcard_reexport(imp: &crate::types::Import) -> bool {
+    imp.reexport.unwrap_or(false) && imp.wildcard_reexport.unwrap_or(false)
+}
+
+/// Walk type-only imports and named re-exports in `ctx.file_symbols` and
+/// return the distinct `(name, file)` pairs that `build_import_edges` will
+/// need to look up. Resolves barrel files the same way the edge-building
+/// loop does so the pre-computed set matches the actual lookup keys.
+/// Shared by symbol-level `imports-type` (#1724) and `reexports` (#1742)
+/// edges — both name specific symbols requiring a (name, file) → node-id
+/// lookup.
+fn collect_symbol_lookup_pairs(ctx: &ImportEdgeContext) -> HashSet<(String, String)> {
     let mut pairs = HashSet::new();
     for (rel_path, symbols) in &ctx.file_symbols {
         let abs_file = Path::new(&ctx.root_dir).join(rel_path);
         let abs_str = abs_file.to_str().unwrap_or("");
         for imp in &symbols.imports {
-            if !imp.type_only.unwrap_or(false) {
+            if !imp.type_only.unwrap_or(false) && !is_named_reexport(imp) {
                 continue;
             }
             let resolved_path = ctx.get_resolved(abs_str, &imp.source);
@@ -312,19 +334,20 @@ fn classify_import_kind(imp: &crate::types::Import) -> &'static str {
     }
 }
 
-/// For a `type` import, emit one symbol-level `imports-type` edge per name
-/// so the target symbols receive fan-in credit and aren't classified dead.
-fn emit_type_only_symbol_rows(
+/// For a `type` import or a named re-export, emit one symbol-level edge per
+/// name so the target symbols receive fan-in credit and aren't classified
+/// dead (`imports-type`, #1724), or so `codegraph exports` can report the
+/// precise re-export surface instead of the target's full export list
+/// (`reexports`, #1742). `kind` selects which edge kind to emit.
+fn emit_named_symbol_rows(
     edges: &mut Vec<EdgeRow>,
     file_node_id: i64,
     imp: &crate::types::Import,
     resolved_path: &str,
+    kind: &str,
     ctx: &ImportEdgeContext,
     symbol_node_ids: &HashMap<(String, String), i64>,
 ) {
-    if !imp.type_only.unwrap_or(false) {
-        return;
-    }
     for (_local, original) in import_name_pairs(imp) {
         let mut target_file = resolved_path.to_string();
         if ctx.is_barrel_file(resolved_path) {
@@ -338,7 +361,7 @@ fn emit_type_only_symbol_rows(
             edges.push(EdgeRow {
                 source_id: file_node_id,
                 target_id: sym_id,
-                kind: "imports-type".to_string(),
+                kind: kind.to_string(),
                 confidence: 1.0,
                 dynamic: 0,
             });
@@ -417,7 +440,36 @@ fn emit_edges_for_import(
         confidence: 1.0,
         dynamic: 0,
     });
-    emit_type_only_symbol_rows(edges, file_node_id, imp, &resolved_path, ctx, symbol_node_ids);
+    if imp.type_only.unwrap_or(false) {
+        emit_named_symbol_rows(
+            edges,
+            file_node_id,
+            imp,
+            &resolved_path,
+            "imports-type",
+            ctx,
+            symbol_node_ids,
+        );
+    }
+    if is_named_reexport(imp) {
+        emit_named_symbol_rows(
+            edges,
+            file_node_id,
+            imp,
+            &resolved_path,
+            "reexports",
+            ctx,
+            symbol_node_ids,
+        );
+    } else if is_wildcard_reexport(imp) {
+        edges.push(EdgeRow {
+            source_id: file_node_id,
+            target_id,
+            kind: "reexports-wildcard".to_string(),
+            confidence: 1.0,
+            dynamic: 0,
+        });
+    }
     emit_barrel_through_rows(
         edges,
         file_node_id,
@@ -433,7 +485,7 @@ pub fn build_import_edges(conn: &Connection, ctx: &ImportEdgeContext) -> Vec<Edg
     let mut edges = Vec::new();
 
     let file_node_ids = load_file_node_ids(conn);
-    let needed_symbol_pairs = collect_type_only_lookup_pairs(ctx);
+    let needed_symbol_pairs = collect_symbol_lookup_pairs(ctx);
     let symbol_node_ids = if needed_symbol_pairs.is_empty() {
         HashMap::new()
     } else {
