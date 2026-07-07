@@ -6,7 +6,7 @@ import { DEFAULTS, loadConfig } from '../infrastructure/config.js';
 import { debug, warn } from '../infrastructure/logger.js';
 import { getNative, isNativeAvailable } from '../infrastructure/native.js';
 import { DbError, toErrorMessage } from '../shared/errors.js';
-import type { BetterSqlite3Database, NativeDatabase } from '../types.js';
+import type { BetterSqlite3Database, CodegraphConfig, NativeDatabase } from '../types.js';
 import { getDatabase } from './better-sqlite3.js';
 import { Repository } from './repository/base.js';
 import { NativeRepository } from './repository/native-repository.js';
@@ -387,6 +387,18 @@ interface ResolvedDbSettings {
 }
 
 /**
+ * Derive the project rootDir from a possibly-custom DB path, for loadConfig().
+ * Using findDbPath (not path.resolve(customDbPath)) ensures directory inputs like
+ * --db /path/to/repo are normalised to .codegraph/graph.db before we strip two levels.
+ * Convention: resolvedDbPath = <rootDir>/.codegraph/graph.db
+ * Shared by resolveDbSettings() and resolveBusyTimeoutMs() so rootDir derivation can't drift.
+ */
+function deriveRootDirFromDbPath(customDbPath: string | undefined): string | undefined {
+  const resolvedDbPath = customDbPath ? findDbPath(customDbPath) : undefined;
+  return resolvedDbPath ? path.dirname(path.dirname(resolvedDbPath)) : undefined;
+}
+
+/**
  * Resolve the effective engine for DB access (explicit opts.engine > config.build.engine >
  * 'auto') alongside config.db.busyTimeoutMs, in a single loadConfig() call.
  * Derives rootDir from the resolved DB path so loadConfig reads the right project config.
@@ -400,18 +412,43 @@ function resolveDbSettings(
   customDbPath: string | undefined,
   engineOpt: 'native' | 'wasm' | 'auto' | undefined,
 ): ResolvedDbSettings {
-  // Using findDbPath (not path.resolve(customDbPath)) ensures directory inputs like
-  // --db /path/to/repo are normalised to .codegraph/graph.db before we strip two levels.
-  // Convention: resolvedDbPath = <rootDir>/.codegraph/graph.db
-  const resolvedDbPath = customDbPath ? findDbPath(customDbPath) : undefined;
-  const rootDir = resolvedDbPath ? path.dirname(path.dirname(resolvedDbPath)) : undefined;
-  const config = loadConfig(rootDir);
+  const config = loadConfig(deriveRootDirFromDbPath(customDbPath));
   // config.build.engine is already populated from CODEGRAPH_ENGINE env by applyEnvOverrides,
   // so this covers both the env-var path and the .codegraphrc.json config-file path.
   return {
     engine: engineOpt ?? config.build.engine ?? 'auto',
     busyTimeoutMs: config.db.busyTimeoutMs ?? DEFAULTS.db.busyTimeoutMs,
   };
+}
+
+/**
+ * Resolve the full config for a given DB path, deriving rootDir the same way
+ * resolveDbSettings()/resolveBusyTimeoutMs() do. Exported so callers that need
+ * both the busy-timeout and other config values (e.g. withReadonlyDb()) can
+ * share a single loadConfig() call instead of resolving it twice.
+ *
+ * MUST be called before opening any DB handle, for the same reason as
+ * resolveDbSettings(): loadConfig can throw (e.g. ConfigError via
+ * resolveSecrets on a malformed llm.apiKeyCommand config), and an
+ * already-open handle at that point would never be closed.
+ */
+export function resolveDbConfig(customDbPath?: string): CodegraphConfig {
+  return loadConfig(deriveRootDirFromDbPath(customDbPath));
+}
+
+/**
+ * Resolve config.db.busyTimeoutMs alone, for the ad-hoc read-only query call
+ * sites (features/*, domain/analysis/*, domain/search/*) that call
+ * openReadonlyOrFail() directly and don't need engine selection. Shares
+ * rootDir derivation with resolveDbSettings() so the two can't drift.
+ *
+ * Accepts an optional pre-resolved `config` for callers that already loaded
+ * it (e.g. withReadonlyDb()), avoiding a second findDbPath()/loadConfig() for
+ * the same path (#1943 review).
+ */
+export function resolveBusyTimeoutMs(customDbPath?: string, config?: CodegraphConfig): number {
+  const cfg = config ?? resolveDbConfig(customDbPath);
+  return cfg.db?.busyTimeoutMs ?? DEFAULTS.db.busyTimeoutMs;
 }
 
 /** Open a NativeRepository via rusqlite, throwing DbError if the DB file is missing. */

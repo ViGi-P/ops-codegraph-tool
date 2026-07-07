@@ -1,6 +1,6 @@
-import { openReadonlyOrFail } from '../../../db/index.js';
+import { openReadonlyOrFail, resolveBusyTimeoutMs } from '../../../db/index.js';
 import { buildFileConditionSQL } from '../../../db/query-builder.js';
-import type { BetterSqlite3Database } from '../../../types.js';
+import type { BetterSqlite3Database, CodegraphConfig } from '../../../types.js';
 import { normalizeSymbol } from '../../queries.js';
 import { hasFtsIndex, sanitizeFtsQuery } from '../stores/fts5.js';
 import { applyFilters } from './filters.js';
@@ -10,6 +10,7 @@ export interface FtsSearchOpts {
   kind?: string;
   filePattern?: string | string[];
   noTests?: boolean;
+  config?: CodegraphConfig;
 }
 
 interface FtsRow {
@@ -41,7 +42,10 @@ export function ftsSearchData(
 ): FtsSearchResult | null {
   const limit = opts.limit || 15;
 
-  const db = openReadonlyOrFail(customDbPath) as BetterSqlite3Database;
+  const db = openReadonlyOrFail(
+    customDbPath,
+    resolveBusyTimeoutMs(customDbPath, opts.config),
+  ) as BetterSqlite3Database;
 
   try {
     if (!hasFtsIndex(db)) {
