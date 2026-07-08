@@ -1360,6 +1360,23 @@ function resolveFallbackTargets(
     if (qualified.length > 0) targets = qualified;
   }
 
+  // #1771: object-literal property-value references (`{ resolve: someFn }`)
+  // resolve against function/method-kind targets only — a bare identifier
+  // there is as likely to be a plain data reference (`{ name: SOME_CONSTANT }`)
+  // as a function, so drop any non-callable match rather than fabricating a
+  // "calls" edge to a constant/class/etc. Applied once here, after every
+  // fallback tier above, so it covers whichever tier produced the match.
+  if (call.dynamicKind === 'value-ref') {
+    // `targets` is typed without `kind` when it flows straight through from
+    // resolveCallTargets (call-resolver.ts's declared return type omits it),
+    // but every underlying CallNodeLookup method actually populates it — the
+    // same gap the preQualifiedTargets cast above already works around. Kept
+    // as its own step (not folded into the filter callback) so the type-gap
+    // workaround and the actual filtering decision stay visually distinct.
+    const typedTargets = targets as ReadonlyArray<{ id: number; file: string; kind?: string }>;
+    targets = typedTargets.filter((t) => t.kind === 'function' || t.kind === 'method');
+  }
+
   return { targets, importedFrom };
 }
 

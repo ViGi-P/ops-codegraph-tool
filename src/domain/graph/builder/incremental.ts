@@ -749,7 +749,7 @@ function buildCallEdges(
       importedOriginalNames,
     );
 
-    const targets = applyCallFallbacks(
+    let targets = applyCallFallbacks(
       call,
       caller.callerName,
       relPath,
@@ -758,6 +758,13 @@ function buildCallEdges(
       symbols.definePropertyReceivers,
       initialTargets,
     );
+
+    // #1771: object-literal property-value references resolve against
+    // function/method-kind targets only — mirrors the same filter in
+    // resolveFallbackTargets (stages/build-edges.ts, full-build path).
+    if (call.dynamicKind === 'value-ref') {
+      targets = targets.filter((t) => t.kind === 'function' || t.kind === 'method');
+    }
 
     edgesAdded += emitIncrementalCallEdges(
       call,
