@@ -8,6 +8,8 @@
 
 set -euo pipefail
 
+source "$(dirname "${BASH_SOURCE[0]}")/tracer-common.sh"
+
 FIXTURE_DIR="${1:-}"
 if [[ -z "$FIXTURE_DIR" ]]; then
     echo "Usage: go-tracer.sh <fixture-dir>" >&2
