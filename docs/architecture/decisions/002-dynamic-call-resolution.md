@@ -79,31 +79,45 @@ export type DynamicKind =
   | 'unresolved-dynamic' // detected dynamic call we cannot resolve
   | 'value-ref';          // bare identifier used as a value reference, not a call site —
                           // object-literal property value (dispatch tables, e.g.
-                          // `{ resolve: someFn }`, #1771) or assignment to a Lua
+                          // `{ resolve: someFn }`, #1771), assignment to a Lua
                           // global/builtin identifier (e.g. `require = tracedRequire`,
-                          // #1776) — resolvable against function/method-kind targets
-                          // only
+                          // #1776), or the right operand of an `instanceof` check
+                          // (e.g. `err instanceof CodegraphError`, #1784) —
+                          // resolvable against function/method/class-kind targets;
+                          // class was added for instanceof, but the filter is
+                          // per-kind rather than per-site, so all three sites
+                          // share the same allow-list
 ```
 
 `dynamic?: boolean` is kept to avoid churning every `call.dynamic ? 1 : 0` site.
 
 `value-ref` is Track A (resolvable) but deliberately **not** added to the flag-only
-sink-edge set: when the identifier doesn't resolve to a function/method (e.g. a
+sink-edge set: when the identifier doesn't resolve to a function/method/class (e.g. a
 plain data reference like `{ name: SOME_CONSTANT }`), that's the common case, not
 an undecidable dynamic call site — so it's silently dropped rather than flagged,
 unlike `eval`/`computed-key`/`unresolved-dynamic`.
 
 `value-ref` is deliberately syntax-position-agnostic: any bare identifier that
-names a known function/method and appears somewhere other than a call site
-qualifies, regardless of which language or grammar shape produced it.
-Object-literal property values (#1771) and Lua assignment to a
-global/builtin identifier (#1776, `require = tracedRequire` — a builtin name
-isn't a locally-scoped variable that alias/points-to resolution could ever
-observe, so this is the narrow, language-specific case where a plain
-reference edge is the correct substitute for real alias tracking) are two
-independent extraction sites feeding the same resolution/filtering logic
-downstream; new languages/positions can add a third without touching
-`build-edges.ts` / `incremental.ts` / `build_edges.rs` again.
+names a known function/method/class and appears somewhere other than a call
+site qualifies, regardless of which language or grammar shape produced it.
+Object-literal property values (#1771), Lua assignment to a global/builtin
+identifier (#1776, `require = tracedRequire` — a builtin name isn't a
+locally-scoped variable that alias/points-to resolution could ever observe,
+so this is the narrow, language-specific case where a plain reference edge
+is the correct substitute for real alias tracking), and the right operand of
+an `instanceof` check (#1784, `err instanceof CodegraphError` — `instanceof`
+evaluates its right operand as a value, never calls it) are three independent
+extraction sites feeding the same resolution/filtering logic downstream. The
+`instanceof` site is the motivation for adding `class` to the allowed
+target kinds, since its operand is always a class/constructor — but the
+resolver-side filter is keyed on `dynamicKind`, not on which site produced
+the call, so this is a per-kind allowed-target-kind set rather than a
+per-site one: object-literal and Lua value-ref sites also gain class-kind
+resolution as a side effect of this change, not because either idiom
+commonly names a class. New languages/positions can add a fourth
+without touching `build-edges.ts` / `incremental.ts` / `build_edges.rs`
+again, beyond widening the allowed-target-kind set if the new site's operand
+isn't a function/method/class.
 
 ### Sink edges reuse `kind='calls'`, not a new edge kind
 

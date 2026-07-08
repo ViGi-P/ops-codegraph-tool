@@ -1372,11 +1372,17 @@ function resolveFallbackTargets(
     if (qualified.length > 0) targets = qualified;
   }
 
-  // #1771: object-literal property-value references (`{ resolve: someFn }`)
-  // resolve against function/method-kind targets only — a bare identifier
-  // there is as likely to be a plain data reference (`{ name: SOME_CONSTANT }`)
-  // as a function, so drop any non-callable match rather than fabricating a
-  // "calls" edge to a constant/class/etc. Applied once here, after every
+  // #1771/#1784: value-ref references (object-literal property values,
+  // Lua builtin reassignment, `instanceof ClassName`) resolve against
+  // function/method/class-kind targets only. A bare identifier in one of
+  // these positions is as likely to be a plain data reference
+  // (`{ name: SOME_CONSTANT }`) as a real function/class, so drop any
+  // other-kind match rather than fabricating a "calls" edge to a constant.
+  // `class` was added because `instanceof`'s right operand is always a
+  // class/constructor (#1784). The filter is keyed on `dynamicKind`, not on
+  // which site produced the call, so the #1771 object-literal and #1776 Lua
+  // sites also gain class-kind resolution as a side effect — not because
+  // either idiom commonly names a class. Applied once here, after every
   // fallback tier above, so it covers whichever tier produced the match.
   if (call.dynamicKind === 'value-ref') {
     // `targets` is typed without `kind` when it flows straight through from
@@ -1386,7 +1392,9 @@ function resolveFallbackTargets(
     // as its own step (not folded into the filter callback) so the type-gap
     // workaround and the actual filtering decision stay visually distinct.
     const typedTargets = targets as ReadonlyArray<{ id: number; file: string; kind?: string }>;
-    targets = typedTargets.filter((t) => t.kind === 'function' || t.kind === 'method');
+    targets = typedTargets.filter(
+      (t) => t.kind === 'function' || t.kind === 'method' || t.kind === 'class',
+    );
   }
 
   return { targets, importedFrom };
