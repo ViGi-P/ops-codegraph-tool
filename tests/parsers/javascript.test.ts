@@ -308,6 +308,80 @@ describe('JavaScript parser', () => {
     });
   });
 
+  describe('dynamic import() destructuring rename (#1824)', () => {
+    function parseTS(code) {
+      const parser = parsers.get('typescript');
+      const tree = parser.parse(code);
+      return extractSymbols(tree, 'test.ts');
+    }
+
+    // `extractDynamicImportNames`'s pair_pattern branch preferred the
+    // tree-sitter `key` field (the name exported by the target module) over
+    // `value` (the local binding actually referenced by call sites) — the
+    // same class of bug fixed for static `import { X as Y }` specifiers in
+    // #1730. `names` must carry the local alias, with the local -> original
+    // mapping recorded in `renamedImports` so call-edge resolution can still
+    // find the target module's real export.
+
+    it('records the local alias, not the exported name, for a renamed destructure', () => {
+      const symbols = parseJS(`const { a: b } = await import('./mod.js');`);
+      expect(symbols.imports).toHaveLength(1);
+      expect(symbols.imports[0].names).toEqual(['b']);
+      expect(symbols.imports[0].renamedImports).toEqual([{ local: 'b', imported: 'a' }]);
+    });
+
+    it('handles a mix of renamed and plain destructured bindings', () => {
+      const symbols = parseJS(`const { a, realName: alias, c } = await import('./mod.js');`);
+      expect(symbols.imports).toHaveLength(1);
+      expect(symbols.imports[0].names).toEqual(['a', 'alias', 'c']);
+      expect(symbols.imports[0].renamedImports).toEqual([{ local: 'alias', imported: 'realName' }]);
+    });
+
+    it('does not record renamedImports when no specifier is renamed', () => {
+      const symbols = parseJS(`const { a, b } = await import('./mod.js');`);
+      expect(symbols.imports[0].names).toEqual(['a', 'b']);
+      expect(symbols.imports[0].renamedImports).toBeUndefined();
+    });
+
+    it('records the local alias through a default value on a renamed destructure', () => {
+      const symbols = parseJS(`const { a: b = null } = await import('./mod.js');`);
+      expect(symbols.imports[0].names).toEqual(['b']);
+      expect(symbols.imports[0].renamedImports).toEqual([{ local: 'b', imported: 'a' }]);
+    });
+
+    it('records the rename through parens + as-cast wrappers', () => {
+      const symbols = parseTS(
+        `const { realName: alias } = (await import('./mod.js')) as { realName: Fn };`,
+      );
+      expect(symbols.imports).toHaveLength(1);
+      expect(symbols.imports[0].names).toEqual(['alias']);
+      expect(symbols.imports[0].renamedImports).toEqual([{ local: 'alias', imported: 'realName' }]);
+    });
+
+    it('strips quotes from a string-literal destructuring key (Greptile follow-up)', () => {
+      // `{ 'foo-bar': local }` — the key's raw text includes quotes; using it
+      // verbatim as `imported` would make the resolver look for an export
+      // literally named `'foo-bar'`, which never matches.
+      const symbols = parseJS(`const { 'foo-bar': local } = await import('./mod.js');`);
+      expect(symbols.imports[0].names).toEqual(['local']);
+      expect(symbols.imports[0].renamedImports).toEqual([{ local: 'local', imported: 'foo-bar' }]);
+    });
+
+    it('unwraps a computed string-literal destructuring key the same way', () => {
+      const symbols = parseJS(`const { ['foo-bar']: local } = await import('./mod.js');`);
+      expect(symbols.imports[0].names).toEqual(['local']);
+      expect(symbols.imports[0].renamedImports).toEqual([{ local: 'local', imported: 'foo-bar' }]);
+    });
+
+    it('still tracks the local binding for a non-string computed key, without a rename pair', () => {
+      // `[Symbol()]` has no statically resolvable export name — the local
+      // binding must still be tracked, just without a renamedImports entry.
+      const symbols = parseJS(`const { [Symbol()]: local } = await import('./mod.js');`);
+      expect(symbols.imports[0].names).toEqual(['local']);
+      expect(symbols.imports[0].renamedImports).toBeUndefined();
+    });
+  });
+
   it('extracts call expressions', () => {
     const symbols = parseJS(`import { foo } from './bar'; foo(); baz();`);
     expect(symbols.calls).toContainEqual(expect.objectContaining({ name: 'foo' }));
