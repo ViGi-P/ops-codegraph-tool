@@ -333,7 +333,7 @@ export function findNodesByScope(
 export function findNodeByQualifiedName(
   db: BetterSqlite3Database,
   qualifiedName: string,
-  opts: { file?: string } = {},
+  opts: { file?: string | string[] } = {},
 ): NodeRow[] {
   const fc = buildFileConditionSQL(opts.file ?? '', 'file');
   if (fc.sql) {
