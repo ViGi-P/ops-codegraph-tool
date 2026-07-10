@@ -7,12 +7,22 @@
  *
  * Usage:  node --import ./scripts/ts-resolve-loader.js ...
  *         (or via NODE_OPTIONS / vitest poolOptions.execArgv)
+ *
+ * Prefers module.registerHooks() (synchronous, in-thread, no worker-thread
+ * overhead) where available, falling back to the deprecated (DEP0205)
+ * module.register() on older Node versions that predate registerHooks()'s
+ * availability floor.
  */
 
-// module.register() requires Node >= 20.6.0
-const [_major, _minor] = process.versions.node.split('.').map(Number);
-if (_major > 20 || (_major === 20 && _minor >= 6)) {
+import { supportsRegister, supportsRegisterHooks } from './node-version-support.js';
+
+const hooksURL = new URL('./ts-resolve-hooks.js', import.meta.url);
+
+if (supportsRegisterHooks) {
+  const { registerHooks } = await import('node:module');
+  const { resolveSync, loadSync } = await import(hooksURL.href);
+  registerHooks({ resolve: resolveSync, load: loadSync });
+} else if (supportsRegister) {
   const { register } = await import('node:module');
-  const hooksURL = new URL('./ts-resolve-hooks.js', import.meta.url);
   register(hooksURL.href, { parentURL: import.meta.url });
 }
