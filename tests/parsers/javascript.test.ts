@@ -1217,6 +1217,174 @@ describe('JavaScript parser', () => {
       expect(cpCalls).toHaveLength(1);
     });
 
+    describe('identifier args to user-defined higher-order functions via parameter type (#1845)', () => {
+      function parseTS(code) {
+        const parser = parsers.get('typescript');
+        const tree = parser.parse(code);
+        return extractSymbols(tree, 'test.ts');
+      }
+
+      it('recognizes an identifier arg passed to a same-file function whose parameter is a function-shaped type alias', () => {
+        const symbols = parseTS(`
+type UserProcessor = (user: string) => void;
+function processEach(users: string[], fn: UserProcessor): void {
+  for (const user of users) fn(user);
+}
+function logUser(user: string): void { console.log(user); }
+function runDemo(users: string[]): void {
+  processEach(users, logUser);
+}
+`);
+        expect(symbols.calls).toContainEqual(
+          expect.objectContaining({ name: 'logUser', dynamic: true }),
+        );
+      });
+
+      it('recognizes an identifier arg passed to a parameter with an inline arrow-function type', () => {
+        const symbols = parseTS(`
+function processEach(users: string[], fn: (user: string) => void): void {
+  for (const user of users) fn(user);
+}
+function logUser(user: string): void {}
+function runDemo(users: string[]): void {
+  processEach(users, logUser);
+}
+`);
+        expect(symbols.calls).toContainEqual(
+          expect.objectContaining({ name: 'logUser', dynamic: true }),
+        );
+      });
+
+      it('recognizes an identifier arg passed to a Function-typed parameter', () => {
+        const symbols = parseTS(`
+function runWith(fn: Function): void { fn(); }
+function handler(): void {}
+function runDemo(): void {
+  runWith(handler);
+}
+`);
+        expect(symbols.calls).toContainEqual(
+          expect.objectContaining({ name: 'handler', dynamic: true }),
+        );
+      });
+
+      it('does not treat an identifier arg as a callback when the callee parameter is not function-shaped (issue #1741 regression guard)', () => {
+        const symbols = parseTS(`
+function findMergeCandidates(communities: string[]): void {}
+function runDemo(communities: string[]): void {
+  findMergeCandidates(communities);
+}
+`);
+        expect(symbols.calls.filter((c) => c.dynamic && c.name === 'communities')).toHaveLength(0);
+      });
+
+      it('only recognizes the function-shaped parameter position, not sibling data parameters', () => {
+        const symbols = parseTS(`
+type UserPredicate = (user: string) => boolean;
+type UserProcessor = (user: string) => void;
+function filterThen(users: string[], pred: UserPredicate, fn: UserProcessor): void {}
+function hasEmail(user: string): boolean { return true; }
+function logUser(user: string): void {}
+function runDemo(users: string[]): void {
+  filterThen(users, hasEmail, logUser);
+}
+`);
+        const dynamicNames = symbols.calls.filter((c) => c.dynamic).map((c) => c.name);
+        expect(dynamicNames).toEqual(expect.arrayContaining(['hasEmail', 'logUser']));
+        expect(dynamicNames).not.toContain('users');
+      });
+
+      it('resolves one level of type-alias indirection', () => {
+        const symbols = parseTS(`
+type Handler = (user: string) => void;
+type UserProcessor = Handler;
+function processEach(users: string[], fn: UserProcessor): void {}
+function logUser(user: string): void {}
+function runDemo(users: string[]): void {
+  processEach(users, logUser);
+}
+`);
+        expect(symbols.calls).toContainEqual(
+          expect.objectContaining({ name: 'logUser', dynamic: true }),
+        );
+      });
+
+      it('recognizes function-shaped parameters on class methods, keyed by bare method name', () => {
+        const symbols = parseTS(`
+class Runner {
+  processEach(users: string[], fn: (user: string) => void): void {}
+}
+function logUser(user: string): void {}
+function runDemo(runner: Runner, users: string[]): void {
+  runner.processEach(users, logUser);
+}
+`);
+        expect(symbols.calls).toContainEqual(
+          expect.objectContaining({ name: 'logUser', dynamic: true }),
+        );
+      });
+
+      it('does not misalign parameter indices when the callee declares an explicit this parameter', () => {
+        const symbols = parseTS(`
+function processEach(this: void, users: string[], fn: (user: string) => void): void {}
+function logUser(user: string): void {}
+function runDemo(users: string[]): void {
+  processEach(users, logUser);
+}
+`);
+        expect(symbols.calls).toContainEqual(
+          expect.objectContaining({ name: 'logUser', dynamic: true }),
+        );
+      });
+
+      it('recognizes an identifier arg passed to a same-file arrow-function higher-order function', () => {
+        const symbols = parseTS(`
+type UserProcessor = (user: string) => void;
+const processEach = (users: string[], fn: UserProcessor): void => {
+  for (const user of users) fn(user);
+};
+function logUser(user: string): void {}
+function runDemo(users: string[]): void {
+  processEach(users, logUser);
+}
+`);
+        expect(symbols.calls).toContainEqual(
+          expect.objectContaining({ name: 'logUser', dynamic: true }),
+        );
+      });
+
+      it('recognizes an identifier arg passed to a same-file function-expression higher-order function', () => {
+        const symbols = parseTS(`
+type UserProcessor = (user: string) => void;
+const processEach = function (users: string[], fn: UserProcessor): void {
+  for (const user of users) fn(user);
+};
+function logUser(user: string): void {}
+function runDemo(users: string[]): void {
+  processEach(users, logUser);
+}
+`);
+        expect(symbols.calls).toContainEqual(
+          expect.objectContaining({ name: 'logUser', dynamic: true }),
+        );
+      });
+
+      it('does not merge callback shapes across two unrelated same-named methods (false-positive guard)', () => {
+        const symbols = parseTS(`
+class Uploader {
+  process(data: string, cb: (result: string) => void): void {}
+}
+class Reporter {
+  process(users: string[]): void {}
+}
+function runDemo(reporter: Reporter, users: string[]): void {
+  reporter.process(users);
+}
+`);
+        expect(symbols.calls.filter((c) => c.dynamic && c.name === 'users')).toHaveLength(0);
+      });
+    });
+
     // Destructured bindings
     it('extracts definitions from destructured const bindings', () => {
       // kind is 'constant' (#1773), not 'function' — matches the plain
