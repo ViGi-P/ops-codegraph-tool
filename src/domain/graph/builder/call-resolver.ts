@@ -12,6 +12,7 @@
 import { CALLABLE_SYMBOL_KINDS } from '../../../shared/kinds.js';
 import { computeConfidence, isSameLanguageFamily } from '../resolve.js';
 import {
+  attachConstructorTargets,
   isModuleScopedLanguage,
   resolveByGlobal,
   resolveByReceiver,
@@ -268,7 +269,10 @@ export function resolveCallTargets(
   typeMap: Map<string, unknown>,
   callerName?: string | null,
   importedOriginalNames?: ReadonlyMap<string, string>,
-): { targets: Array<{ id: number; file: string }>; importedFrom: string | undefined } {
+): {
+  targets: Array<{ id: number; file: string; kind?: string }>;
+  importedFrom: string | undefined;
+} {
   // Flagged dynamic calls use synthetic names like '<dynamic:eval>'. Short-circuit
   // so they never accidentally match a real symbol via lookup.byName.
   if (call.name.startsWith('<dynamic:')) {
@@ -280,14 +284,22 @@ export function resolveCallTargets(
   // the imported file's actual symbol is declared under the *original* name
   // (X) — look that up instead of the local alias the call site wrote (#1730).
   const targetName = importedOriginalNames?.get(call.name) ?? call.name;
-  let targets: ReadonlyArray<{ id: number; file: string }> | undefined;
+  // Tracks the name actually used to find `targets`. Usually equal to
+  // `targetName`, but a barrel hop that itself renames the export
+  // (`export { Foo as Bar } from './foo'`, resolved below) reports the name
+  // truly declared in the origin file — the constructor-attribution lookup
+  // must key on that name, not the call site's (possibly barrel-aliased)
+  // `targetName`, or it builds a qualified name that doesn't exist (#1892).
+  let resolvedClassName = targetName;
+  let targets: ReadonlyArray<{ id: number; file: string; kind?: string }> | undefined;
 
   if (importedFrom) {
     targets = lookup.byNameAndFile(targetName, importedFrom);
     if (targets.length === 0 && lookup.isBarrel(importedFrom)) {
-      const resolved = lookup.resolveBarrel(importedFrom, targetName);
-      if (resolved) {
-        targets = lookup.byNameAndFile(resolved.name, resolved.file);
+      const barrelResolved = lookup.resolveBarrel(importedFrom, targetName);
+      if (barrelResolved) {
+        targets = lookup.byNameAndFile(barrelResolved.name, barrelResolved.file);
+        resolvedClassName = barrelResolved.name;
       }
     }
   }
@@ -322,7 +334,15 @@ export function resolveCallTargets(
     }
   }
 
-  const resolved = [...(targets ?? [])];
+  let resolved = [...(targets ?? [])];
+  // #1892: `new ClassName()` / bare `ClassName()` (keyword-less languages)
+  // always resolves as a bare (no-receiver) call — augment any class-kind
+  // match with the class's own constructor method, if it declares one.
+  // Uses `resolvedClassName` (not `targetName`) so a barrel rename doesn't
+  // make the qualified constructor lookup miss (see comment above).
+  if (!call.receiver) {
+    resolved = attachConstructorTargets(lookup, resolved, resolvedClassName);
+  }
   if (resolved.length > 1) {
     resolved.sort((a, b) => {
       const confA = computeConfidence(relPath, a.file, importedFrom ?? null);
