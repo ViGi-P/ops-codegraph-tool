@@ -765,6 +765,7 @@ mod tests {
                     complexity: None,
                     cfg: None,
                     children: None,
+                    bodyless: None,
                 })
                 .collect(),
             imports,
