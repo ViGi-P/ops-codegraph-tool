@@ -222,14 +222,29 @@ export function findExternalConsumers(
   nodeId: number,
   file: string,
 ): ExternalConsumerRow[] {
-  return cachedStmt(
+  const rows = cachedStmt(
     _findExternalConsumersStmt,
     db,
-    `SELECT DISTINCT caller.name, caller.file, caller.line
+    `SELECT DISTINCT caller.name, caller.file, caller.line, e.kind AS edgeKind
      FROM edges e
      JOIN nodes caller ON e.source_id = caller.id
      WHERE e.target_id = ? AND e.kind IN ('calls', 'imports-type') AND caller.file != ?`,
-  ).all(nodeId, file);
+  ).all(nodeId, file) as Array<ExternalConsumerRow & { edgeKind: string }>;
+  // `consumerKind` discriminates a real caller/constructor symbol (a genuine
+  // `calls` edge, with a real call-site line) from a whole-file reference
+  // such as `import type { X }` (an `imports-type` edge, always sourced from
+  // the importing file node itself — see emitNamedSymbolEdges). Keyed off the
+  // *edge* kind, not the source node's kind: findCaller falls back to the
+  // file node as a call's source for a genuine top-level call with no
+  // enclosing function/binding (e.g. a bare statement at module scope), so a
+  // `calls` edge can legitimately have a file-kind source too — using source
+  // kind alone would misclassify that real call as a type-only import
+  // (Greptile, #1973). Renderers must not treat `name`/`line` on a `'file'`
+  // entry as a caller symbol/call-site.
+  return rows.map(({ edgeKind, ...row }) => ({
+    ...row,
+    consumerKind: edgeKind === 'imports-type' ? ('file' as const) : ('symbol' as const),
+  }));
 }
 
 /**

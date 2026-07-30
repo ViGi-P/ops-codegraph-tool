@@ -56,6 +56,17 @@ beforeAll(() => {
   const add = insertNode(db, 'add', 'function', 'src/math.js', 1, 5, 1);
   const multiply = insertNode(db, 'multiply', 'function', 'src/math.js', 7, 12, 1);
   insertNode(db, 'roundHalfEven', 'function', 'src/math.js', 14, 16, 0);
+  // MathOpts (exported class, src/math.js): only ever referenced via
+  // `import type { MathOpts }` from utils.js — a file-level consumer, not a
+  // real call-site (issue #1973).
+  const mathOpts = insertNode(db, 'MathOpts', 'class', 'src/math.js', 18, 20, 1);
+  // topLevelTarget (exported function, src/math.js): called from a bare
+  // top-level statement in handler.js with no enclosing function/binding —
+  // findCaller falls back to the *file* node as the call's source in that
+  // case, so this is a genuine 'calls' edge sourced from a file-kind node
+  // (issue #1973, Greptile finding: must not be misclassified as a
+  // type-only import just because its source happens to be a file node).
+  const topLevelTarget = insertNode(db, 'topLevelTarget', 'function', 'src/math.js', 22, 24, 1);
 
   // src/utils.js: formatResult (line 1-10), parseInput (line 12-20)
   const formatResult = insertNode(db, 'formatResult', 'function', 'src/utils.js', 1, 10);
@@ -103,6 +114,14 @@ beforeAll(() => {
 
   // No cycle for handler.js
   insertEdge(db, fileHandler, fileMath, 'imports');
+
+  // fileUtils.js does `import type { MathOpts } from './math.js'` — a
+  // file-level (not symbol-level) consumer of MathOpts (issue #1973).
+  insertEdge(db, fileUtils, mathOpts, 'imports-type');
+
+  // handler.js calls topLevelTarget() from a bare top-level statement — a
+  // real 'calls' edge sourced from the file node itself (issue #1973).
+  insertEdge(db, fileHandler, topLevelTarget, 'calls');
 });
 
 afterAll(() => {
@@ -931,6 +950,37 @@ describe('checkNoDeletedExportsInUse', () => {
 
     const noTests = checkNoDeletedExportsInUse(db, new Set(['src/only-test-consumer.js']), true);
     expect(noTests.violations.map((v) => v.name)).not.toContain('onlyTestConsumer');
+  });
+
+  test('discriminates a file-level (imports-type) consumer from a real call-site consumer (#1973)', () => {
+    // MathOpts is only ever referenced via `import type { MathOpts }` from
+    // utils.js — a whole-file reference (source is the importing file node),
+    // not a genuine call/construct site with a real line number.
+    const result = checkNoDeletedExportsInUse(db, new Set(['src/math.js']), false);
+    const violation = result.violations.find((v) => v.name === 'MathOpts');
+    expect(violation).toBeDefined();
+    // `line` here is whatever the shared `fileUtils` file node in this fixture
+    // happens to carry (1) — not a fabricated call-site line, since a file
+    // node has no real one. The discriminator (`consumerKind: 'file'`) is
+    // what distinguishes this from a genuine call/construct site; renderers
+    // must key off that field, not assume any particular line value (#1973).
+    expect(violation.consumers).toEqual([
+      expect.objectContaining({ file: 'src/utils.js', consumerKind: 'file' }),
+    ]);
+  });
+
+  test('does not misclassify a genuine top-level call sourced from a file node as a type-only import (#1973)', () => {
+    // topLevelTarget is called via a real 'calls' edge whose source happens
+    // to be the file node (handler.js has no enclosing function/binding for
+    // this call) — the discriminator must key off the *edge* kind, not the
+    // source node's kind, or this would be wrongly reported as a type-only
+    // import instead of a genuine dangling caller.
+    const result = checkNoDeletedExportsInUse(db, new Set(['src/math.js']), false);
+    const violation = result.violations.find((v) => v.name === 'topLevelTarget');
+    expect(violation).toBeDefined();
+    expect(violation.consumers).toEqual([
+      expect.objectContaining({ file: 'src/handler.js', consumerKind: 'symbol' }),
+    ]);
   });
 });
 
