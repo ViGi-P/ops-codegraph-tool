@@ -252,7 +252,7 @@ After addressing all comments for a PR:
 
 ### 2g. Re-trigger reviewers
 
-**Hard cap: 3 total Greptile re-triggers per PR, counted from live data, not memory.** Long sessions span multiple turns and resumes — don't rely on remembering how many rounds you've done. Before anything else in this step, count the `@greptileai` comments **you** have actually posted — scope the query to the authenticated actor, not just "anyone other than Greptile," or pre-existing `@greptileai` comments from the PR author, a maintainer, or another workflow will count against your budget and stop you early:
+**Hard cap: 50 total Greptile re-triggers per PR, counted from live data, not memory.** Long sessions span multiple turns and resumes — don't rely on remembering how many rounds you've done. Before anything else in this step, count the `@greptileai` comments **you** have actually posted — scope the query to the authenticated actor, not just "anyone other than Greptile," or pre-existing `@greptileai` comments from the PR author, a maintainer, or another workflow will count against your budget and stop you early:
 
 ```bash
 me=$(gh api user --jq '.login')
@@ -261,9 +261,9 @@ trigger_count=$(gh api repos/optave/codegraph/issues/<number>/comments --paginat
 echo "Greptile has been re-triggered $trigger_count time(s) so far by this sweep."
 ```
 
-If `trigger_count` is already **3 or more**: do NOT trigger again, no matter how many real findings you just fixed. Reply to any outstanding comment (per Step 2e) so nothing is left unacknowledged, then run the mandatory final live re-check (Step 2h.1) — hitting the cap does not exempt you from it, and comments can still have arrived since your last check — reply to anything that check turns up, and only then proceed to Step 2i and report `Status: needs-human-review`, noting in Notes how many rounds occurred and what the last item was. Fixing a real bug on round 4+ does not extend the cap — it's a budget on wall-clock and review noise, not a correctness gate; a human reviews the rest.
+If `trigger_count` is already **50 or more**: do NOT trigger again, no matter how many real findings you just fixed. Reply to any outstanding comment (per Step 2e) so nothing is left unacknowledged, then run the mandatory final live re-check (Step 2h.1) — hitting the cap does not exempt you from it, and comments can still have arrived since your last check — reply to anything that check turns up, and only then proceed to Step 2i and report `Status: needs-human-review`, noting in Notes how many rounds occurred and what the last item was. Fixing a real bug on round 51+ does not extend the cap — it's a budget on wall-clock and review noise, not a correctness gate; a human reviews the rest.
 
-If `trigger_count` is under 3, proceed:
+If `trigger_count` is under 50, proceed:
 
 **Greptile:** Always re-trigger after replying to Greptile comments — whether the comment was actionable or not. First, run the verification script below to confirm all Greptile comments have replies. Then, skip the actual trigger only if Greptile already reacted to your most recent reply with a positive emoji (thumbs up, check, etc.), which means it is already satisfied.
 
@@ -327,12 +327,12 @@ After re-triggering:
 1. Poll for new reviews on an interval — see "Before you start: how to wait." Do not end your turn to wait passively, and don't declare a round "done" from a single check taken right after triggering — Greptile can take 15–30 minutes to respond.
 2. Fetch new comments again (repeat Step 2d + 2d.1 — re-mine the summary body too, not just inline comments).
 3. If there are **new** comments from Greptile or Claude, go back to Step 2e and address them, then re-trigger per 2g **only if** the trigger-count cap in 2g hasn't already been hit.
-4. **The 3-trigger cap in Step 2g is the actual stop condition — not a mental "round" count.** If you hit the cap mid-loop, stop re-triggering immediately (you may still reply to outstanding comments), run the mandatory Step 2h.1 final live check, and only then go to 2i with `Status: needs-human-review`.
+4. **The 50-trigger cap in Step 2g is the actual stop condition — not a mental "round" count.** If you hit the cap mid-loop, stop re-triggering immediately (you may still reply to outstanding comments), run the mandatory Step 2h.1 final live check, and only then go to 2i with `Status: needs-human-review`.
 5. Verify CI is still green after all changes.
 
 ### 2h.1. Final fresh check — do this immediately before reporting, every time
 
-Right before you write your Step 2i result, re-run Step 2d + 2d.1 **one more time, live** — regardless of how confident you are that things are settled. Comments arrive asynchronously; a check from even 10–15 minutes ago can already be stale, and reporting `Status: ready` on stale data is worse than reporting late or as `needs-human-review`. If this final check turns up anything new, handle it (reply, and re-trigger only if the Step 2g cap allows it) before finalizing. Only write your Step 2i block once this last check is clean, or you've hit a hard stop (the 3-trigger cap, or 3 rounds of CI fixes).
+Right before you write your Step 2i result, re-run Step 2d + 2d.1 **one more time, live** — regardless of how confident you are that things are settled. Comments arrive asynchronously; a check from even 10–15 minutes ago can already be stale, and reporting `Status: ready` on stale data is worse than reporting late or as `needs-human-review`. If this final check turns up anything new, handle it (reply, and re-trigger only if the Step 2g cap allows it) before finalizing. Only write your Step 2i block once this last check is clean, or you've hit a hard stop (the 50-trigger cap, or 3 rounds of CI fixes).
 
 ### 2i. Return result
 
@@ -383,5 +383,5 @@ If any subagent failed or returned an error, note it in the Status column as `ag
 - If a PR is fundamentally broken beyond what review feedback can fix, note it in the summary and skip to the next PR.
 - **Never defer without tracking.** Do not reply "acknowledged as follow-up", "noted for later", or "tracking for follow-up" to a reviewer comment without creating a GitHub issue first. If you can't fix it now and it's genuinely out of scope, create an issue with the `follow-up` label and include the issue link in your reply. Untracked acknowledgements are the same as ignoring the comment — they will never be revisited.
 - **Never end a turn to passively "wait."** You are a background subagent — nothing wakes you up when a shell job, CI run, or reviewer response completes on its own. Poll actively across a continuous sequence of tool calls (see "Before you start: how to wait") until you have a concrete result. Ending your turn with "I'll wait for X" and no further tool call stalls the sweep silently, sometimes for hours, until a human notices and manually re-prompts you.
-- **The 3-Greptile-trigger cap is counted from live data (actual `@greptileai` comments posted), not from memory of "how many rounds I've done."** Check it mechanically (Step 2g) before every trigger. Once hit, stop triggering even if you just fixed a real bug — reply, don't trigger, and report `needs-human-review`.
+- **The 50-Greptile-trigger cap is counted from live data (actual `@greptileai` comments posted), not from memory of "how many rounds I've done."** Check it mechanically (Step 2g) before every trigger. Once hit, stop triggering even if you just fixed a real bug — reply, don't trigger, and report `needs-human-review`.
 - **Never declare `Status: ready` from a stale check.** Re-verify comments and CI live, immediately before writing your Step 2i result (Step 2h.1) — not from a check earlier in the session, and not just because you feel confident nothing more is coming. The orchestrator relaying a manual spot-check to you is not a substitute for this either — always do your own final live check.
