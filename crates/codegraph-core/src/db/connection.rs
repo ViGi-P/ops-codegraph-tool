@@ -378,6 +378,22 @@ const MIGRATIONS: &[Migration] = &[
       CREATE INDEX IF NOT EXISTS idx_dataflow_call_edge ON dataflow(call_edge_id);
     "#,
     },
+    Migration {
+        // Per-declaration content hash (issue #2015): reverse-dep-edge
+        // reconnection during incremental rebuilds previously matched
+        // siblings by line position alone, which is provably unsafe when a
+        // same-named/same-kind sibling group has one member renamed away
+        // and a different one added in the same edit — the group's size
+        // stays unchanged, so the line-alignment fast path matches by rank
+        // and can silently reconnect a caller to the wrong declaration. A
+        // content hash gives reconnection a true identity signal to try
+        // first, falling back to line alignment only when a hash is
+        // unavailable (e.g. rows from before this migration).
+        version: 24,
+        up: r#"
+      ALTER TABLE nodes ADD COLUMN content_hash TEXT;
+    "#,
+    },
 ];
 
 // ── napi types ──────────────────────────────────────────────────────────
@@ -725,6 +741,18 @@ impl NativeDatabase {
             }
             if !has_column(conn, "nodes", "visibility") {
                 let _ = conn.execute_batch("ALTER TABLE nodes ADD COLUMN visibility TEXT");
+            }
+            // #2015: content_hash is referenced unconditionally by every node
+            // insert (see insert_nodes.rs), unlike the other legacy columns in
+            // this block — propagate failure instead of swallowing it, mirroring
+            // the #2001/#2066 dynamic_kind fix on the edges table below.
+            if !has_column(conn, "nodes", "content_hash") {
+                conn.execute_batch("ALTER TABLE nodes ADD COLUMN content_hash TEXT")
+                    .map_err(|e| {
+                        napi::Error::from_reason(format!(
+                            "legacy repair: add nodes.content_hash failed: {e}"
+                        ))
+                    })?;
             }
             let _ = conn.execute_batch(
                 "UPDATE nodes SET qualified_name = name WHERE qualified_name IS NULL",
@@ -1656,6 +1684,71 @@ fn row_to_json(
 mod tests {
     use super::*;
 
+    /// Regression for #2015: a database whose schema was initialized purely
+    /// through the native `init_schema()` must end up with
+    /// `nodes.content_hash` — needed by reverse-dep-edge reconnection to
+    /// disambiguate a same-named/same-kind sibling group where one member
+    /// was renamed away and a different one added in the same edit (a
+    /// net-zero group-size change the prior line-alignment-only heuristic
+    /// cannot distinguish from "same declaration, shifted").
+    #[test]
+    fn init_schema_adds_nodes_content_hash_column() {
+        let db = NativeDatabase::open_read_write(":memory:".to_string(), None)
+            .expect("open_read_write should succeed for :memory:");
+        db.init_schema().expect("init_schema should succeed");
+
+        let conn = db.conn().expect("connection should still be open");
+        let mut stmt = conn.prepare("PRAGMA table_info(nodes)").unwrap();
+        let has_content_hash = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|name| name == "content_hash");
+
+        assert!(
+            has_content_hash,
+            "nodes.content_hash column missing after native-only init_schema()"
+        );
+    }
+
+    /// Regression for #2015, mirroring the #2001/#2066 pattern: a
+    /// native-only database already stamped past v24 (e.g. by a future
+    /// migration added without content_hash ever having been applied) must
+    /// still be repaired by the unconditional legacy-column backfill, not
+    /// just the version-gated migration. Stamps to the current max computed
+    /// from `MIGRATIONS` itself (not a hardcoded literal — see the
+    /// dynamic_kind repair test's doc comment for why a hardcoded version
+    /// number silently goes stale as soon as a later migration is added).
+    #[test]
+    fn init_schema_repairs_nodes_content_hash_on_a_database_already_past_v24() {
+        let db = NativeDatabase::open_read_write(":memory:".to_string(), None)
+            .expect("open_read_write should succeed for :memory:");
+        db.init_schema()
+            .expect("initial init_schema should succeed");
+
+        let max_version = MIGRATIONS.iter().map(|m| m.version).max().unwrap();
+        {
+            let conn = db.conn().expect("connection should still be open");
+            conn.execute_batch(&format!(
+                "ALTER TABLE nodes DROP COLUMN content_hash; \
+                 UPDATE schema_version SET version = {max_version};"
+            ))
+            .expect("simulating the pre-fix state should succeed");
+            assert!(
+                !has_column(conn, "nodes", "content_hash"),
+                "test setup failed: content_hash should be absent after the simulated drop"
+            );
+        }
+
+        db.init_schema()
+            .expect("repair init_schema call should succeed");
+        let conn = db.conn().expect("connection should still be open");
+        assert!(
+            has_column(conn, "nodes", "content_hash"),
+            "nodes.content_hash was not repaired for a database already stamped past v24"
+        );
+    }
+
     /// Regression for #2001/#2066: a database whose schema was initialized
     /// purely through the native `init_schema()` (never touched by the TS
     /// `initSchema()` in src/db/migrations.ts) must still end up with
@@ -1692,23 +1785,28 @@ mod tests {
     /// to the array. Only the unconditional, reality-checked legacy-column
     /// backfill (not the version-gated migration itself) can repair an
     /// already-affected database. Simulates that exact prior-bug state by
-    /// stamping schema_version to 23 (the current max) and dropping
-    /// dynamic_kind back out before re-running init_schema().
+    /// stamping schema_version to the current max (computed from `MIGRATIONS`
+    /// itself, not hardcoded — a hardcoded literal silently drifts stale
+    /// every time a later migration is added, spuriously re-attempting that
+    /// migration and failing on a column that already exists, exactly as
+    /// happened here when v24 was added after this test was written) and
+    /// dropping dynamic_kind back out before re-running init_schema().
     #[test]
     fn init_schema_repairs_edges_dynamic_kind_on_a_database_already_past_v20() {
         let db = NativeDatabase::open_read_write(":memory:".to_string(), None)
             .expect("open_read_write should succeed for :memory:");
         db.init_schema().expect("initial init_schema should succeed");
 
+        let max_version = MIGRATIONS.iter().map(|m| m.version).max().unwrap();
         {
             let conn = db.conn().expect("connection should still be open");
             // Simulate the pre-fix native-only end state: schema stamped past
             // v20, but the column itself never actually got added.
-            conn.execute_batch(
+            conn.execute_batch(&format!(
                 "DROP INDEX IF EXISTS idx_edges_dynamic_kind; \
                  ALTER TABLE edges DROP COLUMN dynamic_kind; \
-                 UPDATE schema_version SET version = 23;",
-            )
+                 UPDATE schema_version SET version = {max_version};"
+            ))
             .expect("simulating the pre-fix state should succeed");
             assert!(
                 !has_column(conn, "edges", "dynamic_kind"),
