@@ -337,8 +337,13 @@ const MIGRATIONS: &[Migration] = &[
         // dataflow_vertices and dataflow_summary on the next `codegraph build`.
         up: "SELECT 1",
     },
-    // NOTE: TS migration v20 (edges.dynamic_kind) has no Rust counterpart yet — see #2066.
-    // v21 below is independent of it (a standalone new table), so this gap does not block it.
+    Migration {
+        version: 20,
+        up: r#"
+      ALTER TABLE edges ADD COLUMN dynamic_kind TEXT;
+      CREATE INDEX IF NOT EXISTS idx_edges_dynamic_kind ON edges(dynamic_kind) WHERE dynamic_kind IS NOT NULL;
+    "#,
+    },
     Migration {
         version: 21,
         up: r#"
@@ -739,6 +744,33 @@ impl NativeDatabase {
                 let _ =
                     conn.execute_batch("ALTER TABLE edges ADD COLUMN dynamic INTEGER DEFAULT 0");
             }
+            // #2001/#2066: version-gated migration v20 alone cannot repair a
+            // native-only database whose schema_version was already advanced
+            // past 20 by the pre-fix MIGRATIONS array (which jumped straight
+            // from v19 to v21, never applying v20) — its stored version being
+            // >= 21 makes the `migration.version > current_version` gate skip
+            // v20 forever on every subsequent init_schema() call. This
+            // unconditional, reality-checked backfill (mirroring the
+            // confidence/dynamic columns just above) repairs those databases
+            // too, not just fresh ones.
+            //
+            // Unlike the other legacy columns in this block, `dynamic_kind` is
+            // referenced unconditionally by every edge insert (see
+            // db/repository/edges.rs). A silently swallowed ALTER failure here
+            // would let init_schema() report success while leaving the column
+            // absent, so every subsequent edge batch would fail with a much
+            // harder-to-diagnose "no such column" error — propagate instead.
+            if !has_column(conn, "edges", "dynamic_kind") {
+                conn.execute_batch("ALTER TABLE edges ADD COLUMN dynamic_kind TEXT")
+                    .map_err(|e| {
+                        napi::Error::from_reason(format!(
+                            "legacy repair: add edges.dynamic_kind failed: {e}"
+                        ))
+                    })?;
+            }
+            let _ = conn.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_edges_dynamic_kind ON edges(dynamic_kind) WHERE dynamic_kind IS NOT NULL",
+            );
         }
 
         Ok(())
@@ -1618,4 +1650,79 @@ fn row_to_json(
         map.insert(col_names[i].clone(), val);
     }
     serde_json::Value::Object(map)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression for #2001/#2066: a database whose schema was initialized
+    /// purely through the native `init_schema()` (never touched by the TS
+    /// `initSchema()` in src/db/migrations.ts) must still end up with
+    /// `edges.dynamic_kind` — migration v20 was missing from Rust's
+    /// `MIGRATIONS` array entirely, so `do_insert_edges`'s unconditional
+    /// `dynamic_kind` column reference would fail with "no such column" on
+    /// any DB that only ever ran the native migration path.
+    #[test]
+    fn init_schema_adds_edges_dynamic_kind_column() {
+        let db = NativeDatabase::open_read_write(":memory:".to_string(), None)
+            .expect("open_read_write should succeed for :memory:");
+        db.init_schema().expect("init_schema should succeed");
+
+        let conn = db.conn().expect("connection should still be open");
+        let mut stmt = conn.prepare("PRAGMA table_info(edges)").unwrap();
+        let has_dynamic_kind = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|name| name == "dynamic_kind");
+
+        assert!(
+            has_dynamic_kind,
+            "edges.dynamic_kind column missing after native-only init_schema()"
+        );
+    }
+
+    /// Regression for the Greptile-flagged gap in #2001's initial fix: a
+    /// native-only database that was ALREADY migrated past v20 by the
+    /// pre-fix `MIGRATIONS` array (which jumped straight from v19 to v21,
+    /// never applying v20) has `schema_version >= 21` stored — so the
+    /// version-gated `migration.version > current_version` check skips v20
+    /// forever on every later `init_schema()` call, even after v20 is added
+    /// to the array. Only the unconditional, reality-checked legacy-column
+    /// backfill (not the version-gated migration itself) can repair an
+    /// already-affected database. Simulates that exact prior-bug state by
+    /// stamping schema_version to 23 (the current max) and dropping
+    /// dynamic_kind back out before re-running init_schema().
+    #[test]
+    fn init_schema_repairs_edges_dynamic_kind_on_a_database_already_past_v20() {
+        let db = NativeDatabase::open_read_write(":memory:".to_string(), None)
+            .expect("open_read_write should succeed for :memory:");
+        db.init_schema().expect("initial init_schema should succeed");
+
+        {
+            let conn = db.conn().expect("connection should still be open");
+            // Simulate the pre-fix native-only end state: schema stamped past
+            // v20, but the column itself never actually got added.
+            conn.execute_batch(
+                "DROP INDEX IF EXISTS idx_edges_dynamic_kind; \
+                 ALTER TABLE edges DROP COLUMN dynamic_kind; \
+                 UPDATE schema_version SET version = 23;",
+            )
+            .expect("simulating the pre-fix state should succeed");
+            assert!(
+                !has_column(conn, "edges", "dynamic_kind"),
+                "test setup failed: dynamic_kind should be absent after the simulated drop"
+            );
+        }
+
+        db.init_schema()
+            .expect("repair init_schema call should succeed");
+
+        let conn = db.conn().expect("connection should still be open");
+        assert!(
+            has_column(conn, "edges", "dynamic_kind"),
+            "edges.dynamic_kind was not repaired for a database already stamped past v20"
+        );
+    }
 }
