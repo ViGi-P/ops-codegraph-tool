@@ -1,5 +1,5 @@
 import Database from 'better-sqlite3';
-import { openRepo, type Repository, resolveDbConfig } from '../db/index.js';
+import { openRepo, type Repository, resolveBusyTimeoutMs, resolveDbConfig } from '../db/index.js';
 import { SqliteRepository } from '../db/repository/sqlite-repository.js';
 import { findMatchingNodes } from '../domain/queries.js';
 import { isTestFile } from '../infrastructure/test-filter.js';
@@ -165,7 +165,8 @@ function bfsCallees(
   return { messages, fileSet, idToNode, truncated };
 }
 
-function annotateDataflow(
+/** Exported for direct testing of its own busy_timeout pragma (issue #2020). */
+export function annotateDataflow(
   repo: Repository,
   messages: SequenceMessage[],
   idToNode: Map<number, { id: number; name: string; file: string; kind: string; line: number }>,
@@ -180,6 +181,7 @@ function annotateDataflow(
     db = repo.db;
   } else if (dbPath) {
     db = new Database(dbPath, { readonly: true }) as unknown as BetterSqlite3Database;
+    db.pragma(`busy_timeout = ${resolveBusyTimeoutMs(dbPath)}`);
     ownDb = true;
   } else {
     return;
