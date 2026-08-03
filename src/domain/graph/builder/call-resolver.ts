@@ -384,7 +384,7 @@ export function resolveByMethodOrGlobal(
 
 export function resolveCallTargets(
   lookup: CallNodeLookup,
-  call: { name: string; receiver?: string | null },
+  call: { name: string; receiver?: string | null; accessorRead?: 'get' | 'set' },
   relPath: string,
   importedNames: Map<string, string>,
   typeMap: Map<string, unknown>,
@@ -398,6 +398,57 @@ export function resolveCallTargets(
   // so they never accidentally match a real symbol via lookup.byName.
   if (call.name.startsWith('<dynamic:')) {
     return { targets: [], importedFrom: undefined };
+  }
+
+  // #2030: a property-read call tagged with the accessor kind it needs
+  // carries its *resolved class name* as `receiver` (see
+  // collectAccessorPropertyRead in extractors/javascript.ts, and the native
+  // mirror handle_accessor_property_read) — resolve directly against the
+  // qualified `receiver.name`, filtered to the DB's `accessor_kind` column.
+  // This deliberately bypasses the rest of this function's directory-
+  // proximity confidence scoring: kind-plus-exact-qualified-name match is a
+  // strictly stronger disambiguator than proximity (proximity exists only to
+  // arbitrate when nothing stronger is available — see resolveExactGlobalMatch
+  // in resolver/strategy.ts for that precedent), and a real cross-file
+  // accessor can legitimately live many directories away from the read site
+  // (the #2030 repro itself: src/features/sequence.ts ↔
+  // src/db/repository/sqlite-repository.ts). An unconfirmed candidate is
+  // dropped outright — never falls through to the general cascade below,
+  // which could otherwise resolve to an unrelated same-named non-accessor
+  // method/field, the exact false-positive class #1893's same-file registry
+  // was designed to prevent.
+  if (call.accessorRead && call.receiver) {
+    // The resolved class name can itself be a renamed import binding
+    // (`import { Original as Alias }` — the extractor's typeMap only knows
+    // the local alias), so de-alias before building the qualified lookup key
+    // exactly like the general cascade below does (#1825).
+    const dealiasedClassName = importedOriginalNames?.get(call.receiver) ?? call.receiver;
+    const qualified = `${dealiasedClassName}.${call.name}`;
+    // When the class is a known import, commit to the specific file it
+    // resolves to rather than falling through to the unscoped global lookup
+    // below — otherwise an unrelated same-qualified-name accessor in a
+    // completely different file could "confirm" a read it has nothing to do
+    // with, whenever two files coincidentally declare the same class+property
+    // name pair. This scoped result is authoritative: an empty (or
+    // wrong-kind) match here means "no", not "keep looking elsewhere" — the
+    // unscoped global fallback below is reserved for when the class isn't a
+    // known import in this file at all (e.g. an ambient/global type).
+    //
+    // `importedNames` is keyed by the *local* binding as written in this
+    // file's own import statement (`call.receiver` — e.g. 'Alias' for
+    // `import { Original as Alias }`), not the de-aliased original name —
+    // looking it up under `dealiasedClassName` would always miss for a
+    // renamed import and silently fall through to the unscoped lookup this
+    // whole branch exists to avoid.
+    const accessorImportedFrom = importedNames.get(call.receiver);
+    if (accessorImportedFrom) {
+      const scoped = lookup
+        .byNameAndFile(qualified, accessorImportedFrom)
+        .filter((n) => n.accessorKind === call.accessorRead);
+      return { targets: [...scoped], importedFrom: undefined };
+    }
+    const targets = lookup.byName(qualified).filter((n) => n.accessorKind === call.accessorRead);
+    return { targets: [...targets], importedFrom: undefined };
   }
 
   const importedFrom = importedNames.get(call.name);

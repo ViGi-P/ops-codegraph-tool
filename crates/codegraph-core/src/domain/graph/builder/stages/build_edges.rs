@@ -38,6 +38,13 @@ pub struct NodeInfo {
     pub kind: String,
     pub file: String,
     pub line: u32,
+    /// `get`/`set` when this `method`-kind node is an ES6 accessor
+    /// declaration, `None` otherwise (issue #2030). Populated from the DB
+    /// `accessor_kind` column — see `loadNodes` in `build-edges.ts` (JS path)
+    /// and `load_all_edge_nodes`/`load_edge_node_set` in `pipeline.rs`
+    /// (native path) for the two SELECTs that populate this field.
+    #[napi(js_name = "accessorKind")]
+    pub accessor_kind: Option<String>,
 }
 
 #[napi(object)]
@@ -50,6 +57,11 @@ pub struct CallInfo {
     pub dynamic_kind: Option<String>,
     #[napi(js_name = "keyExpr")]
     pub key_expr: Option<String>,
+    /// Set on a synthetic property-read call to the accessor kind the read
+    /// requires — mirrors TS `Call.accessorRead` (issue #2030). See that
+    /// field's doc comment for the full rationale.
+    #[napi(js_name = "accessorRead")]
+    pub accessor_read: Option<String>,
 }
 
 #[napi(object)]
@@ -584,6 +596,7 @@ fn emit_pts_alias_edges<'a>(
             receiver: None,
             dynamic_kind: None,
             key_expr: None,
+            accessor_read: None,
         };
         // The CHA typed-dispatch fallback (#1949) only fires for a genuine
         // receiver; `alias_call` is always receiver-less (an alias name
@@ -592,7 +605,7 @@ fn emit_pts_alias_edges<'a>(
         let mut alias_confidence_override: Option<f64> = None;
         let mut alias_targets = resolve_call_targets(
             ctx, &alias_call, alias_ctx.rel_path, alias_imported_from, alias_ctx.type_map, alias_ctx.caller_name,
-            alias_ctx.imported_original_names, &mut alias_confidence_override,
+            alias_ctx.imported_names, alias_ctx.imported_original_names, &mut alias_confidence_override,
         );
         sort_targets_by_confidence(&mut alias_targets, alias_ctx.rel_path, alias_imported_from, alias_confidence_override);
         for t in &alias_targets {
@@ -953,8 +966,8 @@ fn process_file<'a>(
         // interface lookup missed — see `resolve_call_targets` doc comment.
         let mut confidence_override: Option<f64> = None;
         let mut targets = resolve_call_targets(
-            ctx, call, fc.rel_path, imported_from, &fc.type_map, caller_name, &fc.imported_original_names,
-            &mut confidence_override,
+            ctx, call, fc.rel_path, imported_from, &fc.type_map, caller_name, &fc.imported_names,
+            &fc.imported_original_names, &mut confidence_override,
         );
         // #1771/#1784: value-ref references (object-literal property values,
         // Lua builtin reassignment, `instanceof ClassName`) resolve against
@@ -1254,12 +1267,13 @@ fn resolve_call_targets<'a>(
     imported_from: Option<&str>,
     type_map: &HashMap<&str, (&str, f64)>,
     caller_name: &str,
+    imported_names: &HashMap<&str, &str>,
     imported_original_names: &HashMap<&str, &str>,
     confidence_override: &mut Option<f64>,
 ) -> Vec<&'a NodeInfo> {
     let targets = resolve_call_targets_core(
-        ctx, call, rel_path, imported_from, type_map, caller_name, imported_original_names,
-        confidence_override,
+        ctx, call, rel_path, imported_from, type_map, caller_name, imported_names,
+        imported_original_names, confidence_override,
     );
     if call.receiver.is_some() {
         return targets;
@@ -1280,6 +1294,7 @@ fn resolve_call_targets_core<'a>(
     imported_from: Option<&str>,
     type_map: &HashMap<&str, (&str, f64)>,
     caller_name: &str,
+    imported_names: &HashMap<&str, &str>,
     imported_original_names: &HashMap<&str, &str>,
     confidence_override: &mut Option<f64>,
 ) -> Vec<&'a NodeInfo> {
@@ -1287,6 +1302,70 @@ fn resolve_call_targets_core<'a>(
     // so they never accidentally match a real symbol via name lookup.
     if call.name.starts_with("<dynamic:") {
         return vec![];
+    }
+
+    // #2030: a property-read call tagged with the accessor kind it needs
+    // carries its *resolved class name* as `receiver` (see
+    // handle_accessor_property_read in extractors/javascript.rs) — resolve
+    // directly against the qualified `receiver.name`, filtered to the DB's
+    // `accessor_kind` column. Deliberately bypasses the rest of this
+    // function's directory-proximity confidence scoring: kind-plus-exact-
+    // qualified-name match is a strictly stronger disambiguator than
+    // proximity (proximity exists only to arbitrate when nothing stronger is
+    // available — see resolve_exact_global_match for that precedent), and a
+    // real cross-file accessor can legitimately live many directories away
+    // from the read site. An unconfirmed candidate is dropped outright —
+    // never falls through to the general cascade below, which could
+    // otherwise resolve to an unrelated same-named non-accessor method/field,
+    // the exact false-positive class #1893's same-file registry was designed
+    // to prevent. Mirrors resolveCallTargets in call-resolver.ts.
+    if let Some(ref needed_kind) = call.accessor_read {
+        let Some(receiver) = call.receiver.as_deref() else { return vec![] };
+        // The resolved class name can itself be a renamed import binding
+        // (`import { Original as Alias }` — the extractor's type_map only
+        // knows the local alias), so de-alias before building the qualified
+        // lookup key exactly like the general cascade below does (#1730).
+        let dealiased_class_name = imported_original_names.get(receiver).copied().unwrap_or(receiver);
+        let qualified = format!("{}.{}", dealiased_class_name, call.name);
+        // When the class is a known import, commit to the specific file it
+        // resolves to rather than falling through to the unscoped global
+        // lookup below — otherwise an unrelated same-qualified-name accessor
+        // in a completely different file could "confirm" a read it has
+        // nothing to do with, whenever two files coincidentally declare the
+        // same class+property name pair. This scoped result is authoritative:
+        // an empty (or wrong-kind) match here means "no", not "keep looking
+        // elsewhere" — the unscoped global fallback below is reserved for
+        // when the class isn't a known import in this file at all (e.g. an
+        // ambient/global type).
+        //
+        // `imported_names` is keyed by the *local* binding as written in this
+        // file's own import statement (`receiver` — e.g. "Alias" for
+        // `import { Original as Alias }`), not the de-aliased original name —
+        // looking it up under `dealiased_class_name` would always miss for a
+        // renamed import and silently fall through to the unscoped lookup
+        // this whole branch exists to avoid.
+        if let Some(accessor_imported_from) = imported_names.get(receiver) {
+            return ctx
+                .nodes_by_name_and_file
+                .get(&(qualified.as_str(), *accessor_imported_from))
+                .map(|v| {
+                    v.iter()
+                        .filter(|n| n.accessor_kind.as_deref() == Some(needed_kind.as_str()))
+                        .copied()
+                        .collect()
+                })
+                .unwrap_or_default();
+        }
+        return ctx
+            .nodes_by_name
+            .get(qualified.as_str())
+            .map(|v| {
+                v.iter()
+                    .filter(|n| n.accessor_kind.as_deref() == Some(needed_kind.as_str()))
+                    .copied()
+                    .collect()
+            })
+            .unwrap_or_default();
     }
 
     // When the call site uses a renamed import binding (`import { X as Y }`),
@@ -3211,7 +3290,33 @@ mod call_edge_tests {
     use super::*;
 
     fn node(id: u32, name: &str, kind: &str, file: &str, line: u32) -> NodeInfo {
-        NodeInfo { id, name: name.to_string(), kind: kind.to_string(), file: file.to_string(), line }
+        NodeInfo {
+            id,
+            name: name.to_string(),
+            kind: kind.to_string(),
+            file: file.to_string(),
+            line,
+            accessor_kind: None,
+        }
+    }
+
+    /// Like [`node`], but with an explicit `accessor_kind` — for #2030 tests.
+    fn accessor_node(
+        id: u32,
+        name: &str,
+        kind: &str,
+        file: &str,
+        line: u32,
+        accessor_kind: &str,
+    ) -> NodeInfo {
+        NodeInfo {
+            id,
+            name: name.to_string(),
+            kind: kind.to_string(),
+            file: file.to_string(),
+            line,
+            accessor_kind: Some(accessor_kind.to_string()),
+        }
     }
 
     fn def(name: &str, kind: &str, line: u32, end_line: u32) -> DefInfo {
@@ -3232,6 +3337,20 @@ mod call_edge_tests {
             receiver: receiver.map(|s| s.to_string()),
             dynamic_kind: None,
             key_expr: None,
+            accessor_read: None,
+        }
+    }
+
+    /// Like [`call`], but tagged with `accessor_read` — for #2030 tests.
+    fn accessor_call(name: &str, line: u32, receiver: &str, accessor_read: &str) -> CallInfo {
+        CallInfo {
+            name: name.to_string(),
+            line,
+            dynamic: None,
+            receiver: Some(receiver.to_string()),
+            dynamic_kind: None,
+            key_expr: None,
+            accessor_read: Some(accessor_read.to_string()),
         }
     }
 
@@ -3306,6 +3425,224 @@ mod call_edge_tests {
         let re = receiver_edge.unwrap();
         assert_eq!(re.source_id, 1, "receiver edge source should be main (id=1)");
         assert_eq!(re.target_id, 2, "receiver edge target should be Calculator (id=2)");
+    }
+
+    // ── Cross-file ES6 accessor property-read resolution (#2030) ───────────
+
+    /// The issue's own repro shape: a property-read call tagged
+    /// `accessor_read: "get"` with `receiver` set to the *resolved class
+    /// name* (not a variable) must resolve to the matching accessor node
+    /// even when it lives many directories away from the caller — the
+    /// directory-proximity confidence gate the rest of the cascade relies on
+    /// must NOT apply here.
+    #[test]
+    fn cross_file_accessor_read_resolves_across_distant_directories() {
+        let all_nodes = vec![
+            node(1, "useRepo", "function", "src/features/sequence.js", 1),
+            accessor_node(2, "SqliteRepository.db", "method", "src/db/repository/sqlite.js", 3, "get"),
+        ];
+        let files = vec![make_file(
+            "src/features/sequence.js",
+            10,
+            vec![def("useRepo", "function", 1, 3)],
+            vec![accessor_call("db", 2, "SqliteRepository", "get")],
+            vec![],
+            vec![],
+        )];
+
+        let edges = build_call_edges(files, all_nodes, vec![], MAX_SOLVER_ITERATIONS);
+
+        let call_edge = edges.iter().find(|e| e.kind == "calls");
+        assert!(
+            call_edge.is_some(),
+            "expected a calls edge to the cross-file accessor; got: {:?}",
+            edges.iter().map(|e| (&e.kind, e.source_id, e.target_id)).collect::<Vec<_>>()
+        );
+        let ce = call_edge.unwrap();
+        assert_eq!(ce.source_id, 1);
+        assert_eq!(ce.target_id, 2);
+    }
+
+    /// A plain (non-accessor) method sharing the exact qualified name must
+    /// NOT be matched by an `accessor_read`-tagged call — the whole point of
+    /// #2030's DB `accessor_kind` column is to rule this false positive out,
+    /// which #1893's same-file-only registry couldn't do across files.
+    #[test]
+    fn cross_file_accessor_read_does_not_match_plain_method_of_same_name() {
+        let all_nodes = vec![
+            node(1, "useThing", "function", "consumer.js", 1),
+            node(2, "Thing.value", "method", "thing.js", 3), // plain method, accessor_kind = None
+        ];
+        let files = vec![make_file(
+            "consumer.js",
+            10,
+            vec![def("useThing", "function", 1, 3)],
+            vec![accessor_call("value", 2, "Thing", "get")],
+            vec![],
+            vec![],
+        )];
+
+        let edges = build_call_edges(files, all_nodes, vec![], MAX_SOLVER_ITERATIONS);
+
+        assert!(
+            !edges.iter().any(|e| e.kind == "calls"),
+            "an accessor-read call must never resolve to a plain (non-accessor) method; got: {:?}",
+            edges.iter().map(|e| (&e.kind, e.source_id, e.target_id)).collect::<Vec<_>>()
+        );
+    }
+
+    /// When a property declares both a getter and setter (two distinct
+    /// nodes sharing the same qualified name, one accessor_kind="get" and
+    /// the other "set"), an accessor_read-tagged call must resolve to
+    /// exactly the one matching its own needed kind — never both, never the
+    /// wrong one.
+    #[test]
+    fn cross_file_accessor_read_disambiguates_get_and_set_pair() {
+        let all_nodes = vec![
+            node(1, "useToggle", "function", "consumer.js", 1),
+            accessor_node(2, "Toggle.flag", "method", "toggle.js", 3, "get"),
+            accessor_node(3, "Toggle.flag", "method", "toggle.js", 6, "set"),
+        ];
+        let files = vec![make_file(
+            "consumer.js",
+            10,
+            vec![def("useToggle", "function", 1, 3)],
+            vec![accessor_call("flag", 2, "Toggle", "set")],
+            vec![],
+            vec![],
+        )];
+
+        let edges = build_call_edges(files, all_nodes, vec![], MAX_SOLVER_ITERATIONS);
+
+        let call_edges: Vec<_> = edges.iter().filter(|e| e.kind == "calls").collect();
+        assert_eq!(
+            call_edges.len(),
+            1,
+            "expected exactly one calls edge (to the setter only); got: {:?}",
+            edges.iter().map(|e| (&e.kind, e.source_id, e.target_id)).collect::<Vec<_>>()
+        );
+        assert_eq!(call_edges[0].target_id, 3, "expected the setter (id=3), not the getter");
+    }
+
+    /// Regression for #2030's Greptile review finding: the resolved class
+    /// name on an accessor-read-tagged call can itself be a renamed import
+    /// binding (`import { SqliteRepository as SR } from './sqlite-repository.js'`),
+    /// so `call.receiver` is the local alias 'SR' — the accessor is
+    /// persisted under the real declared name. Must de-alias before the
+    /// qualified lookup, mirroring #1730's general-cascade de-aliasing.
+    #[test]
+    fn cross_file_accessor_read_dealiases_renamed_import_binding() {
+        // A competing unrelated node with the identical qualified name in a
+        // different file is included deliberately: `imported_names` is keyed
+        // by the *local alias* ('SR'), not the de-aliased original
+        // ('SqliteRepository') — an earlier version of this fix looked it up
+        // under the de-aliased name, always missed, and silently fell through
+        // to the unscoped global lookup, which would have returned this
+        // unrelated node too (masked in a single-candidate test).
+        let all_nodes = vec![
+            node(1, "useRepo", "function", "consumer.js", 1),
+            accessor_node(2, "SqliteRepository.db", "method", "sqlite-repository.js", 3, "get"),
+            accessor_node(3, "SqliteRepository.db", "method", "unrelated-other-file.js", 9, "get"),
+        ];
+        let mut file = make_file(
+            "consumer.js",
+            10,
+            vec![def("useRepo", "function", 1, 3)],
+            vec![accessor_call("db", 2, "SR", "get")],
+            vec![],
+            vec![],
+        );
+        file.imported_names = vec![ImportedName {
+            name: "SR".to_string(),
+            file: "sqlite-repository.js".to_string(),
+            imported: Some("SqliteRepository".to_string()),
+        }];
+
+        let edges = build_call_edges(vec![file], all_nodes, vec![], MAX_SOLVER_ITERATIONS);
+
+        let call_edges: Vec<_> = edges.iter().filter(|e| e.kind == "calls").collect();
+        assert_eq!(
+            call_edges.len(),
+            1,
+            "expected exactly one calls edge (to the aliased import's own file); got: {:?}",
+            edges.iter().map(|e| (&e.kind, e.source_id, e.target_id)).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            call_edges[0].target_id, 2,
+            "expected the imported file's node (id=2), not the unrelated one (id=3)"
+        );
+    }
+
+    /// Regression for #2030's Greptile review finding: when the resolved
+    /// class name is a known import, resolution must commit to that specific
+    /// file rather than falling through to the unscoped global name map —
+    /// otherwise an unrelated file that happens to declare the same
+    /// `ClassName.prop` accessor (same kind) would also match.
+    #[test]
+    fn cross_file_accessor_read_prefers_imported_file_over_unrelated_same_named_global_match() {
+        let all_nodes = vec![
+            node(1, "useRepo", "function", "consumer.js", 1),
+            accessor_node(2, "SqliteRepository.db", "method", "sqlite-repository.js", 3, "get"),
+            accessor_node(3, "SqliteRepository.db", "method", "unrelated-other-file.js", 9, "get"),
+        ];
+        let mut file = make_file(
+            "consumer.js",
+            10,
+            vec![def("useRepo", "function", 1, 3)],
+            vec![accessor_call("db", 2, "SqliteRepository", "get")],
+            vec![],
+            vec![],
+        );
+        file.imported_names = vec![ImportedName {
+            name: "SqliteRepository".to_string(),
+            file: "sqlite-repository.js".to_string(),
+            imported: None,
+        }];
+
+        let edges = build_call_edges(vec![file], all_nodes, vec![], MAX_SOLVER_ITERATIONS);
+
+        let call_edges: Vec<_> = edges.iter().filter(|e| e.kind == "calls").collect();
+        assert_eq!(
+            call_edges.len(),
+            1,
+            "expected exactly one calls edge (to the imported file's accessor only); got: {:?}",
+            edges.iter().map(|e| (&e.kind, e.source_id, e.target_id)).collect::<Vec<_>>()
+        );
+        assert_eq!(call_edges[0].target_id, 2, "expected the imported file's node (id=2), not the unrelated one (id=3)");
+    }
+
+    /// Companion to the above: when the imported file's own accessor doesn't
+    /// match the needed kind, the call must be dropped outright — never fall
+    /// back to an unrelated global match of the right kind in a different
+    /// file, even though one exists.
+    #[test]
+    fn cross_file_accessor_read_drops_when_imported_file_kind_mismatches_without_global_fallback() {
+        let all_nodes = vec![
+            node(1, "useRepo", "function", "consumer.js", 1),
+            accessor_node(2, "SqliteRepository.db", "method", "sqlite-repository.js", 3, "set"),
+            accessor_node(3, "SqliteRepository.db", "method", "unrelated-other-file.js", 9, "get"),
+        ];
+        let mut file = make_file(
+            "consumer.js",
+            10,
+            vec![def("useRepo", "function", 1, 3)],
+            vec![accessor_call("db", 2, "SqliteRepository", "get")],
+            vec![],
+            vec![],
+        );
+        file.imported_names = vec![ImportedName {
+            name: "SqliteRepository".to_string(),
+            file: "sqlite-repository.js".to_string(),
+            imported: None,
+        }];
+
+        let edges = build_call_edges(vec![file], all_nodes, vec![], MAX_SOLVER_ITERATIONS);
+
+        assert!(
+            !edges.iter().any(|e| e.kind == "calls"),
+            "expected no calls edge — the imported file has only a setter, and the unrelated global getter must not be used as a fallback; got: {:?}",
+            edges.iter().map(|e| (&e.kind, e.source_id, e.target_id)).collect::<Vec<_>>()
+        );
     }
 
     /// Issue #1895: an object-literal-property value-ref call whose property
@@ -4124,7 +4461,7 @@ mod call_edge_tests {
                 // this() inside invoker
                 call("this", 2, None),
                 // invoker.call(handler, 10) — extractor emits dynamic call to invoker
-                CallInfo { name: "invoker".to_string(), line: 9, dynamic: Some(true), receiver: None, dynamic_kind: None, key_expr: None },
+                CallInfo { name: "invoker".to_string(), line: 9, dynamic: Some(true), receiver: None, dynamic_kind: None, key_expr: None, accessor_read: None },
             ],
             vec![],
             vec![],
@@ -4207,7 +4544,7 @@ mod call_edge_tests {
             vec![def("f3", "function", 1, 3), def("main", "function", 8, 10)],
             vec![
                 // eerest.e4() inside f3
-                CallInfo { name: "e4".to_string(), line: 2, dynamic: None, receiver: Some("eerest".to_string()), dynamic_kind: None, key_expr: None },
+                CallInfo { name: "e4".to_string(), line: 2, dynamic: None, receiver: Some("eerest".to_string()), dynamic_kind: None, key_expr: None, accessor_read: None },
                 call("f3", 9, None),
             ],
             vec![],
