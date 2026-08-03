@@ -1792,6 +1792,80 @@ function handleNewExpr(node: TreeSitterNode, ctx: ExtractorOutput): void {
   }
 }
 
+/** The callee `{ name, receiver }` a decorator/call resolves to — see `decoratorCallExprIdentity`. */
+interface DecoratorCalleeIdentity {
+  name: string;
+  receiver: string | undefined;
+}
+
+/**
+ * The logical callee identity of a decorator's call-expression form
+ * (`@Foo()` → `{name: 'Foo', receiver: undefined}`, `@Ns.Foo()` →
+ * `{name: 'Foo', receiver: 'Ns'}`), or null if `decoratorNode` doesn't wrap a
+ * call_expression. Used by `decoratorPrecedesCallSibling` to confirm a
+ * sibling decorator actually targets the same callee — name AND receiver —
+ * before trusting its position for the `outOfOrder` determination.
+ *
+ * Comparing the receiver too (not just the terminal property name) matters:
+ * in a mixed qualified list like `@B.Log() @A.Log @C.Log()`, `@B.Log()` and
+ * `@C.Log()` share the tail name "Log" but are different callees (different
+ * receivers) — matching on name alone would wrongly treat `@C.Log()` as proof
+ * that the middle `@A.Log` is out of order, when `@A.Log`'s real callee
+ * (receiver `A`) has no call-expression sibling at all.
+ */
+function decoratorCallExprIdentity(decoratorNode: TreeSitterNode): DecoratorCalleeIdentity | null {
+  for (let i = 0; i < decoratorNode.childCount; i++) {
+    const child = decoratorNode.child(i);
+    if (!child || child.type === '@') continue;
+    if (child.type !== 'call_expression') return null;
+    const fn = child.childForFieldName('function');
+    if (fn?.type === 'identifier') return { name: fn.text, receiver: undefined };
+    if (fn?.type === 'member_expression') {
+      const prop = fn.childForFieldName('property');
+      if (!prop) return null;
+      return { name: prop.text, receiver: extractReceiverName(fn.childForFieldName('object')) };
+    }
+    return null;
+  }
+  return null;
+}
+
+/**
+ * True when `decoratorNode` (a bare-identifier/member-expression decorator,
+ * e.g. `@Log`, resolving to callee identity `{name, receiver}`) has a LATER
+ * sibling decorator in the same decorator list (e.g. class_declaration's
+ * `@Log()`) that wraps a call_expression targeting that SAME callee — both
+ * name and receiver, not merely the tail name (see `decoratorCallExprIdentity`
+ * for why the receiver check matters).
+ *
+ * Decorators are always direct, contiguous siblings of one another and of
+ * the node they decorate (confirmed via AST dump: `@Log @Log() class Foo {}`
+ * parses as two sibling `decorator` nodes under `class_declaration`), so
+ * walking `nextSibling` gives the true relative source order directly from
+ * the AST — independent of which pass (query-match loop vs supplementary
+ * walk, see runCollectorWalk) happens to visit this node, and independent of
+ * both nodes sharing the same `line`.
+ *
+ * This is what lets `outOfOrder` be correct for BOTH textual orderings of a
+ * stacked bare/call decorator pair sharing a callee: `@Log @Log()` (bare
+ * genuinely first — flag true, upgrade is safe) and `@Log() @Log` (bare
+ * genuinely second — flag false, no upgrade, matching native's
+ * first-recorded-wins result for that ordering) (#2029).
+ */
+function decoratorPrecedesCallSibling(
+  decoratorNode: TreeSitterNode,
+  name: string,
+  receiver: string | undefined,
+): boolean {
+  let sib = decoratorNode.nextSibling;
+  while (sib?.type === 'decorator') {
+    const identity = decoratorCallExprIdentity(sib);
+    if (identity && identity.name === name && identity.receiver === receiver) return true;
+    sib = sib.nextSibling;
+  }
+  return false;
+}
+
 /**
  * Handle a TypeScript/JS decorator node.
  *
@@ -1812,11 +1886,19 @@ function handleDecorator(node: TreeSitterNode, calls: Call[]): void {
         line: nodeStartLine(node),
         dynamic: true,
         dynamicKind: 'reflection',
+        outOfOrder: decoratorPrecedesCallSibling(node, child.text, undefined),
       });
     } else if (t === 'member_expression') {
       // @Foo.bar — emit as reflection; always mark dynamic since it's decorator dispatch
       const callInfo = extractCallInfo(child, node);
-      if (callInfo) calls.push({ ...callInfo, dynamic: true, dynamicKind: 'reflection' });
+      if (callInfo) {
+        calls.push({
+          ...callInfo,
+          dynamic: true,
+          dynamicKind: 'reflection',
+          outOfOrder: decoratorPrecedesCallSibling(node, callInfo.name, callInfo.receiver),
+        });
+      }
     }
     // call_expression / other — handled by the recursive walker automatically
     break;
