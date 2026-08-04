@@ -1513,6 +1513,56 @@ function runDemo(reporter: Reporter, users: string[]): void {
       );
     });
 
+    describe('destructured const binding rest/default definitions (#2051)', () => {
+      // extractDestructuredBindings's object_pattern branch only recognized
+      // shorthand_property_identifier_pattern and pair_pattern children, so a
+      // rest element (`...rest`) never got a Definition at all and a shorthand
+      // default (`{ a = 1 }`) produced no Definition either — the same class of
+      // bug fixed for dynamic-import destructure extraction in #1920, but for
+      // the generic destructured-const-binding path used by any object
+      // destructure, not just dynamic imports.
+
+      it('extracts a constant Definition for a rest binding alongside plain names', () => {
+        const symbols = parseJS(`const { a, ...rest } = someValue;`);
+        expect(symbols.definitions).toContainEqual(
+          expect.objectContaining({ name: 'a', kind: 'constant' }),
+        );
+        expect(symbols.definitions).toContainEqual(
+          expect.objectContaining({ name: 'rest', kind: 'constant' }),
+        );
+      });
+
+      it('extracts a constant Definition for a shorthand default-value binding', () => {
+        const symbols = parseJS(`const { a = 1 } = someValue;`);
+        expect(symbols.definitions).toContainEqual(
+          expect.objectContaining({ name: 'a', kind: 'constant' }),
+        );
+      });
+
+      it('extracts a mix of plain, renamed, default, and rest bindings', () => {
+        const symbols = parseJS(`const { a, b: alias, c = 1, ...rest } = someValue;`);
+        for (const name of ['a', 'alias', 'c', 'rest']) {
+          expect(symbols.definitions).toContainEqual(
+            expect.objectContaining({ name, kind: 'constant' }),
+          );
+        }
+        expect(symbols.definitions).not.toContainEqual(expect.objectContaining({ name: 'b' }));
+      });
+
+      it('extracts a constant Definition for a renamed binding with a default value', () => {
+        // Greptile follow-up: { key: local = fallback } nests an
+        // assignment_pattern under pair_pattern's value field — a distinct
+        // shape from the plain shorthand default ({ a = 1 }) case above.
+        // Without this branch the pair_pattern handler rejected the nested
+        // assignment_pattern and `local` never got a Definition at all.
+        const symbols = parseJS(`const { key: local = fallback } = someValue;`);
+        expect(symbols.definitions).toContainEqual(
+          expect.objectContaining({ name: 'local', kind: 'constant' }),
+        );
+        expect(symbols.definitions).not.toContainEqual(expect.objectContaining({ name: 'key' }));
+      });
+    });
+
     // let/var object-literal method definitions
     it('extracts qualified definitions from var object-literal arrow functions', () => {
       // `var x = { a: function() {} }` — native produces `x.a`, WASM must too.
