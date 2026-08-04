@@ -66,6 +66,15 @@ function buildTestGraph() {
   // No callers from same file, but one cross-file caller
   const crossCaller = insertNode('crossCaller', 'function', 'b.js', 50);
   insertEdge(crossCaller, entryFn, 'calls');
+  // crossCaller is the graph's only confirmed-live root (#2032): genuinely
+  // exported, not merely inferred "exported" from being someone's cross-file
+  // caller (that broader signal no longer grants BFS root status — see
+  // isLiveRoot's isPublicSurface doc comment). Without a real root here, the
+  // whole graph below is an unreachable component and everything downstream
+  // of crossCaller would be (correctly, under #2032) flagged dead, which
+  // would defeat this fixture's actual purpose: testing fan-shape
+  // classification (core/utility/adapter/leaf), not reachability.
+  db.prepare('UPDATE nodes SET exported = 1 WHERE id = ?').run(crossCaller);
 
   // coreFn: high fan_in (3 callers), low fan_out (0) → core
   insertEdge(entryFn, coreFn, 'calls');
@@ -176,6 +185,15 @@ describe('classifyNodeRoles', () => {
     // fn1 calls fn2, fn2 calls fn1 (mutual)
     insertEdge(fn1, fn2, 'calls');
     insertEdge(fn2, fn1, 'calls');
+
+    // fn1 is exported — a confirmed-live reachability root (#2032) — so this
+    // mutually-recursive pair is reachable from outside the codebase via fn1.
+    // Without a root, fn1/fn2 would be a closed component unreachable from
+    // any live entry point and correctly downgraded to dead-unresolved,
+    // regardless of their mutual fan-in/fan-out — this test is specifically
+    // about median-based fan-shape classification, not reachability, so it
+    // needs a genuine root to keep exercising that.
+    db.prepare('UPDATE nodes SET exported = 1 WHERE id = ?').run(fn1);
 
     const summary = classifyNodeRoles(db);
     // Both have fan_in=1 (>= median 1) and fan_out=1 (>= median 1) → utility
@@ -308,6 +326,14 @@ describe('classifyNodeRoles', () => {
     insertEdge(externalCaller, fn1, 'calls');
     insertEdge(fn1, fn2, 'calls');
     // Structs have no call edges (they are used as type annotations only)
+
+    // externalCaller ("main") is the confirmed-live root (#2032): genuinely
+    // exported, not merely inferred "exported" from being fn1's cross-file
+    // caller (that broader signal no longer grants BFS root status). Without
+    // a real root, fn1/fn2 would be an unreachable component and fn1 would
+    // (correctly, under #2032) be flagged dead, defeating this test's actual
+    // purpose of checking the struct/enum/trait hasActiveFileSiblings rescue.
+    db.prepare('UPDATE nodes SET exported = 1 WHERE id = ?').run(externalCaller);
 
     classifyNodeRoles(db);
 

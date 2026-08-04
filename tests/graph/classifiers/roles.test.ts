@@ -766,4 +766,401 @@ describe('classifyRoles', () => {
     const roles = classifyRoles(nodes);
     expect(roles.get('1')).toBe('leaf');
   });
+
+  // ── Transitive-reachability dead-code downgrade (#2032) ─────────────
+
+  it('does not downgrade anything when callEdges is omitted (pre-#2032 behavior preserved)', () => {
+    // A function whose only caller has fanIn=0 and isn't a root: without
+    // callEdges, classifyRoles must behave exactly as before — the direct
+    // fan-in check alone decides liveness.
+    const nodes = [
+      { id: '1', name: 'computeHelper', kind: 'function', fanIn: 1, fanOut: 0, isExported: false },
+      {
+        id: '2',
+        name: 'deadIntermediate',
+        kind: 'function',
+        fanIn: 0,
+        fanOut: 1,
+        isExported: false,
+      },
+    ];
+    const roles = classifyRoles(nodes);
+    expect(roles.get('1')).not.toBe('dead-unresolved');
+  });
+
+  it('downgrades a function whose only caller is itself unreachable (#2032 repro)', () => {
+    // computeHelper is called only by deadIntermediate, which is never
+    // itself called by anything reachable from the confirmed-live root
+    // (useThing). Direct fan-in alone would call computeHelper live; the
+    // reachability pass must correctly flag it dead.
+    const nodes = [
+      {
+        id: '1',
+        name: 'computeHelper',
+        kind: 'function',
+        file: 'a.ts',
+        fanIn: 1,
+        fanOut: 0,
+        isExported: false,
+      },
+      {
+        id: '2',
+        name: 'deadIntermediate',
+        kind: 'function',
+        file: 'a.ts',
+        fanIn: 0,
+        fanOut: 1,
+        isExported: false,
+      },
+      {
+        id: '3',
+        name: 'useThing',
+        kind: 'function',
+        file: 'a.ts',
+        fanIn: 0,
+        fanOut: 0,
+        isExported: true,
+      },
+    ];
+    // deadIntermediate calls computeHelper; useThing (the only root) calls nothing.
+    const callEdges: Array<[string, string]> = [['2', '1']];
+    const roles = classifyRoles(nodes, undefined, callEdges);
+    expect(roles.get('1')).toBe('dead-unresolved');
+    // deadIntermediate itself has fanIn=0, so it's untouched by the downgrade
+    // pass (it goes through the fanIn===0 branch, not classifyByFanShape) —
+    // its own dead-vs-leaf classification is unrelated to this fix.
+  });
+
+  it('does not downgrade a node reachable from a publicly-surfaced root via a real call chain', () => {
+    const nodes = [
+      {
+        id: '1',
+        name: 'helper',
+        kind: 'function',
+        file: 'a.ts',
+        fanIn: 1,
+        fanOut: 0,
+        isExported: false,
+      },
+      {
+        id: '2',
+        name: 'useThing',
+        kind: 'function',
+        file: 'a.ts',
+        fanIn: 0,
+        fanOut: 1,
+        isExported: true,
+        isPublicSurface: true,
+      },
+    ];
+    const callEdges: Array<[string, string]> = [['2', '1']];
+    const roles = classifyRoles(nodes, undefined, callEdges);
+    expect(roles.get('1')).not.toBe('dead-unresolved');
+  });
+
+  it('does NOT treat a symbol as a root merely because some (possibly unreachable) cross-file caller exists', () => {
+    // Regression for a Greptile-flagged gap: the pre-existing `isExported`
+    // heuristic (used by classifyNodeRole's own `entry` branch) also marks a
+    // symbol "exported" merely because SOME caller in a different file calls
+    // it — regardless of whether that caller is itself reachable. Using that
+    // broader signal for root determination would let a cross-file dead call
+    // chain evade #2032's fix entirely. `isLiveRoot` must key off the
+    // narrower `isPublicSurface` (explicit export / confirmed reexport
+    // chain), not `isExported`.
+    const nodes = [
+      {
+        id: '1',
+        name: 'unreachableCrossFileCaller',
+        kind: 'function',
+        file: 'a.ts',
+        fanIn: 0,
+        fanOut: 1,
+        isExported: false,
+      },
+      {
+        id: '2',
+        name: 'calleeInAnotherFile',
+        kind: 'function',
+        file: 'b.ts',
+        fanIn: 1,
+        fanOut: 0,
+        // Mirrors what `exportedIds`'s cross-file-caller heuristic would set:
+        // isExported becomes true merely because the caller is in a
+        // different file, even though isPublicSurface (no explicit export,
+        // no reexport chain) stays false.
+        isExported: true,
+        isPublicSurface: false,
+      },
+    ];
+    const callEdges: Array<[string, string]> = [['1', '2']];
+    const roles = classifyRoles(nodes, undefined, callEdges);
+    expect(roles.get('2')).toBe('dead-unresolved');
+  });
+
+  it('downgrades a mutually-recursive pair with no confirmed-live root', () => {
+    const nodes = [
+      {
+        id: '1',
+        name: 'fn1',
+        kind: 'function',
+        file: 'a.ts',
+        fanIn: 1,
+        fanOut: 1,
+        isExported: false,
+      },
+      {
+        id: '2',
+        name: 'fn2',
+        kind: 'function',
+        file: 'a.ts',
+        fanIn: 1,
+        fanOut: 1,
+        isExported: false,
+      },
+    ];
+    const callEdges: Array<[string, string]> = [
+      ['1', '2'],
+      ['2', '1'],
+    ];
+    const roles = classifyRoles(nodes, undefined, callEdges);
+    expect(roles.get('1')).toBe('dead-unresolved');
+    expect(roles.get('2')).toBe('dead-unresolved');
+  });
+
+  it('treats a module-top-level constant as an unconditional root for its value-ref edges (#1771 rescue preserved)', () => {
+    // Mirrors the real dispatch-table shape: a top-level `const HANDLERS =
+    // [{ resolve: resolveA }]` gets a value-ref `calls` edge sourced from the
+    // constant declaration itself, not from a function. The constant is not
+    // itself subject to reachability (module-top-level initializers always
+    // run), so its value-ref edges must propagate liveness unconditionally.
+    const nodes = [
+      {
+        id: '1',
+        name: 'resolveA',
+        kind: 'function',
+        file: 'dispatch.js',
+        fanIn: 1,
+        fanOut: 0,
+        isExported: false,
+      },
+      {
+        id: '2',
+        name: 'HANDLERS',
+        kind: 'constant',
+        file: 'dispatch.js',
+        fanIn: 0,
+        fanOut: 0,
+        isExported: false,
+      },
+    ];
+    const callEdges: Array<[string, string]> = [['2', '1']];
+    const roles = classifyRoles(nodes, undefined, callEdges);
+    expect(roles.get('1')).not.toBe('dead-unresolved');
+  });
+
+  it('treats a non-function/method call-edge source absent from nodes (e.g. a file scope) as an unconditional root (#1776)', () => {
+    // Mirrors Lua's builtin-reassignment pattern (`require = tracedFn`): the
+    // value-ref edge is sourced from the enclosing file/module scope, which
+    // is entirely excluded from the classifier's `nodes` input (file/directory
+    // kinds never reach this module) — so the source id is absent from
+    // `nodes` altogether, not merely a non-function kind present in it.
+    const nodes = [
+      {
+        id: '1',
+        name: 'tracedFn',
+        kind: 'function',
+        file: 'main.lua',
+        fanIn: 1,
+        fanOut: 0,
+        isExported: false,
+      },
+    ];
+    // Source '99' is a file-scope id that never appears in `nodes`.
+    const callEdges: Array<[string, string]> = [['99', '1']];
+    const roles = classifyRoles(nodes, undefined, callEdges);
+    expect(roles.get('1')).not.toBe('dead-unresolved');
+  });
+
+  it('does not downgrade a test-only node even though its only caller (a test) is unreachable', () => {
+    const nodes = [
+      {
+        id: '1',
+        name: 'helperForTests',
+        kind: 'function',
+        file: 'a.ts',
+        fanIn: 1,
+        fanOut: 0,
+        isExported: false,
+        productionFanIn: 0,
+      },
+    ];
+    const callEdges: Array<[string, string]> = [['2', '1']];
+    const roles = classifyRoles(nodes, undefined, callEdges);
+    expect(roles.get('1')).toBe('test-only');
+  });
+
+  it('does not downgrade an interface method-signature member even with fanIn > 0 and an unreachable caller', () => {
+    // Regression: isTypeDeclarationMember returns 'leaf' unconditionally,
+    // independent of fanIn — this is indistinguishable from
+    // classifyByFanShape's 'leaf' by role string alone unless the downgrade
+    // pass explicitly re-checks isTypeDeclarationMember. A widely-referenced
+    // interface method (e.g. a native-binding surface like `NativeDatabase`
+    // in `types.ts`) has real fanIn > 0 from call sites resolving to it by
+    // name, and must never be reconsidered by reachability.
+    const nodes = [
+      {
+        id: '1',
+        name: 'NativeDatabase',
+        kind: 'interface',
+        file: 'types.ts',
+        fanIn: 0,
+        fanOut: 0,
+        isExported: false,
+      },
+      {
+        id: '2',
+        name: 'NativeDatabase.countNodes',
+        kind: 'method',
+        file: 'types.ts',
+        fanIn: 1,
+        fanOut: 0,
+        isExported: false,
+      },
+      {
+        id: '3',
+        name: 'unreachableCaller',
+        kind: 'function',
+        file: 'a.ts',
+        fanIn: 0,
+        fanOut: 1,
+        isExported: false,
+      },
+    ];
+    const callEdges: Array<[string, string]> = [['3', '2']];
+    const roles = classifyRoles(nodes, undefined, callEdges);
+    expect(roles.get('2')).toBe('leaf');
+  });
+
+  it('treats an interface-dispatch method (Pattern 2) as an unconditional root for what it calls', () => {
+    // Mirrors ast-analysis/visitors/*.ts's Visitor pattern: enterNode is
+    // dispatched generically (`if (v.enterNode) v.enterNode(node)`) so it can
+    // never be the TARGET of a `calls` edge — fanIn stays 0 forever, yet it's
+    // rescued to 'leaf' by classifyUnreferencedNode's Pattern-2 heuristic.
+    // Whatever it calls (classifyHalstead) must be reachable through it.
+    //
+    // The declared `Visitor` interface (mirroring src/types.ts) is required:
+    // isInterfaceDispatchMethodRoot only promotes a method to root when its
+    // bare name matches an actual interface/type member somewhere in the
+    // codebase, not merely from the fanIn/fanOut/hasActiveFileSiblings shape
+    // alone (see the "does NOT treat an ordinary unused class method" test
+    // below for why that additional check matters).
+    const nodes = [
+      {
+        id: '1',
+        name: 'enterNode',
+        kind: 'method',
+        file: 'visitor.ts',
+        fanIn: 0,
+        fanOut: 1,
+        isExported: false,
+        hasActiveFileSiblings: true,
+      },
+      {
+        id: '2',
+        name: 'classifyHalstead',
+        kind: 'function',
+        file: 'visitor.ts',
+        fanIn: 1,
+        fanOut: 0,
+        isExported: false,
+      },
+      {
+        id: '3',
+        name: 'Visitor',
+        kind: 'interface',
+        file: 'types.ts',
+        fanIn: 0,
+        fanOut: 0,
+        isExported: true,
+      },
+      {
+        id: '4',
+        name: 'Visitor.enterNode',
+        kind: 'method',
+        file: 'types.ts',
+        fanIn: 0,
+        fanOut: 0,
+        isExported: false,
+      },
+    ];
+    const callEdges: Array<[string, string]> = [['1', '2']];
+    const roles = classifyRoles(nodes, undefined, callEdges);
+    expect(roles.get('2')).not.toBe('dead-unresolved');
+  });
+
+  it('does NOT treat an ordinary unused class method as an interface-dispatch root merely from fan shape', () => {
+    // Regression for a Greptile-flagged gap: without the interface-member
+    // name-match requirement, ANY method with fanIn=0, fanOut>0, and an
+    // active sibling in its file would be promoted to root — including a
+    // genuinely-dead class method that happens to call a helper. No
+    // interface/type declares a `deadMethod` member anywhere here, so this
+    // must NOT be treated as an interface-dispatch root, and the helper it
+    // calls must correctly stay dead.
+    const nodes = [
+      {
+        id: '1',
+        name: 'MyClass.deadMethod',
+        kind: 'method',
+        file: 'a.ts',
+        fanIn: 0,
+        fanOut: 1,
+        isExported: false,
+        hasActiveFileSiblings: true,
+      },
+      {
+        id: '2',
+        name: 'helper',
+        kind: 'function',
+        file: 'a.ts',
+        fanIn: 1,
+        fanOut: 0,
+        isExported: false,
+      },
+    ];
+    const callEdges: Array<[string, string]> = [['1', '2']];
+    const roles = classifyRoles(nodes, undefined, callEdges);
+    expect(roles.get('2')).toBe('dead-unresolved');
+  });
+
+  it('does NOT treat a function-kind logical-or-fallback rescue as a root (would defeat #2032 for the common case)', () => {
+    // Unlike the method/interface-dispatch case above, a plain `function`
+    // rescued via the (explicitly acknowledged as imprecise) logical-or
+    // fallback heuristic must NOT be promoted to root — otherwise almost any
+    // genuinely-dead intermediate function in an active file would silently
+    // rescue whatever it calls, the exact #2032 pattern this fix targets.
+    const nodes = [
+      {
+        id: '1',
+        name: 'deadIntermediate',
+        kind: 'function',
+        file: 'a.ts',
+        fanIn: 0,
+        fanOut: 1,
+        isExported: false,
+        hasActiveFileSiblings: true,
+      },
+      {
+        id: '2',
+        name: 'computeHelper',
+        kind: 'function',
+        file: 'a.ts',
+        fanIn: 1,
+        fanOut: 0,
+        isExported: false,
+      },
+    ];
+    const callEdges: Array<[string, string]> = [['1', '2']];
+    const roles = classifyRoles(nodes, undefined, callEdges);
+    expect(roles.get('2')).toBe('dead-unresolved');
+  });
 });

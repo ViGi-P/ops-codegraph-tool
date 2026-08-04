@@ -681,6 +681,7 @@ function buildClassifierInput(
   prodFanInMap: Map<number, number>,
   activeFiles: Set<string>,
   calledActiveFiles: Set<string>,
+  publicSurfaceIds: Set<number>,
 ): Array<{
   id: string;
   name: string;
@@ -691,6 +692,7 @@ function buildClassifierInput(
   isExported: boolean;
   productionFanIn: number;
   hasActiveFileSiblings: boolean | undefined;
+  isPublicSurface: boolean;
 }> {
   return rows.map((r) => ({
     id: String(r.id),
@@ -715,6 +717,16 @@ function buildClassifierInput(
       : r.kind === 'method' || r.kind === 'function'
         ? calledActiveFiles.has(r.file)
         : undefined,
+    // Narrower than `isExported`: only the explicit `export` keyword (the
+    // `exported` column) and confirmed production-reachable reexport chains —
+    // deliberately EXCLUDES `exportedIds`'s "some caller in a different file"
+    // component. That component is only ever a proxy for "has a cross-file
+    // caller", which is exactly the kind of unverified-caller evidence #2032's
+    // reachability check exists to see through — a symbol called only by an
+    // unreachable cross-file caller must not become an automatic BFS root
+    // merely because the call happens to cross a file boundary. See
+    // `isLiveRoot` in `graph/classifiers/roles.ts`.
+    isPublicSurface: publicSurfaceIds.has(r.id),
   }));
 }
 
@@ -939,6 +951,60 @@ function classifyNodeRolesFull(db: BetterSqlite3Database, emptySummary: RoleSumm
     .all() as { id: number }[];
   for (const r of explicitlyExported) exportedIds.add(r.id);
 
+  // Narrower "genuinely public" surface for #2032's reachability roots —
+  // explicit `export` keyword usage and confirmed production-reachable
+  // reexport chains only, deliberately excluding the cross-file-caller
+  // component of `exportedIds` above (see `buildClassifierInput`'s
+  // `isPublicSurface` doc comment for why that component must not grant
+  // automatic root status).
+  //
+  // Deliberately NOT reusing `reexportExported` above (Greptile review): that
+  // set treats ANY `reexports` edge — whether from `export { specificThing }
+  // from './b'` (which only re-exports `specificThing`) or `export * from
+  // './b'` (which genuinely re-exports everything) — as "every symbol in the
+  // target file is exported". For a named reexport that over-broadly marks
+  // every OTHER private symbol in that file as a public-surface root too,
+  // which would let an unreachable private call chain sharing a file with
+  // one re-exported symbol evade the whole check. A named reexport gets its
+  // own symbol-level `reexports` edge (target = the specific symbol node, not
+  // the file) — use that directly; only a genuine wildcard reexport (kind
+  // `reexports-wildcard`) justifies marking the whole file.
+  const publicSurfaceIds = new Set<number>();
+  const publicSurfaceRows = db
+    .prepare(
+      `WITH RECURSIVE prod_reachable(file_id) AS (
+        SELECT DISTINCT e.target_id
+        FROM edges e
+        JOIN nodes src ON e.source_id = src.id
+        WHERE e.kind IN ('imports', 'dynamic-imports', 'imports-type')
+          AND src.kind = 'file'
+          ${testFilterSQL('src.file')}
+        UNION
+        SELECT e.target_id
+        FROM edges e
+        JOIN prod_reachable pr ON e.source_id = pr.file_id
+        WHERE e.kind = 'reexports'
+      )
+      SELECT DISTINCT e.target_id AS id
+      FROM edges e
+      JOIN nodes n ON n.id = e.target_id
+      WHERE e.kind = 'reexports' AND n.kind != 'file'
+        AND e.source_id IN (SELECT file_id FROM prod_reachable)
+      UNION
+      SELECT DISTINCT n.id AS id
+      FROM nodes n
+      JOIN nodes f ON f.file = n.file AND f.kind = 'file'
+      WHERE f.id IN (
+        SELECT e.target_id FROM edges e
+        WHERE e.kind = 'reexports-wildcard'
+          AND e.source_id IN (SELECT file_id FROM prod_reachable)
+      )
+      AND n.kind NOT IN ('file', 'directory', 'parameter', 'property', 'method')`,
+    )
+    .all() as { id: number }[];
+  for (const r of publicSurfaceRows) publicSurfaceIds.add(r.id);
+  for (const r of explicitlyExported) publicSurfaceIds.add(r.id);
+
   // Compute production fan-in (excluding callers in test files)
   const prodFanInMap = new Map<number, number>();
   const prodRows = db
@@ -966,6 +1032,7 @@ function classifyNodeRolesFull(db: BetterSqlite3Database, emptySummary: RoleSumm
     prodFanInMap,
     activeFiles,
     calledActiveFiles,
+    publicSurfaceIds,
   );
   const nonZeroFanIn = classifierInput
     .filter((n) => n.fanIn > 0)
@@ -976,7 +1043,25 @@ function classifyNodeRolesFull(db: BetterSqlite3Database, emptySummary: RoleSumm
     .map((n) => n.fanOut)
     .sort((a, b) => a - b);
   const globalMedians = { fanIn: median(nonZeroFanIn), fanOut: median(nonZeroFanOut) };
-  const roleMap = classifyRoles(classifierInput, globalMedians);
+  // Full graph `calls`-edge adjacency for the transitive-reachability
+  // dead-code pass (#2032). Only the full-build path supplies this — a
+  // single indexed full-table scan, consistent with the other full-graph
+  // scans this function already performs (exportedIds, reexportExported,
+  // prodFanInMap above). The incremental path (`classifyNodeRolesIncremental`)
+  // deliberately omits it: reachability is a whole-graph property that a
+  // changed-files-plus-one-hop-neighbour window cannot answer correctly (a
+  // node's only live path in could run through files outside that window),
+  // and re-running a full scan on every incremental build would reintroduce
+  // exactly the cost this function's median/exported-set caching was built to
+  // avoid (#1855). See #2032's follow-up issue for incremental parity.
+  const callEdgeRows = db
+    .prepare(`SELECT source_id, target_id FROM edges WHERE kind = 'calls'`)
+    .all() as { source_id: number; target_id: number }[];
+  const callEdges: Array<[string, string]> = callEdgeRows.map((r) => [
+    String(r.source_id),
+    String(r.target_id),
+  ]);
+  const roleMap = classifyRoles(classifierInput, globalMedians, callEdges);
   // Derive the edge count from already-loaded in-memory rows: summing fan_in
   // across all nodes equals COUNT(*) FROM edges WHERE kind IN ('calls','imports-type'),
   // since the full-build query left-joins every matching edge exactly once per target.
@@ -1209,10 +1294,21 @@ function classifyNodeRolesIncremental(
   // (see `isBarrelProdReachable`).
   //
   // `method` is excluded (#1780) — see classifyNodeRolesFull for rationale.
+  //
+  // `publicSurfaceIds` mirrors classifyNodeRolesFull's narrower "genuinely
+  // public" set for #2032's reachability roots (explicit `export` + confirmed
+  // reexport chains only, excluding the cross-file-caller component of
+  // `exportedIds`) — see `buildClassifierInput`'s `isPublicSurface` doc
+  // comment. Computed here too even though this path never actually runs the
+  // reachability downgrade (it doesn't pass `callEdges` to `classifyRoles`),
+  // so the field stays correct rather than silently stubbed if that ever changes.
+  const publicSurfaceIds = new Set<number>();
   const reexportBarrels = findDirectReexportBarrels(db, allAffectedFiles);
   const reachableBarrels = reexportBarrels.filter((b) => isBarrelProdReachable(db, b));
   if (reachableBarrels.length > 0) {
     const barrelPlaceholders = reachableBarrels.map(() => '?').join(',');
+    // Broad "whole file" set for the pre-existing exportedIds/`entry`
+    // classification behavior (#837) — unchanged.
     const reexportExported = db
       .prepare(
         `SELECT DISTINCT n.id
@@ -1226,6 +1322,37 @@ function classifyNodeRolesIncremental(
       )
       .all(...reachableBarrels, ...allAffectedFiles) as { id: number }[];
     for (const r of reexportExported) exportedIds.add(r.id);
+
+    // Narrower set for #2032's reachability roots (Greptile review): a named
+    // reexport only re-exports the SPECIFIC symbol(s) actually named — its
+    // own symbol-level `reexports` edge (target != file) — not every other
+    // private symbol sharing that file. Only a genuine `export * from`
+    // (`reexports-wildcard`) justifies marking the whole file.
+    const namedReexportSymbols = db
+      .prepare(
+        `SELECT DISTINCT e.target_id AS id
+        FROM edges e
+        JOIN nodes n ON n.id = e.target_id
+        JOIN nodes b ON b.id = e.source_id
+        WHERE e.kind = 'reexports' AND n.kind != 'file' AND b.file IN (${barrelPlaceholders})
+          AND n.file IN (${placeholders})`,
+      )
+      .all(...reachableBarrels, ...allAffectedFiles) as { id: number }[];
+    for (const r of namedReexportSymbols) publicSurfaceIds.add(r.id);
+
+    const wildcardReexported = db
+      .prepare(
+        `SELECT DISTINCT n.id AS id
+        FROM nodes n
+        JOIN nodes f ON f.file = n.file AND f.kind = 'file'
+        JOIN edges e ON e.target_id = f.id
+        JOIN nodes b ON e.source_id = b.id
+        WHERE e.kind = 'reexports-wildcard' AND b.file IN (${barrelPlaceholders})
+          AND n.kind NOT IN ('file', 'directory', 'parameter', 'property', 'method')
+          AND n.file IN (${placeholders})`,
+      )
+      .all(...reachableBarrels, ...allAffectedFiles) as { id: number }[];
+    for (const r of wildcardReexported) publicSurfaceIds.add(r.id);
   }
 
   // 3c. Mark symbols with exported=1 as exported — the extractor sets this flag when the
@@ -1241,7 +1368,10 @@ function classifyNodeRolesIncremental(
         AND file IN (${placeholders})`,
     )
     .all(...allAffectedFiles) as { id: number }[];
-  for (const r of explicitlyExported) exportedIds.add(r.id);
+  for (const r of explicitlyExported) {
+    exportedIds.add(r.id);
+    publicSurfaceIds.add(r.id);
+  }
 
   // 4. Production fan-in for affected nodes only
   const prodFanInMap = new Map<number, number>();
@@ -1269,6 +1399,7 @@ function classifyNodeRolesIncremental(
     prodFanInMap,
     activeFiles,
     calledActiveFiles,
+    publicSurfaceIds,
   );
   const roleMap = classifyRoles(classifierInput, globalMedians);
 

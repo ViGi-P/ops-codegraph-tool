@@ -459,6 +459,26 @@ pub(crate) fn do_classify_full(conn: &Connection) -> rusqlite::Result<RoleSummar
     // abstract base class's zero-fan-in method declarations were promoted to
     // `entry` merely because some other symbol in the same file was re-exported
     // through a barrel.
+    //
+    // `public_surface_ids` mirrors the TS `publicSurfaceIds` narrower "genuinely
+    // public" set for #2032's reachability roots (explicit `export` + confirmed
+    // reexport chains only, excluding `exported_ids`'s cross-file-caller
+    // component above) — see `is_live_root`'s doc comment for why that
+    // component must not grant automatic root status.
+    //
+    // Deliberately NOT reusing the whole-file `exported_ids` query above
+    // (Greptile review): that query treats ANY `reexports` edge — whether
+    // from `export { specificThing } from './b'` (which only re-exports
+    // `specificThing`) or `export * from './b'` (which genuinely re-exports
+    // everything) — as "every symbol in the target file is exported". For a
+    // named reexport that over-broadly marks every OTHER private symbol in
+    // that file as a public-surface root too, letting an unreachable private
+    // call chain sharing a file with one re-exported symbol evade the whole
+    // check. A named reexport gets its own symbol-level `reexports` edge
+    // (target = the specific symbol node, not the file) — use that directly;
+    // only a genuine wildcard reexport (kind `reexports-wildcard`) justifies
+    // marking the whole file.
+    let mut public_surface_ids: std::collections::HashSet<i64> = std::collections::HashSet::new();
     {
         let sql = format!(
             "WITH RECURSIVE prod_reachable(file_id) AS (
@@ -491,6 +511,44 @@ pub(crate) fn do_classify_full(conn: &Connection) -> rusqlite::Result<RoleSummar
             exported_ids.insert(r);
         }
     }
+    {
+        let sql = format!(
+            "WITH RECURSIVE prod_reachable(file_id) AS (
+                SELECT DISTINCT e.target_id
+                FROM edges e
+                JOIN nodes src ON e.source_id = src.id
+                WHERE e.kind IN ('imports', 'dynamic-imports', 'imports-type')
+                  AND src.kind = 'file'
+                  {}
+                UNION
+                SELECT e.target_id
+                FROM edges e
+                JOIN prod_reachable pr ON e.source_id = pr.file_id
+                WHERE e.kind = 'reexports'
+              )
+              SELECT DISTINCT e.target_id AS id
+              FROM edges e
+              JOIN nodes n ON n.id = e.target_id
+              WHERE e.kind = 'reexports' AND n.kind != 'file'
+                AND e.source_id IN (SELECT file_id FROM prod_reachable)
+              UNION
+              SELECT DISTINCT n.id AS id
+              FROM nodes n
+              JOIN nodes f ON f.file = n.file AND f.kind = 'file'
+              WHERE f.id IN (
+                SELECT e.target_id FROM edges e
+                WHERE e.kind = 'reexports-wildcard'
+                  AND e.source_id IN (SELECT file_id FROM prod_reachable)
+              )
+              AND n.kind NOT IN ('file', 'directory', 'parameter', 'property', 'method')",
+            test_file_filter_col("src.file")
+        );
+        let mut stmt = tx.prepare(&sql)?;
+        let public_surface_rows = stmt.query_map([], |row| row.get::<_, i64>(0))?;
+        for r in public_surface_rows.flatten() {
+            public_surface_ids.insert(r);
+        }
+    }
 
     // 3c. Mark symbols with exported=1 as exported — the extractor sets this flag when the
     // author writes `export interface Foo { }` / `export type Bar = ...` / `export function`.
@@ -506,6 +564,7 @@ pub(crate) fn do_classify_full(conn: &Connection) -> rusqlite::Result<RoleSummar
         let rows = stmt.query_map([], |row| row.get::<_, i64>(0))?;
         for r in rows.flatten() {
             exported_ids.insert(r);
+            public_surface_ids.insert(r);
         }
     }
 
@@ -553,7 +612,7 @@ pub(crate) fn do_classify_full(conn: &Connection) -> rusqlite::Result<RoleSummar
             .extend(type_member_leaf_ids);
     }
 
-    classify_rows(
+    let mut role_by_id = classify_rows(
         &rows,
         &exported_ids,
         &prod_fan_in,
@@ -562,9 +621,34 @@ pub(crate) fn do_classify_full(conn: &Connection) -> rusqlite::Result<RoleSummar
         &type_def_names_by_file,
         median_fan_in,
         median_fan_out,
-        &mut ids_by_role,
-        &mut summary,
     );
+
+    // 6b. Transitive-reachability dead-code downgrade (#2032). Only the
+    // full-classification path runs this: it needs the FULL graph's
+    // `calls`-edge adjacency (not just `rows`, which already spans every
+    // callable node on this path) to compute reachability correctly — a
+    // single indexed full-table scan, consistent with the other full-graph
+    // scans this function already performs. `do_classify_incremental`
+    // deliberately skips it: reachability is a whole-graph property that a
+    // changed-files-plus-one-hop-neighbour window cannot answer correctly,
+    // and re-running a full scan on every incremental build would reintroduce
+    // exactly the cost this path's neighbour-scoping was built to avoid
+    // (#1855). See #2032's follow-up issue for incremental parity.
+    let call_edges: Vec<(i64, i64)> = {
+        let mut stmt = tx.prepare("SELECT source_id, target_id FROM edges WHERE kind = 'calls'")?;
+        let mapped = stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?;
+        mapped.filter_map(|r| r.ok()).collect()
+    };
+    apply_reachability_downgrade(
+        &rows,
+        &public_surface_ids,
+        &called_active_files,
+        &type_def_names_by_file,
+        &call_edges,
+        &mut role_by_id,
+    );
+
+    finalize_roles(&role_by_id, &mut ids_by_role, &mut summary);
 
     // 7. Batch UPDATE: reset all roles then set per-role
     tx.execute("UPDATE nodes SET role = NULL", [])?;
@@ -677,7 +761,10 @@ fn query_id_counts(
     Ok(result)
 }
 
-/// Classify rows and accumulate into ids_by_role and summary.
+/// Classify every row into a role. Returns a per-id role map rather than
+/// accumulating directly into `ids_by_role`/`summary` so that, on the
+/// full-classification path, `apply_reachability_downgrade` can reconsider
+/// individual verdicts before final bucketing/counting via `finalize_roles`.
 #[allow(clippy::too_many_arguments)]
 fn classify_rows(
     rows: &[(i64, String, String, String, u32, u32)],
@@ -688,9 +775,8 @@ fn classify_rows(
     type_def_names_by_file: &HashMap<String, std::collections::HashSet<String>>,
     median_fan_in: f64,
     median_fan_out: f64,
-    ids_by_role: &mut HashMap<&'static str, Vec<i64>>,
-    summary: &mut RoleSummary,
-) {
+) -> HashMap<i64, &'static str> {
+    let mut role_by_id: HashMap<i64, &'static str> = HashMap::with_capacity(rows.len());
     for (id, name, kind, file, fan_in, fan_out) in rows {
         let is_exported = exported_ids.contains(id);
         let prod_fi = prod_fan_in.get(id).copied().unwrap_or(0);
@@ -726,8 +812,276 @@ fn classify_rows(
             median_fan_in,
             median_fan_out,
         );
+        role_by_id.insert(*id, role);
+    }
+    role_by_id
+}
+
+/// Bucket a finalized per-id role map into `ids_by_role`/`summary`. Split from
+/// `classify_rows` so the full-classification path can run
+/// `apply_reachability_downgrade` on the role map first.
+fn finalize_roles(
+    role_by_id: &HashMap<i64, &'static str>,
+    ids_by_role: &mut HashMap<&'static str, Vec<i64>>,
+    summary: &mut RoleSummary,
+) {
+    for (id, role) in role_by_id {
         increment_summary(summary, role);
         ids_by_role.entry(role).or_default().push(*id);
+    }
+}
+
+/// Roles produced by `classify_node`'s `fan_in > 0` branch (the
+/// `high_in`/`high_out` shape decision) — the only verdicts eligible for the
+/// reachability downgrade below. Mirrors TS `FAN_SHAPE_ROLES`.
+fn is_fan_shape_role(role: &str) -> bool {
+    matches!(role, "core" | "utility" | "adapter" | "leaf")
+}
+
+/// True when (name, kind, file, is_public_surface) is a confirmed-live
+/// reachability root for the transitive dead-code pass (#2032) — mirrors TS
+/// `isLiveRoot`. Only covers roots that are themselves `function`/`method`
+/// rows; `apply_reachability_downgrade` separately seeds additional roots
+/// directly from `call_edges` for non-function/method call sources.
+///
+/// Deliberately takes `is_public_surface`, NOT the broader `is_exported` that
+/// `classify_node`'s own `entry` branch uses — `is_exported` also considers a
+/// node "exported" merely because SOME caller in a different file calls it,
+/// regardless of whether that caller is itself reachable. Using that signal
+/// here would let a symbol called only by an unreachable cross-file caller
+/// become an automatic root, defeating #2032's fix for exactly the cross-file
+/// case it's meant to catch. `is_public_surface` is narrower: only the
+/// explicit `export` keyword and confirmed production-reachable reexport
+/// chains — see its computation at the `do_classify_full` call site.
+fn is_live_root(
+    name: &str,
+    kind: &str,
+    file: &str,
+    is_public_surface: bool,
+    is_type_member: bool,
+) -> bool {
+    if is_type_member {
+        return false;
+    }
+    if FRAMEWORK_ENTRY_PREFIXES.iter().any(|p| name.starts_with(p)) {
+        return true;
+    }
+    if kind != "function" && kind != "method" {
+        return false;
+    }
+    if is_public_surface {
+        return true;
+    }
+    COMMANDER_DISPATCH_NAMES.iter().any(|n| *n == name)
+        && ENTRY_PATH_PATTERNS.iter().any(|p| file.contains(p))
+}
+
+/// Compute the set of bare (owner-prefix-stripped) member names declared by
+/// ANY interface/type-level declaration across `rows` — e.g. TS `interface
+/// Visitor { enter_node?(...): ...; exit_node?(...): ...; }` contributes
+/// `"enterNode"`/`"exitNode"`. Used by `is_interface_dispatch_method_root` to
+/// require that a candidate dispatch method's name corresponds to an actual
+/// declared interface contract SOMEWHERE in the codebase, rather than merely
+/// "any method with fan_out > 0 in a file that also has other active code" —
+/// the latter is indistinguishable from a genuinely-dead, ordinary class
+/// method that happens to call a helper. Mirrors TS `computeInterfaceMemberBareNames`.
+fn compute_interface_member_bare_names(
+    rows: &[(i64, String, String, String, u32, u32)],
+    type_def_names_by_file: &HashMap<String, std::collections::HashSet<String>>,
+) -> std::collections::HashSet<String> {
+    let mut names = std::collections::HashSet::new();
+    for (_id, name, kind, file, _fan_in, _fan_out) in rows {
+        if !is_type_declaration_member(name, kind, file, type_def_names_by_file) {
+            continue;
+        }
+        let bare = match name.find('.') {
+            Some(dot_idx) => &name[dot_idx + 1..],
+            None => name.as_str(),
+        };
+        names.insert(bare.to_string());
+    }
+    names
+}
+
+/// True when (kind, fan_in, fan_out, has_active_siblings, is_type_member,
+/// name) is a `method`-kind interface-dispatch implementation rescued by
+/// `classify_node`'s Pattern-2 heuristic (fan_in == 0, fan_out > 0,
+/// has_active_siblings) AND whose bare name corresponds to an actual
+/// interface/type declaration member somewhere in the codebase (matched via
+/// `interface_member_bare_names`) — e.g. `enter_node`/`exit_node` on a
+/// Visitor-shaped object, invoked only via generic property-access dispatch
+/// that codegraph cannot trace to a concrete implementation. Such a method
+/// can never be the TARGET of a `calls` edge by construction, so it must be
+/// an unconditional root — otherwise everything it calls would be wrongly
+/// treated as unreachable merely because the dispatch mechanism itself
+/// leaves no edge.
+///
+/// The name-match requirement exists specifically because the
+/// fan_in/fan_out/has_active_siblings shape ALONE is too broad: an ordinary,
+/// genuinely-dead class method that happens to call a helper and share its
+/// file with another called symbol satisfies that shape too. Tying the
+/// rescue to an actual declared contract elsewhere in the codebase makes an
+/// "ordinary unused method" false positive require a coincidental name
+/// collision with some unrelated interface's member, rather than being the
+/// default outcome for any such method.
+///
+/// Deliberately narrower than the sibling rescue for `function`-kind
+/// logical-or-fallback values in `classify_node` — that heuristic is an
+/// explicitly acknowledged, imprecise last-resort fallback, not a structural
+/// certainty like interface dispatch. Promoting it to root status would
+/// silently rescue genuinely-dead intermediate functions (the exact #2032
+/// pattern) merely because they happen to call something in an active file.
+/// Mirrors TS `isInterfaceDispatchMethodRoot`.
+fn is_interface_dispatch_method_root(
+    name: &str,
+    kind: &str,
+    fan_in: u32,
+    fan_out: u32,
+    has_active_siblings: bool,
+    is_type_member: bool,
+    interface_member_bare_names: &std::collections::HashSet<String>,
+) -> bool {
+    if kind != "method"
+        || fan_in != 0
+        || fan_out == 0
+        || !has_active_siblings
+        || is_type_member
+    {
+        return false;
+    }
+    let bare = match name.find('.') {
+        Some(dot_idx) => &name[dot_idx + 1..],
+        None => name,
+    };
+    interface_member_bare_names.contains(bare)
+}
+
+/// Forward BFS over `calls` edges starting from `roots`, using a single
+/// index-walked `Vec` queue (no repeated front-removal) so the whole
+/// traversal is O(V+E) — safe on graphs with tens of thousands of nodes/edges
+/// (this repo's own self-build). Mirrors TS `computeReachableIds`.
+fn compute_reachable_ids(
+    roots: &std::collections::HashSet<i64>,
+    call_edges: &[(i64, i64)],
+) -> std::collections::HashSet<i64> {
+    let mut adjacency: HashMap<i64, Vec<i64>> = HashMap::new();
+    for (source, target) in call_edges {
+        adjacency.entry(*source).or_default().push(*target);
+    }
+
+    let mut visited: std::collections::HashSet<i64> = roots.clone();
+    let mut queue: Vec<i64> = visited.iter().copied().collect();
+    let mut head = 0;
+    while head < queue.len() {
+        let current = queue[head];
+        head += 1;
+        if let Some(outs) = adjacency.get(&current) {
+            for next in outs {
+                if visited.insert(*next) {
+                    queue.push(*next);
+                }
+            }
+        }
+    }
+    visited
+}
+
+/// Downgrade fan-in-based "not dead" verdicts to dead when the node is not
+/// transitively reachable from any confirmed-live root via `calls` edges
+/// (#2032) — "has at least one inbound `calls` edge" is not sufficient
+/// evidence of liveness when that edge's source is itself unreachable.
+/// Mirrors TS `applyReachabilityDowngrade` — see its doc comment (in
+/// `src/graph/classifiers/roles.ts`) for the full rationale, including why:
+///
+///  - roots come from `is_live_root` (confirmed `function`/`method` entry
+///    points), `is_interface_dispatch_method_root` (Visitor-pattern-style
+///    `method`-kind dispatch implementations, which can never be the TARGET
+///    of a `calls` edge by construction), AND every `calls`-edge source that
+///    is NOT itself a `function`/`method` row (module-top-level `constant`
+///    declarations, bare top-level assignments attributed to the enclosing
+///    `file`, and other structural kinds) — those represent code that runs
+///    unconditionally once their containing scope is parsed, with no
+///    genuine "was this invoked" question the way a function/method body has;
+///  - this only reconsiders `function`/`method` rows with `fan_in > 0` whose
+///    current verdict is a `classify_by_fan_shape`-derived role
+///    (`core`/`utility`/`adapter`/`leaf`) — never `test-only`, `entry`, or any
+///    verdict from the `fan_in == 0` branch (interface members,
+///    `has_active_siblings` rescues, exported zero-fan-in entries), which
+///    already correctly resolve liveness through signals reachability
+///    doesn't apply to.
+#[allow(clippy::too_many_arguments)]
+fn apply_reachability_downgrade(
+    rows: &[(i64, String, String, String, u32, u32)],
+    public_surface_ids: &std::collections::HashSet<i64>,
+    called_active_files: &std::collections::HashSet<String>,
+    type_def_names_by_file: &HashMap<String, std::collections::HashSet<String>>,
+    call_edges: &[(i64, i64)],
+    role_by_id: &mut HashMap<i64, &'static str>,
+) {
+    let mut kind_by_id: HashMap<i64, &str> = HashMap::with_capacity(rows.len());
+    for (id, _name, kind, _file, _fan_in, _fan_out) in rows {
+        kind_by_id.insert(*id, kind.as_str());
+    }
+    let interface_member_bare_names = compute_interface_member_bare_names(rows, type_def_names_by_file);
+
+    let mut roots: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    for (id, name, kind, file, fan_in, fan_out) in rows {
+        let is_public_surface = public_surface_ids.contains(id);
+        let is_type_member = is_type_declaration_member(name, kind, file, type_def_names_by_file);
+        if is_live_root(name, kind, file, is_public_surface, is_type_member) {
+            roots.insert(*id);
+            continue;
+        }
+        let has_active_siblings = called_active_files.contains(file);
+        if is_interface_dispatch_method_root(
+            name,
+            kind,
+            *fan_in,
+            *fan_out,
+            has_active_siblings,
+            is_type_member,
+            &interface_member_bare_names,
+        ) {
+            roots.insert(*id);
+        }
+    }
+    for (source, _target) in call_edges {
+        let source_kind = kind_by_id.get(source).copied();
+        if source_kind != Some("function") && source_kind != Some("method") {
+            roots.insert(*source);
+        }
+    }
+
+    let reachable = compute_reachable_ids(&roots, call_edges);
+
+    for (id, name, kind, file, fan_in, _fan_out) in rows {
+        if kind != "function" && kind != "method" {
+            continue;
+        }
+        if *fan_in == 0 {
+            continue;
+        }
+        // is_type_declaration_member returns "leaf" unconditionally,
+        // independent of fan_in — an interface/type method-signature member
+        // can have fan_in > 0 (real call sites resolve to it by name) and
+        // still land on "leaf", indistinguishable from
+        // classify_by_fan_shape's "leaf" by role string alone. Must be
+        // excluded explicitly, or a widely-referenced interface method (e.g.
+        // a native-binding surface like `NativeDatabase` in `types.ts`) gets
+        // wrongly reconsidered here.
+        if is_type_declaration_member(name, kind, file, type_def_names_by_file) {
+            continue;
+        }
+        let Some(role) = role_by_id.get(id).copied() else {
+            continue;
+        };
+        if !is_fan_shape_role(role) {
+            continue;
+        }
+        if reachable.contains(id) {
+            continue;
+        }
+        role_by_id.insert(*id, classify_dead_sub_role(name, kind, file));
     }
 }
 
@@ -1109,7 +1463,10 @@ pub(crate) fn do_classify_incremental(
             .extend(type_member_leaf_ids);
     }
 
-    classify_rows(
+    // No transitive-reachability downgrade here (#2032) — see the doc comment
+    // on the `apply_reachability_downgrade` call in `do_classify_full` for why
+    // the incremental path deliberately doesn't run it.
+    let role_by_id = classify_rows(
         &rows,
         &exported_ids,
         &prod_fan_in,
@@ -1118,9 +1475,8 @@ pub(crate) fn do_classify_incremental(
         &type_def_names_by_file,
         median_fan_in,
         median_fan_out,
-        &mut ids_by_role,
-        &mut summary,
     );
+    finalize_roles(&role_by_id, &mut ids_by_role, &mut summary);
 
     // Reset roles for affected files only, then update
     let reset_sql = format!(
@@ -1138,4 +1494,310 @@ pub(crate) fn do_classify_incremental(
 
     tx.commit()?;
     Ok(summary)
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::connection::NativeDatabase;
+
+    /// In-memory DB with the full migration chain applied — mirrors the
+    /// pattern used by `db::connection::tests`.
+    fn setup_db() -> NativeDatabase {
+        let db = NativeDatabase::open_read_write(":memory:".to_string(), None)
+            .expect("open_read_write should succeed for :memory:");
+        db.init_schema().expect("init_schema should succeed");
+        db
+    }
+
+    fn insert_node(conn: &Connection, id: i64, name: &str, kind: &str, file: &str, exported: i64) {
+        conn.execute(
+            "INSERT INTO nodes (id, name, kind, file, exported) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![id, name, kind, file, exported],
+        )
+        .expect("insert node should succeed");
+    }
+
+    fn insert_edge(conn: &Connection, source: i64, target: i64, kind: &str, dynamic: i64) {
+        conn.execute(
+            "INSERT INTO edges (source_id, target_id, kind, dynamic) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![source, target, kind, dynamic],
+        )
+        .expect("insert edge should succeed");
+    }
+
+    fn role_of(conn: &Connection, id: i64) -> Option<String> {
+        conn.query_row("SELECT role FROM nodes WHERE id = ?1", [id], |row| row.get(0))
+            .expect("query role should succeed")
+    }
+
+    // ── Transitive-reachability dead-code downgrade (#2032) ─────────────
+
+    #[test]
+    fn downgrades_function_whose_only_caller_is_itself_unreachable() {
+        let db = setup_db();
+        let conn = db.conn().expect("connection should still be open");
+
+        // computeHelper is called only by deadIntermediate, which is never
+        // itself called by anything reachable from the confirmed-live root
+        // (useThing). Direct fan-in alone would call computeHelper live.
+        insert_node(conn, 1, "computeHelper", "function", "a.ts", 0);
+        insert_node(conn, 2, "deadIntermediate", "function", "a.ts", 0);
+        insert_node(conn, 3, "useThing", "function", "a.ts", 1);
+        insert_edge(conn, 2, 1, "calls", 0);
+
+        do_classify_full(conn).expect("do_classify_full should succeed");
+
+        assert_eq!(role_of(conn, 1).as_deref(), Some("dead-unresolved"));
+    }
+
+    #[test]
+    fn does_not_downgrade_when_reachable_via_a_real_call_chain() {
+        let db = setup_db();
+        let conn = db.conn().expect("connection should still be open");
+
+        insert_node(conn, 1, "helper", "function", "a.ts", 0);
+        insert_node(conn, 2, "useThing", "function", "a.ts", 1);
+        insert_edge(conn, 2, 1, "calls", 0);
+
+        do_classify_full(conn).expect("do_classify_full should succeed");
+
+        assert_ne!(role_of(conn, 1).as_deref(), Some("dead-unresolved"));
+    }
+
+    #[test]
+    fn downgrades_mutually_recursive_pair_with_no_confirmed_live_root() {
+        let db = setup_db();
+        let conn = db.conn().expect("connection should still be open");
+
+        insert_node(conn, 1, "fn1", "function", "a.ts", 0);
+        insert_node(conn, 2, "fn2", "function", "a.ts", 0);
+        insert_edge(conn, 1, 2, "calls", 0);
+        insert_edge(conn, 2, 1, "calls", 0);
+
+        do_classify_full(conn).expect("do_classify_full should succeed");
+
+        assert_eq!(role_of(conn, 1).as_deref(), Some("dead-unresolved"));
+        assert_eq!(role_of(conn, 2).as_deref(), Some("dead-unresolved"));
+    }
+
+    #[test]
+    fn constant_sourced_value_ref_is_an_unconditional_root() {
+        let db = setup_db();
+        let conn = db.conn().expect("connection should still be open");
+
+        // Mirrors the real dispatch-table shape (#1771): a top-level `const
+        // HANDLERS = [{ resolve: resolveA }]` gets a value-ref `calls` edge
+        // sourced from the constant declaration itself, not from a function.
+        insert_node(conn, 1, "resolveA", "function", "dispatch.js", 0);
+        insert_node(conn, 2, "HANDLERS", "constant", "dispatch.js", 0);
+        insert_edge(conn, 2, 1, "calls", 1);
+
+        do_classify_full(conn).expect("do_classify_full should succeed");
+
+        assert_ne!(role_of(conn, 1).as_deref(), Some("dead-unresolved"));
+    }
+
+    #[test]
+    fn file_sourced_value_ref_is_an_unconditional_root() {
+        let db = setup_db();
+        let conn = db.conn().expect("connection should still be open");
+
+        // Mirrors Lua's builtin-reassignment pattern (#1776): `require =
+        // tracedFn` has no LHS binding to attach to, so the value-ref edge is
+        // sourced from the enclosing file/module scope. `file`-kind nodes are
+        // entirely excluded from `rows`/classification, so this source id
+        // never appears there — it must still act as an unconditional root.
+        insert_node(conn, 1, "tracedFn", "function", "main.lua", 0);
+        insert_node(conn, 2, "main.lua", "file", "main.lua", 0);
+        insert_edge(conn, 2, 1, "calls", 1);
+
+        do_classify_full(conn).expect("do_classify_full should succeed");
+
+        assert_ne!(role_of(conn, 1).as_deref(), Some("dead-unresolved"));
+    }
+
+    #[test]
+    fn does_not_downgrade_test_only_node_despite_unreachable_caller() {
+        let db = setup_db();
+        let conn = db.conn().expect("connection should still be open");
+
+        // Same file for both: a cross-file caller would separately mark the
+        // target "exported" (see `exported_ids`'s cross-file heuristic),
+        // which is orthogonal to what this test checks — that a test-only
+        // verdict is never revisited by the reachability downgrade.
+        insert_node(conn, 1, "helperForTests", "function", "a.test.ts", 0);
+        insert_node(conn, 2, "someTest", "function", "a.test.ts", 0);
+        insert_edge(conn, 2, 1, "calls", 0);
+
+        do_classify_full(conn).expect("do_classify_full should succeed");
+
+        assert_eq!(role_of(conn, 1).as_deref(), Some("test-only"));
+    }
+
+    #[test]
+    fn does_not_downgrade_interface_method_signature_member_despite_fan_in_and_unreachable_caller()
+    {
+        let db = setup_db();
+        let conn = db.conn().expect("connection should still be open");
+
+        // Regression: is_type_declaration_member returns "leaf"
+        // unconditionally, independent of fan_in — indistinguishable from
+        // classify_by_fan_shape's "leaf" by role string alone unless the
+        // downgrade pass explicitly re-checks it. A widely-referenced
+        // interface method (e.g. a native-binding surface like
+        // `NativeDatabase` in `types.ts`) has real fan_in > 0 from call sites
+        // resolving to it by name, and must never be reconsidered here.
+        insert_node(conn, 1, "NativeDatabase", "interface", "types.ts", 0);
+        insert_node(conn, 2, "NativeDatabase.countNodes", "method", "types.ts", 0);
+        insert_node(conn, 3, "unreachableCaller", "function", "a.ts", 0);
+        insert_edge(conn, 3, 2, "calls", 0);
+
+        do_classify_full(conn).expect("do_classify_full should succeed");
+
+        assert_eq!(role_of(conn, 2).as_deref(), Some("leaf"));
+    }
+
+    #[test]
+    fn interface_dispatch_method_is_an_unconditional_root_for_what_it_calls() {
+        let db = setup_db();
+        let conn = db.conn().expect("connection should still be open");
+
+        // Mirrors ast-analysis visitors' Visitor pattern: enterNode is
+        // dispatched generically (`if (v.enterNode) v.enterNode(node)`) so it
+        // can never be the TARGET of a `calls` edge — fan_in stays 0
+        // forever, yet it's rescued to "leaf" by classify_node's Pattern-2
+        // heuristic. Whatever it calls must be reachable through it.
+        //
+        // The declared `Visitor` interface (mirroring src/types.ts) is
+        // required: is_interface_dispatch_method_root only promotes a method
+        // to root when its bare name matches an actual interface/type member
+        // somewhere in the codebase, not merely from the
+        // fan_in/fan_out/has_active_siblings shape alone.
+        insert_node(conn, 1, "enterNode", "method", "visitor.ts", 0);
+        insert_node(conn, 2, "classifyHalstead", "function", "visitor.ts", 0);
+        insert_node(conn, 3, "Visitor", "interface", "types.ts", 1);
+        insert_node(conn, 4, "Visitor.enterNode", "method", "types.ts", 0);
+        insert_edge(conn, 1, 2, "calls", 0);
+
+        do_classify_full(conn).expect("do_classify_full should succeed");
+
+        assert_ne!(role_of(conn, 2).as_deref(), Some("dead-unresolved"));
+    }
+
+    #[test]
+    fn does_not_treat_ordinary_unused_class_method_as_interface_dispatch_root() {
+        let db = setup_db();
+        let conn = db.conn().expect("connection should still be open");
+
+        // Regression for a Greptile-flagged gap: without the interface-member
+        // name-match requirement, ANY method with fan_in=0, fan_out>0, and an
+        // active sibling in its file would be promoted to root — including a
+        // genuinely-dead class method that happens to call a helper. No
+        // interface/type declares a "deadMethod" member anywhere here.
+        insert_node(conn, 1, "MyClass.deadMethod", "method", "a.ts", 0);
+        insert_node(conn, 2, "helper", "function", "a.ts", 0);
+        insert_edge(conn, 1, 2, "calls", 0);
+
+        do_classify_full(conn).expect("do_classify_full should succeed");
+
+        assert_eq!(role_of(conn, 2).as_deref(), Some("dead-unresolved"));
+    }
+
+    #[test]
+    fn does_not_treat_a_symbol_as_root_merely_because_of_an_unreachable_cross_file_caller() {
+        let db = setup_db();
+        let conn = db.conn().expect("connection should still be open");
+
+        // Regression for a Greptile-flagged gap: exported_ids' cross-file-
+        // caller heuristic also marks a symbol "exported" merely because SOME
+        // caller in a different file calls it — regardless of whether that
+        // caller is itself reachable. is_live_root must key off the narrower
+        // public_surface_ids (explicit export / confirmed reexport chain),
+        // not that broader signal, or a cross-file dead call chain would
+        // evade #2032's fix entirely.
+        insert_node(conn, 1, "unreachableCrossFileCaller", "function", "a.ts", 0);
+        insert_node(conn, 2, "calleeInAnotherFile", "function", "b.ts", 0);
+        insert_edge(conn, 1, 2, "calls", 0);
+
+        do_classify_full(conn).expect("do_classify_full should succeed");
+
+        assert_eq!(role_of(conn, 2).as_deref(), Some("dead-unresolved"));
+    }
+
+    #[test]
+    fn function_kind_logical_or_fallback_rescue_is_not_treated_as_a_root() {
+        let db = setup_db();
+        let conn = db.conn().expect("connection should still be open");
+
+        // Unlike the method/interface-dispatch case above, a plain
+        // `function` rescued via the (explicitly acknowledged as imprecise)
+        // logical-or fallback heuristic must NOT be promoted to root —
+        // otherwise almost any genuinely-dead intermediate function in an
+        // active file would silently rescue whatever it calls, the exact
+        // #2032 pattern this fix targets.
+        insert_node(conn, 1, "deadIntermediate", "function", "a.ts", 0);
+        insert_node(conn, 2, "computeHelper", "function", "a.ts", 0);
+        insert_edge(conn, 1, 2, "calls", 0);
+
+        do_classify_full(conn).expect("do_classify_full should succeed");
+
+        assert_eq!(role_of(conn, 2).as_deref(), Some("dead-unresolved"));
+    }
+
+    #[test]
+    fn named_reexport_does_not_leak_public_surface_status_to_unreachable_siblings() {
+        let db = setup_db();
+        let conn = db.conn().expect("connection should still be open");
+
+        // Regression for a Greptile-flagged gap: the whole-file `exported_ids`
+        // query treats ANY 'reexports' edge as "every symbol in the target
+        // file is exported" — but `export { publicThing } from './lib'` only
+        // re-exports `publicThing`. public_surface_ids must not let
+        // deadHelper (whose only caller, deadIntermediate, is itself
+        // unreachable) evade the reachability check merely because it shares
+        // a file with the one actually re-exported symbol.
+        insert_node(conn, 1, "src/lib.ts", "file", "src/lib.ts", 0);
+        insert_node(conn, 2, "src/index.ts", "file", "src/index.ts", 0);
+        insert_node(conn, 3, "src/app.ts", "file", "src/app.ts", 0);
+        insert_node(conn, 4, "publicThing", "function", "src/lib.ts", 0);
+        insert_node(conn, 5, "deadIntermediate", "function", "src/lib.ts", 0);
+        insert_node(conn, 6, "deadHelper", "function", "src/lib.ts", 0);
+
+        // Generic file-to-file 'reexports' edge (emitted regardless of
+        // named/wildcard) plus the symbol-level edge targeting publicThing
+        // specifically — NOT a 'reexports-wildcard' marker.
+        insert_edge(conn, 2, 1, "reexports", 0);
+        insert_edge(conn, 2, 4, "reexports", 0);
+        insert_edge(conn, 3, 2, "imports", 0);
+
+        insert_edge(conn, 5, 6, "calls", 0);
+
+        do_classify_full(conn).expect("do_classify_full should succeed");
+
+        assert_ne!(role_of(conn, 4).as_deref(), Some("dead-unresolved"));
+        assert_eq!(role_of(conn, 6).as_deref(), Some("dead-unresolved"));
+    }
+
+    #[test]
+    fn incremental_path_does_not_run_the_reachability_downgrade() {
+        // Documents the deliberate full-vs-incremental asymmetry (see the doc
+        // comment on `apply_reachability_downgrade`'s call site in
+        // `do_classify_full`): the incremental path can't safely compute
+        // whole-graph reachability from a changed-files-scoped window, so it
+        // must keep classifying via direct fan-in only, same as before #2032.
+        let db = setup_db();
+        let conn = db.conn().expect("connection should still be open");
+
+        insert_node(conn, 1, "computeHelper", "function", "a.ts", 0);
+        insert_node(conn, 2, "deadIntermediate", "function", "a.ts", 0);
+        insert_edge(conn, 2, 1, "calls", 0);
+
+        do_classify_incremental(conn, &["a.ts".to_string()])
+            .expect("do_classify_incremental should succeed");
+
+        assert_ne!(role_of(conn, 1).as_deref(), Some("dead-unresolved"));
+    }
 }
