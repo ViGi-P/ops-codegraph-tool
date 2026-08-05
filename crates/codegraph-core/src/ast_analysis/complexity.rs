@@ -523,6 +523,52 @@ pub static LUA_RULES: LangRules = LangRules {
     switch_like_nodes: &[],
 };
 
+// tree-sitter-zig's if_statement wraps its else branch in an `else_clause`
+// node whose single named child is either a nested `if_statement` (else-if)
+// or the terminal else body — confirmed by parsing `if (..) {..} else if
+// (..) {..} else {..}` and inspecting the S-expression. Pattern A, same as
+// JS/C#/Rust, even though the grammar internally tags that child with an
+// `alternative` field name — the wrapper-node detection only checks the
+// parent node's type, not field names, so that's immaterial.
+//
+// `and`/`or`/`orelse` are keyword operators sharing the single generic
+// `binary_expression` node type (confirmed by parsing `a and b or c` and
+// `a orelse b`) — same shared-type pattern as Lua's `and`/`or`.
+//
+// `catch_expression` (`expr catch fallback`, `expr catch |err| { .. }`) is
+// a branch/nesting node, the same treatment C/C++/ObjC/C# give
+// `catch_clause` — its fallback can be an arbitrary block with its own
+// control flow, not just a coalescing value. `try_expression` (`try expr`)
+// is NOT a branch — it propagates the error up rather than branching
+// locally, mirroring how Rust's `?` operator is Halstead-only.
+pub static ZIG_RULES: LangRules = LangRules {
+    branch_nodes: &[
+        "if_statement",
+        "else_clause",
+        "for_statement",
+        "while_statement",
+        "switch_expression",
+        "catch_expression",
+    ],
+    case_nodes: &["switch_case"],
+    logical_operators: &["and", "or", "orelse"],
+    logical_node_types: &["binary_expression"],
+    optional_chain_type: None,
+    nesting_nodes: &[
+        "if_statement",
+        "for_statement",
+        "while_statement",
+        "switch_expression",
+        "catch_expression",
+    ],
+    function_nodes: &["function_declaration"],
+    if_node_type: Some("if_statement"),
+    else_node_type: Some("else_clause"),
+    elif_node_type: None,
+    else_via_alternative: false,
+    switch_like_nodes: &["switch_expression"],
+};
+
 /// Look up complexity rules by language ID (matches `COMPLEXITY_RULES` keys in JS).
 pub fn lang_rules(lang_id: &str) -> Option<&'static LangRules> {
     match lang_id {
@@ -542,6 +588,7 @@ pub fn lang_rules(lang_id: &str) -> Option<&'static LangRules> {
         "scala" => Some(&SCALA_RULES),
         "bash" => Some(&BASH_RULES),
         "lua" => Some(&LUA_RULES),
+        "zig" => Some(&ZIG_RULES),
         _ => None,
     }
 }
@@ -1173,6 +1220,31 @@ pub static LUA_HALSTEAD: HalsteadRules = HalsteadRules {
     skip_types: &[],
 };
 
+// Zig has no `++`/`--` (increments are `x += 1`) and no `case` keyword in
+// switch arms (`1 => ..`, confirmed by parsing), so neither appears below.
+// Literal wrapper nodes (`character`, `string`, `boolean`) have non-empty
+// children, so their leaf *content* tokens (`character_content`,
+// `string_content`, `true`/`false`) are the operand leaves — same split
+// RUST_HALSTEAD already uses for `string_content`.
+pub static ZIG_HALSTEAD: HalsteadRules = HalsteadRules {
+    operator_leaf_types: &[
+        "+", "-", "*", "/", "%", "=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>=",
+        "==", "!=", "<", ">", "<=", ">=", "!",
+        "&", "|", "^", "~", "<<", ">>",
+        "and", "or", "orelse", "try", "catch",
+        "if", "else", "for", "while", "switch",
+        "return", "break", "continue", "unreachable", "defer",
+        "const", "var", "pub", "fn", "struct", "enum", "union", "error", "comptime",
+        ".", "..", ".?", ".*", ",", ";", ":", "?", "=>", "->",
+    ],
+    operand_leaf_types: &[
+        "identifier", "builtin_type", "integer", "float", "string_content", "character_content",
+        "true", "false", "null", "undefined",
+    ],
+    compound_operators: &["call_expression", "field_expression", "index_expression"],
+    skip_types: &[],
+};
+
 /// Look up Halstead rules by language ID.
 pub fn halstead_rules(lang_id: &str) -> Option<&'static HalsteadRules> {
     match lang_id {
@@ -1192,6 +1264,7 @@ pub fn halstead_rules(lang_id: &str) -> Option<&'static HalsteadRules> {
         "scala" => Some(&SCALA_HALSTEAD),
         "bash" => Some(&BASH_HALSTEAD),
         "lua" => Some(&LUA_HALSTEAD),
+        "zig" => Some(&ZIG_HALSTEAD),
         _ => None,
     }
 }
@@ -1210,6 +1283,7 @@ pub fn comment_prefixes(lang_id: &str) -> &'static [&'static str] {
         "scala" => &["//", "/*"],
         "bash" => &["#"],
         "lua" => &["--"],
+        "zig" => &["//"],
         _ => &["//", "/*", "*", "*/"],
     }
 }
@@ -2048,6 +2122,72 @@ mod tests {
         );
         assert_eq!(m.cognitive, 1);
         assert_eq!(m.cyclomatic, 2);
+    }
+
+    // ─── Zig tests (issue #1923) ─────────────────────────────────────────────
+    //
+    // tree-sitter-zig wraps its else branch in an else_clause node (Pattern
+    // A, same as JS/C#/Rust/ObjC). and/or/orelse share the generic
+    // binary_expression node type. catch_expression is a branch/nesting
+    // node; try_expression is Halstead-only (mirrors Rust's `?`).
+
+    fn compute_zig(code: &str) -> ComplexityMetrics {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_zig::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(code.as_bytes(), None).unwrap();
+        let root = tree.root_node();
+        let func = find_first_function(&root, &ZIG_RULES).expect("no function found");
+        compute_function_complexity(&func, &ZIG_RULES)
+    }
+
+    #[test]
+    fn zig_if_elseif_else() {
+        let m = compute_zig(
+            "pub fn classify(value: i32) i32 {\n    if (value > 0) {\n        return 1;\n    } else if (value < 0) {\n        return -1;\n    } else {\n        return 0;\n    }\n}",
+        );
+        assert_eq!(m.cognitive, 3);
+        assert_eq!(m.cyclomatic, 3);
+        assert_eq!(m.max_nesting, 1);
+    }
+
+    #[test]
+    fn zig_while_with_orelse() {
+        let m = compute_zig(
+            "pub fn sum(n: i32, opt: ?i32) i32 {\n    var result: i32 = opt orelse 0;\n    var i: i32 = 0;\n    while (i < n) {\n        result += i;\n        i += 1;\n    }\n    return result;\n}",
+        );
+        assert_eq!(m.cognitive, 2);
+        assert_eq!(m.cyclomatic, 3);
+        assert_eq!(m.max_nesting, 1);
+    }
+
+    #[test]
+    fn zig_for_range_with_switch() {
+        let m = compute_zig(
+            "pub fn tally(n: i32) i32 {\n    var total: i32 = 0;\n    for (0..n) |i| {\n        switch (i) {\n            0 => total += 1,\n            1, 2 => total += 2,\n            else => total += 0,\n        }\n    }\n    return total;\n}",
+        );
+        assert_eq!(m.cognitive, 3);
+        assert_eq!(m.cyclomatic, 5);
+        assert_eq!(m.max_nesting, 2);
+    }
+
+    #[test]
+    fn zig_catch_with_error_payload_block_is_a_branch() {
+        let m = compute_zig(
+            "pub fn risky() i32 {\n    const v = mayFail() catch |err| {\n        _ = err;\n        return -1;\n    };\n    return v;\n}",
+        );
+        assert_eq!(m.cognitive, 1);
+        assert_eq!(m.cyclomatic, 2);
+        assert_eq!(m.max_nesting, 1);
+    }
+
+    #[test]
+    fn zig_try_is_not_a_branch() {
+        let m = compute_zig("pub fn wrapper() !i32 {\n    const v = try mayFail();\n    return v;\n}");
+        assert_eq!(m.cognitive, 0);
+        assert_eq!(m.cyclomatic, 1);
+        assert_eq!(m.max_nesting, 0);
     }
 
     // ─── Kotlin tests (issue #1923) ─────────────────────────────────────────
