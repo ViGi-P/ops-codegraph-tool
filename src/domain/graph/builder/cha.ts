@@ -19,14 +19,24 @@
 import type { BetterSqlite3Database, ClassRelation, ExtractorOutput } from '../../../types.js';
 import type { ResolvedCandidate } from '../resolver/strategy.js';
 import type { CallNodeLookup } from './call-resolver.js';
+import { RECEIVER_KINDS } from './call-resolver.js';
 
 // ── CHA context ──────────────────────────────────────────────────────────────
 
 export interface ChaContext {
   /** interface/class name → concrete classes that implement or extend it */
   readonly implementors: ReadonlyMap<string, readonly string[]>;
-  /** class name → direct parent class name (from `extends`) */
+  /**
+   * class name → direct parent class name (from `extends`), first-write-wins
+   * across the whole project. Ambiguous when the same bare class name is
+   * declared in multiple files with different parents — prefer
+   * `parentsByFile` whenever a declaration's home file is known.
+   */
   readonly parents: ReadonlyMap<string, string>;
+  /** `${className}|${file}` → direct parent class name (from `extends`), scoped
+   * to the file that declared `className` — disambiguates same-named classes
+   * declared in different files (issue #2062). */
+  readonly parentsByFile: ReadonlyMap<string, string>;
   /** RTA: class names that appear in `new X()` anywhere in the project */
   readonly instantiatedTypes: ReadonlySet<string>;
 }
@@ -34,6 +44,7 @@ export interface ChaContext {
 export const EMPTY_CHA_CONTEXT: ChaContext = {
   implementors: new Map(),
   parents: new Map(),
+  parentsByFile: new Map(),
   instantiatedTypes: new Set(),
 };
 
@@ -52,18 +63,22 @@ function recordImplements(cls: ClassRelation, implementors: Map<string, string[]
 }
 
 /**
- * Record a class's `extends` relationship into both the parents map (child →
- * direct parent, for this/super hierarchy walking) and the implementors map
- * (parent → children, for CHA dispatch expansion via extends).
+ * Record a class's `extends` relationship into the parents map (child →
+ * direct parent, for this/super hierarchy walking), the file-scoped parents
+ * map (same, but disambiguated by the declaring file), and the implementors
+ * map (parent → children, for CHA dispatch expansion via extends).
  */
 function recordExtends(
   cls: ClassRelation,
   implementors: Map<string, string[]>,
   parents: Map<string, string>,
+  parentsByFile: Map<string, string>,
+  file: string,
 ): void {
   if (!cls.extends) return;
   // child → parent (for this/super hierarchy walking)
   if (!parents.has(cls.name)) parents.set(cls.name, cls.extends);
+  parentsByFile.set(`${cls.name}|${file}`, cls.extends);
   // parent → children (for CHA dispatch expansion via extends)
   let list = implementors.get(cls.extends);
   if (!list) {
@@ -103,17 +118,18 @@ function collectInstantiatedTypes(symbols: ExtractorOutput, instantiatedTypes: S
 export function buildChaContext(fileSymbols: ReadonlyMap<string, ExtractorOutput>): ChaContext {
   const implementors = new Map<string, string[]>();
   const parents = new Map<string, string>();
+  const parentsByFile = new Map<string, string>();
   const instantiatedTypes = new Set<string>();
 
-  for (const symbols of fileSymbols.values()) {
+  for (const [file, symbols] of fileSymbols) {
     for (const cls of symbols.classes) {
       recordImplements(cls, implementors);
-      recordExtends(cls, implementors, parents);
+      recordExtends(cls, implementors, parents, parentsByFile, file);
     }
     collectInstantiatedTypes(symbols, instantiatedTypes);
   }
 
-  return { implementors, parents, instantiatedTypes };
+  return { implementors, parents, parentsByFile, instantiatedTypes };
 }
 
 /**
@@ -141,17 +157,23 @@ export function buildChaContext(fileSymbols: ReadonlyMap<string, ExtractorOutput
 export function buildChaContextFromDb(db: BetterSqlite3Database): ChaContext {
   const hierarchyRows = db
     .prepare(`
-      SELECT src.name AS child_name, tgt.name AS parent_name, e.kind AS edge_kind
+      SELECT src.name AS child_name, src.file AS child_file, tgt.name AS parent_name, e.kind AS edge_kind
       FROM edges e
       JOIN nodes src ON e.source_id = src.id
       JOIN nodes tgt ON e.target_id = tgt.id
       WHERE e.kind IN ('extends', 'implements')
     `)
-    .all() as Array<{ child_name: string; parent_name: string; edge_kind: string }>;
+    .all() as Array<{
+    child_name: string;
+    child_file: string;
+    parent_name: string;
+    edge_kind: string;
+  }>;
   if (hierarchyRows.length === 0) return EMPTY_CHA_CONTEXT;
 
   const implementors = new Map<string, string[]>();
   const parents = new Map<string, string>();
+  const parentsByFile = new Map<string, string>();
   for (const row of hierarchyRows) {
     let list = implementors.get(row.parent_name);
     if (!list) {
@@ -159,8 +181,9 @@ export function buildChaContextFromDb(db: BetterSqlite3Database): ChaContext {
       implementors.set(row.parent_name, list);
     }
     if (!list.includes(row.child_name)) list.push(row.child_name);
-    if (row.edge_kind === 'extends' && !parents.has(row.child_name)) {
-      parents.set(row.child_name, row.parent_name);
+    if (row.edge_kind === 'extends') {
+      if (!parents.has(row.child_name)) parents.set(row.child_name, row.parent_name);
+      parentsByFile.set(`${row.child_name}|${row.child_file}`, row.parent_name);
     }
   }
 
@@ -174,7 +197,7 @@ export function buildChaContextFromDb(db: BetterSqlite3Database): ChaContext {
     .all() as Array<{ name: string }>;
   const instantiatedTypes = new Set(rtaRows.map((r) => r.name));
 
-  return { implementors, parents, instantiatedTypes };
+  return { implementors, parents, parentsByFile, instantiatedTypes };
 }
 
 // ── this / self / super resolution ──────────────────────────────────────────
@@ -211,7 +234,11 @@ export function resolveThisDispatch(
   if (dotIdx === -1) return [];
 
   const callerClass = callerName.slice(0, dotIdx);
-  const startClass = receiver === 'super' ? chaCtx.parents.get(callerClass) : callerClass;
+  const startClass =
+    receiver === 'super'
+      ? (callerFile && chaCtx.parentsByFile.get(`${callerClass}|${callerFile}`)) ||
+        chaCtx.parents.get(callerClass)
+      : callerClass;
   if (!startClass) return [];
 
   // Walk up the hierarchy; the visited set guards against cycles in malformed data.
@@ -225,8 +252,35 @@ export function resolveThisDispatch(
       // When the caller's file is known, prefer same-file nodes to avoid
       // emitting cross-file edges to identically-named methods in unrelated
       // files.  Only fall back to the full set when no same-file node exists.
-      if (callerFile && found.some((n) => n.file === callerFile)) {
-        return found.filter((n) => n.file === callerFile);
+      if (callerFile) {
+        const sameFile = found.filter((n) => n.file === callerFile);
+        if (sameFile.length > 0) return sameFile;
+        // No same-file candidate. `chaCtx.parents` is keyed by bare class
+        // name, so `current` may be an unrelated class that merely shares a
+        // name with the caller's real ancestor (issue #2062) — e.g. two
+        // independent files each defining their own `Shape` class. Before
+        // accepting a cross-file match, check whether a class named
+        // `current` is ALSO declared in the caller's own file: if so, that
+        // same-file class IS the caller's real ancestor at this step (it
+        // simply doesn't define `methodName` — an implicit default
+        // constructor, for instance), so a same-named method from a
+        // different file is a false match, not a legitimate inherited
+        // method. Keep walking instead of accepting it. Only accept the
+        // cross-file match when `current` is NOT declared anywhere in the
+        // caller's own file — a genuine cross-file heritage reference
+        // (e.g. `import { Base } from './base'; class Foo extends Base`).
+        const sameNameInCallerFile = lookup
+          .byNameAndFile(current, callerFile)
+          .some((n) => RECEIVER_KINDS.has(n.kind ?? ''));
+        if (!sameNameInCallerFile) return found;
+        // `current` is a same-named collision: it's genuinely declared in
+        // callerFile but a different, unrelated file's class of the same
+        // name is what defines `methodName`. Advance via THAT same-file
+        // declaration's own parent (file-scoped) rather than the ambiguous
+        // bare-name `parents` entry, which may belong to the colliding file
+        // and misdirect the walk into a wholly unrelated hierarchy.
+        current = chaCtx.parentsByFile.get(`${current}|${callerFile}`);
+        continue;
       }
       return found;
     }
