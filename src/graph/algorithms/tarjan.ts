@@ -1,3 +1,4 @@
+import { compareByCodePoint } from '../../shared/compare.js';
 import type { CodeGraph } from '../model.js';
 
 /**
@@ -43,7 +44,19 @@ export function tarjan(graph: CodeGraph): string[][] {
         scc.push(w);
       } while (w !== v);
       // Only report non-trivial SCCs (length > 1 = a real cycle)
-      if (scc.length > 1) sccs.push(scc);
+      if (scc.length > 1) {
+        // Canonicalize node order within the SCC — mirrors the native Rust
+        // implementation (crates/codegraph-core/src/graph/algorithms/
+        // tarjan.rs), whose HashMap-backed adjacency map makes its DFS entry
+        // point (and therefore stack-pop order) non-deterministic across
+        // separate calls on the same logical graph. Sorting makes the
+        // returned array a deterministic function of SCC membership alone,
+        // so both engines agree byte-for-byte. See issues #2064, #2067, #2076.
+        // compareByCodePoint (not the default comparator) so supplementary-
+        // plane Unicode labels sort the same way Rust's UTF-8 byte order does.
+        scc.sort(compareByCodePoint);
+        sccs.push(scc);
+      }
     }
   }
 

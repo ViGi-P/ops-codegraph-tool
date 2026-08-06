@@ -349,6 +349,25 @@ describe.skipIf(!hasNative)('Cycle detection: native vs JS parity', () => {
     expect(sortCycles(nativeResult)).toEqual(sortCycles(jsResult));
   });
 
+  it('supplementary-plane Unicode node labels sort identically on both engines, without re-sorting (#2292)', () => {
+    // Unlike the tests above, this compares raw (not test-re-sorted) output —
+    // `sortCycles`'s own default-comparator re-sort would mask exactly the
+    // UTF-16-vs-code-point divergence this test exists to catch. U+FFFF (BMP)
+    // sorts before U+1F600 (supplementary plane) by code point, matching
+    // Rust's UTF-8-byte-order string sort; the default JS comparator gets
+    // this pair backwards.
+    const bmp = '\uFFFF';
+    const supplementary = '\u{1F600}';
+    const edges = [
+      { source: supplementary, target: bmp },
+      { source: bmp, target: supplementary },
+    ];
+    const jsResult = findCyclesJS(edges);
+    const nativeResult = native.detectCycles(edges);
+    expect(jsResult).toEqual([[bmp, supplementary]]);
+    expect(nativeResult).toEqual([[bmp, supplementary]]);
+  });
+
   it('speculative classification agrees between native and JS Tarjan backends', () => {
     // Same fixture as the "excludeSpeculative" unit test above, run through
     // findCycles() so both the full and filtered Tarjan passes exercise
@@ -389,5 +408,62 @@ describe.skipIf(!hasNative)('Cycle detection: native vs JS parity', () => {
     expect(cycles).toHaveLength(1);
     expect(cycles[0].speculative).toBe(true);
     db.close();
+  });
+});
+
+// ── Deterministic node order within a cycle (#2064, #2067, #2076) ─────────
+
+describe('Cycle detection: node order is deterministic across repeated calls', () => {
+  // Regression coverage: Tarjan's SCC node order within a cycle must be a
+  // deterministic function of the cycle's member set alone. Before this fix,
+  // the native engine's HashMap-backed adjacency map reseeds its hasher per
+  // construction, so the DFS entry point — and therefore the stack-pop order
+  // reconstructed into each SCC's node array — varied across separate calls
+  // on the exact same logical graph. That is what made the "excludeSpeculative
+  // has no effect..." test above flaky: two back-to-back calls on identical
+  // input reported the same cycle with a different node order.
+  const twoNodeEdges = [
+    { source: 'src/math.js', target: 'src/utils.js' },
+    { source: 'src/utils.js', target: 'src/math.js' },
+  ];
+  const threeNodeEdges = [
+    { source: 'a.js', target: 'b.js' },
+    { source: 'b.js', target: 'c.js' },
+    { source: 'c.js', target: 'a.js' },
+  ];
+
+  it.each([
+    ['2-node cycle', twoNodeEdges],
+    ['3-node cycle', threeNodeEdges],
+  ])(
+    'findCyclesJS returns byte-identical node order across repeated calls (%s)',
+    (_label, edges) => {
+      const first = findCyclesJS(edges);
+      for (let i = 0; i < 25; i++) {
+        expect(findCyclesJS(edges)).toEqual(first);
+      }
+    },
+  );
+
+  it.skipIf(!hasNative).each([
+    ['2-node cycle', twoNodeEdges],
+    ['3-node cycle', threeNodeEdges],
+  ])(
+    'native detectCycles returns byte-identical node order across repeated calls (%s)',
+    (_label, edges) => {
+      const native = loadNative()!;
+      const first = native.detectCycles(edges);
+      for (let i = 0; i < 25; i++) {
+        expect(native.detectCycles(edges)).toEqual(first);
+      }
+    },
+  );
+
+  it.skipIf(!hasNative).each([
+    ['2-node cycle', twoNodeEdges],
+    ['3-node cycle', threeNodeEdges],
+  ])('native and JS engines agree on node order, not just membership (%s)', (_label, edges) => {
+    const native = loadNative()!;
+    expect(native.detectCycles(edges)).toEqual(findCyclesJS(edges));
   });
 });

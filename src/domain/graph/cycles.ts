@@ -1,6 +1,7 @@
 import { getCallableNodes, getCallEdges, getFileNodesAll, getImportEdges } from '../../db/index.js';
 import { loadNative } from '../../infrastructure/native.js';
 import { isTestFile } from '../../infrastructure/test-filter.js';
+import { compareByCodePoint } from '../../shared/compare.js';
 import type { BetterSqlite3Database } from '../../types.js';
 
 type Edge = { source: string; target: string; speculative?: boolean };
@@ -219,7 +220,19 @@ function tarjanFromEdges(edges: Edge[]): string[][] {
         onStack.delete(w);
         scc.push(w);
       } while (w !== v);
-      if (scc.length > 1) sccs.push(scc);
+      if (scc.length > 1) {
+        // Canonicalize node order within the SCC before returning it — see
+        // the matching comment in crates/codegraph-core/src/graph/algorithms/
+        // tarjan.rs. `allNodes` here is a Set built from edge insertion order,
+        // so this JS path is already deterministic call-to-call in isolation,
+        // but sorting keeps it byte-identical to the native engine's output
+        // for the same logical graph regardless of either side's internal
+        // traversal order. See issues #2064, #2067, #2076.
+        // compareByCodePoint (not the default comparator) so supplementary-
+        // plane Unicode labels sort the same way Rust's UTF-8 byte order does.
+        scc.sort(compareByCodePoint);
+        sccs.push(scc);
+      }
     }
   }
 
