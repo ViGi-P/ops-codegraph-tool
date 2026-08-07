@@ -10,6 +10,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { bulkNodeIdsByFile, purgeFileData } from '../../../db/index.js';
+import { escapeLike } from '../../../db/query-builder.js';
 import { PROPAGATION_HOP_PENALTY } from '../../../extractors/javascript.js';
 import { debug, warn } from '../../../infrastructure/logger.js';
 import { getOrCreatePerDbChunkStmt } from '../../../shared/chunked-stmt-cache.js';
@@ -1645,6 +1646,131 @@ function emitChaDispatchForCall(
 }
 
 /**
+ * Find caller files with an EXISTING CHA/RTA dispatch edge to some OTHER
+ * implementor of an interface/base class this rebuild's files just gained or
+ * changed an `extends`/`implements` relationship to (#2078).
+ *
+ * `findReverseDeps` (used to build the reverse-dep cascade above) only finds
+ * callers that already have an edge to THIS rebuild's OLD nodes — it cannot
+ * discover a caller that dispatches through the *interface type*, not a
+ * direct reference, to a sibling implementor elsewhere. If this rebuild adds
+ * (or removes) a class implementing that interface, such a caller is never
+ * revisited and its dispatch edge to the new implementor is silently missing
+ * (or, for a removed implementor, a stale edge from some OTHER unrelated
+ * caller to a class that no longer implements the interface would persist —
+ * but that half is already handled: `purgeFileData` deletes every edge
+ * pointing at a rebuilt file's OLD nodes regardless of which caller holds
+ * it, before the file's nodes are re-inserted).
+ *
+ * A caller "dispatches through the interface" iff it already holds a
+ * `technique IN ('cha', 'super-dispatch')` edge to some OTHER known
+ * implementor of that same interface — that edge could only have been
+ * created by `resolveChaTargets`'s BFS starting from the interface name, so
+ * its source file is exactly the caller set this rebuild's implementor-set
+ * change needs to reach.
+ */
+function findChaSiblingCallerFiles(
+  db: BetterSqlite3Database,
+  chaCtx: ChaContext,
+  filesWithSymbols: ReadonlyArray<readonly [string, ExtractorOutput]>,
+): string[] {
+  const directHeritage = new Set<string>();
+  for (const [, symbols] of filesWithSymbols) {
+    for (const cls of symbols.classes) {
+      if (cls.extends) directHeritage.add(cls.extends);
+      if (cls.implements) directHeritage.add(cls.implements);
+    }
+  }
+  if (directHeritage.size === 0) return [];
+
+  // Walk UP the full ancestry from each direct extends/implements name, not
+  // just that name itself: a class extending a base that itself implements
+  // interface I is ALSO a transitive implementor of I for CHA dispatch
+  // purposes, and an existing caller may dispatch via I directly rather than
+  // via the (possibly abstract, never-instantiated) intermediate base.
+  // `chaCtx.parents` only covers `extends` (single-parent), so this needs
+  // its own reverse map covering `implements` too.
+  const reverseHeritage = buildReverseHeritageMap(db);
+  const touchedInterfaces = new Set<string>(directHeritage);
+  const upQueue = [...directHeritage];
+  while (upQueue.length > 0) {
+    const name = upQueue.shift()!;
+    for (const parent of reverseHeritage.get(name) ?? []) {
+      if (!touchedInterfaces.has(parent)) {
+        touchedInterfaces.add(parent);
+        upQueue.push(parent);
+      }
+    }
+  }
+
+  // Walk DOWN from every touched interface/base-class name to every
+  // transitively reachable implementor — mirroring `resolveChaTargets`'s own
+  // BFS — since an existing caller's edge may point at a sibling several
+  // hops below the touched interface, not just a direct child of it.
+  const otherImplementors = new Set<string>();
+  const downVisited = new Set<string>(touchedInterfaces);
+  const downQueue = [...touchedInterfaces];
+  while (downQueue.length > 0) {
+    const current = downQueue.shift()!;
+    for (const child of chaCtx.implementors.get(current) ?? []) {
+      if (downVisited.has(child)) continue;
+      downVisited.add(child);
+      otherImplementors.add(child);
+      downQueue.push(child);
+    }
+  }
+  if (otherImplementors.size === 0) return [];
+
+  const knownFiles = new Set(filesWithSymbols.map(([relPath]) => relPath));
+  const additional = new Set<string>();
+  const stmt = db.prepare(
+    `SELECT DISTINCT src.file AS file
+     FROM edges e
+     JOIN nodes tgt ON e.target_id = tgt.id
+     JOIN nodes src ON e.source_id = src.id
+     WHERE e.technique IN ('cha', 'super-dispatch')
+       AND tgt.kind = 'method'
+       AND tgt.name LIKE ? ESCAPE '\\'`,
+  );
+  for (const cls of otherImplementors) {
+    const rows = stmt.all(`${escapeLike(cls)}.%`) as Array<{ file: string }>;
+    for (const r of rows) {
+      if (!knownFiles.has(r.file)) additional.add(r.file);
+    }
+  }
+  return [...additional];
+}
+
+/**
+ * Reverse child -> [parent/interface names] map from every `extends` and
+ * `implements` edge in the DB, covering BOTH kinds (unlike `ChaContext.parents`,
+ * which only tracks `extends` for single-parent super-dispatch resolution) —
+ * needed so `findChaSiblingCallerFiles` can walk a rebuilt class's full
+ * ancestry upward to find every interface it transitively implements.
+ */
+function buildReverseHeritageMap(db: BetterSqlite3Database): Map<string, string[]> {
+  const rows = db
+    .prepare(
+      `SELECT DISTINCT src.name AS child_name, tgt.name AS parent_name
+       FROM edges e
+       JOIN nodes src ON e.source_id = src.id
+       JOIN nodes tgt ON e.target_id = tgt.id
+       WHERE e.kind IN ('extends', 'implements')`,
+    )
+    .all() as Array<{ child_name: string; parent_name: string }>;
+  const reverse = new Map<string, string[]>();
+  for (const row of rows) {
+    let list = reverse.get(row.child_name);
+    if (!list) {
+      list = [];
+      reverse.set(row.child_name, list);
+    }
+    if (!list.includes(row.parent_name)) list.push(row.parent_name);
+  }
+  return reverse;
+}
+
+/**
  * Phase 8.5 CHA + RTA dispatch expansion post-pass for the incremental
  * single-file rebuild path (#1852).
  *
@@ -1658,23 +1784,42 @@ function emitChaDispatchForCall(
  * `runPostNativeThisDispatch` (stages/native-orchestrator.ts), which must
  * WASM-re-parse because it never held the raw call sites in memory to begin
  * with (the native engine doesn't persist unresolved receiver info to DB).
+ *
+ * `findChaSiblingCallerFiles` (#2078) can widen this set with caller files
+ * that were never re-parsed by the reverse-dep cascade — those DO need a
+ * re-parse (mirroring `parseReverseDep`) since their `calls` array was never
+ * held in memory this rebuild.
  */
-function applyChaDispatchPostPass(
+async function applyChaDispatchPostPass(
   db: BetterSqlite3Database,
   stmts: IncrementalStmts,
   filesWithSymbols: ReadonlyArray<readonly [string, ExtractorOutput]>,
-): number {
+  rootDir: string,
+  engineOpts: EngineOpts,
+  cache: unknown,
+): Promise<number> {
   const chaCtx = buildChaContextFromDb(db);
   if (chaCtx.implementors.size === 0) return 0;
+
+  let allFilesWithSymbols = filesWithSymbols;
+  const siblingCallerFiles = findChaSiblingCallerFiles(db, chaCtx, filesWithSymbols);
+  if (siblingCallerFiles.length > 0) {
+    const extra: Array<readonly [string, ExtractorOutput]> = [];
+    for (const relPath of siblingCallerFiles) {
+      const symbols = await parseReverseDep(rootDir, relPath, engineOpts, cache);
+      if (symbols) extra.push([relPath, symbols]);
+    }
+    if (extra.length > 0) allFilesWithSymbols = [...filesWithSymbols, ...extra];
+  }
 
   const lookup = makeIncrementalLookup(db, stmts);
   const seenCallEdges = seedChaSeenEdges(
     db,
-    filesWithSymbols.map(([relPath]) => relPath),
+    allFilesWithSymbols.map(([relPath]) => relPath),
   );
 
   let edgesAdded = 0;
-  for (const [relPath, symbols] of filesWithSymbols) {
+  for (const [relPath, symbols] of allFilesWithSymbols) {
     const fileNodeRow = stmts.getNodeId.get(relPath, 'file', relPath, 0);
     if (!fileNodeRow) continue;
     const typeMap = buildIncrementalTypeMap(symbols);
@@ -1777,7 +1922,14 @@ export async function rebuildFile(
   // Phase 8.5 CHA + RTA dispatch expansion post-pass (#1852) — runs after all
   // of this rebuild's class-hierarchy edges are in the DB (target file +
   // reverse deps), since the DB-driven ChaContext depends on them.
-  edgesAdded += applyChaDispatchPostPass(db, stmts, [[relPath, symbols], ...depSymbols]);
+  edgesAdded += await applyChaDispatchPostPass(
+    db,
+    stmts,
+    [[relPath, symbols], ...depSymbols],
+    rootDir,
+    engineOpts,
+    cache,
+  );
 
   // Backfill technique='ts-native' (and the confidence floor) for this
   // rebuild's calls edges — buildCallEdges above inserts edges without a
