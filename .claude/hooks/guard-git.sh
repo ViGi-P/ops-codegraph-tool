@@ -21,9 +21,31 @@ if [ -z "$COMMAND" ]; then
   exit 0
 fi
 
-# Act on git and gh commands (may appear after cd "..." &&)
-if ! echo "$COMMAND" | grep -qE '(^|[[:space:]]|&&[[:space:]]*)(git|gh)[[:space:]]+'; then
+# Act on git and gh commands (may appear after cd "..." &&, inside a quoted
+# nested-shell invocation like `bash -c "git clean -fd"`, or inside a command
+# substitution like `"message $(git clean -fd)"` — #2099 Greptile review).
+# This is only a cheap fast-path skip, so it's deliberately permissive
+# (["'`(] as extra allowed prefix boundaries alongside start/whitespace/&&)
+# rather than exact: a false "yes" here just means the rest of the script
+# runs its checks anyway, while a false "no" would exit before ever reaching
+# them.
+if ! echo "$COMMAND" | grep -qE '(^|[[:space:]]|&&[[:space:]]*|["'"'"'`(])(git|gh)[[:space:]]+'; then
   exit 0
+fi
+
+# Mask the *contents* of quoted strings (single or double) before any of the
+# "does this command invoke a dangerous verb" checks below run (#2099). Every
+# such check is a plain substring/regex scan over the command text, with no
+# awareness of shell quoting — so text that merely APPEARS inside a quoted
+# argument (e.g. `gh issue create --body "...git clean -fd..."`) matched the
+# same pattern as a real invocation and got blocked. See mask-quoted-text.mjs
+# for the masking rules. Extraction logic below (detect_work_dir, MSG_FILE,
+# the AI-attribution scan) deliberately keeps reading the raw, unmasked
+# $COMMAND — masking only feeds the verb-detection checks that use $NCOMMAND.
+HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
+MASKED_COMMAND=$(echo "$COMMAND" | node "$HOOK_DIR/mask-quoted-text.mjs" 2>/dev/null) || true
+if [ -z "$MASKED_COMMAND" ]; then
+  MASKED_COMMAND="$COMMAND"
 fi
 
 # Normalize: strip `git -C "<path>"` / `git -C <path>` so downstream subcommand
@@ -33,8 +55,20 @@ fi
 # the opening `"` of a quoted path (which would leave a trailing `path"` in
 # NCOMMAND). The pattern re-anchors on `git`, so multi-`-C` chains (e.g.
 # `git -C /a -C /b push`) need a second pass to collapse the residual `-C`.
-NCOMMAND=$(echo "$COMMAND" | sed -E 's/(^|[[:space:]]|&&[[:space:]]*)git[[:space:]]+-C[[:space:]]+"[^"]+"/\1git/g; s/(^|[[:space:]]|&&[[:space:]]*)git[[:space:]]+-C[[:space:]]+[^"[:space:]][^[:space:]]*/\1git/g')
+NCOMMAND=$(echo "$MASKED_COMMAND" | sed -E 's/(^|[[:space:]]|&&[[:space:]]*)git[[:space:]]+-C[[:space:]]+"[^"]+"/\1git/g; s/(^|[[:space:]]|&&[[:space:]]*)git[[:space:]]+-C[[:space:]]+[^"[:space:]][^[:space:]]*/\1git/g')
 NCOMMAND=$(echo "$NCOMMAND" | sed -E 's/(^|[[:space:]]|&&[[:space:]]*)git[[:space:]]+-C[[:space:]]+"[^"]+"/\1git/g; s/(^|[[:space:]]|&&[[:space:]]*)git[[:space:]]+-C[[:space:]]+[^"[:space:]][^[:space:]]*/\1git/g')
+
+# Strip any remaining literal quote/substitution-delimiter characters from
+# NCOMMAND (#2099 Greptile review): an exec-triggered quote
+# (`bash -c "git clean -fd"`) or a command substitution
+# (`"message $(git clean -fd)"`, which executes even inside an otherwise
+# masked double-quoted string) is left unmasked by mask-quoted-text.mjs, but
+# its delimiters survive — e.g. `"git` or `$(git` — sitting directly adjacent
+# to the verb, defeating every `(^|[[:space:]])`-anchored check below.
+# NCOMMAND is used exclusively for verb detection (never for value
+# extraction — detect_work_dir/MSG_FILE read the raw $COMMAND instead), so
+# these characters carry no meaning here once masking has already run.
+NCOMMAND=$(echo "$NCOMMAND" | sed -E "s/[\"'\`()]/ /g")
 
 deny() {
   local reason="$1"
@@ -74,9 +108,23 @@ if echo "$NCOMMAND" | grep -qE '(^|[[:space:]]|&&[[:space:]]*)git[[:space:]]+res
   fi
 fi
 
-# git clean (delete untracked files)
+# git clean (delete untracked files) — #2099: `-n`/`--dry-run` is a pure
+# listing operation (git itself treats --dry-run as always overriding -f, so
+# it never deletes regardless of what else is on the line) and is exactly the
+# discovery mechanism /housekeep's Phase 2 recommends; only block an
+# invocation that would actually delete (carries -f/--force, and no
+# -n/--dry-run). A bare `git clean` with neither flag already refuses to run
+# without config changes this hook has no visibility into, so it's left
+# unblocked rather than flagging something git itself won't execute.
+# Delegates to check-git-clean-force.mjs (not an inline awk/grep pair) so the
+# per-segment split and bundled-short-flag matching (`-ndf`, `-fnd`, …) are
+# correct — an earlier version here split only on `&&`, so a flag on an
+# unrelated `;`/`|`/newline-separated command could suppress the block, and
+# missed bundled `-n` (Greptile review on #2099's own PR).
 if echo "$NCOMMAND" | grep -qE '(^|[[:space:]]|&&[[:space:]]*)git[[:space:]]+clean'; then
-  deny "BLOCKED: 'git clean' deletes untracked files that may belong to other sessions."
+  if [ "$(echo "$NCOMMAND" | node "$HOOK_DIR/check-git-clean-force.mjs" 2>/dev/null)" = "BLOCK" ]; then
+    deny "BLOCKED: 'git clean -f'/'--force' deletes untracked files that may belong to other sessions. Preview first with 'git clean -n'/'--dry-run'."
+  fi
 fi
 
 # git stash (hides all changes)
