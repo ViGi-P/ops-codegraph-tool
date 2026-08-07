@@ -232,19 +232,64 @@ fn handle_var_declarator_type_map(node: &Node, source: &[u8], symbols: &mut File
 /// Handle `required_parameter` / `optional_parameter` nodes in the type-map walk.
 ///
 /// Seeds a type-map entry when the parameter carries a TypeScript type annotation.
+///
+/// A plain typed parameter (`worker: IWorker`) seeds a direct entry keyed on
+/// its own name. An object-rest-destructured parameter with a type
+/// annotation (`{ ...rest }: IWorker`) has no single "name" — `name_node` is
+/// an `object_pattern`, not an `identifier` — but the rest binding itself
+/// (`rest`) is exactly what later property-access dispatch resolves
+/// against, so it gets the SAME direct type-annotation seed (#2080), keyed
+/// on the rest binding's own name. Mirrors `handleParamTypeMap` in
+/// `src/extractors/javascript.ts`.
 fn handle_param_type_map(node: &Node, source: &[u8], symbols: &mut FileSymbols) {
     let name_node = node.child_by_field_name("pattern")
         .or_else(|| node.child_by_field_name("left"))
         .or_else(|| node.child(0));
     let Some(name_node) = name_node else { return };
-    if name_node.kind() != "identifier" { return };
+    if name_node.kind() == "identifier" {
+        let Some(type_anno) = find_child(node, "type_annotation") else { return };
+        if let Some(type_name) = extract_simple_type_name(&type_anno, source) {
+            push_type_map_entry(
+                symbols,
+                node_text(&name_node, source).to_string(),
+                type_name.to_string(),
+            );
+        }
+        return;
+    }
+    if name_node.kind() != "object_pattern" { return };
+    // Only seed when the rest element is the pattern's ONLY member (`{
+    // ...rest }: IWorker`) — if a named property sits alongside it (`{
+    // doWork, ...rest }: IWorker`), TypeScript's own structural typing
+    // excludes that property from `rest`'s real type (effectively
+    // `Omit<IWorker, 'doWork'>`), so assigning the full `IWorker` type to
+    // `rest` would let a call like `rest.doWork()` — invalid, since
+    // `doWork` was destructured away — resolve a false edge via CHA
+    // dispatch (#2080 review).
+    for i in 0..name_node.child_count() {
+        let Some(sibling) = name_node.child(i) else { continue };
+        let st = sibling.kind();
+        if st == "{" || st == "}" || st == "," { continue }
+        if st != "rest_pattern" && st != "rest_element" { return }
+    }
     let Some(type_anno) = find_child(node, "type_annotation") else { return };
-    if let Some(type_name) = extract_simple_type_name(&type_anno, source) {
-        push_type_map_entry(
-            symbols,
-            node_text(&name_node, source).to_string(),
-            type_name.to_string(),
-        );
+    let Some(type_name) = extract_simple_type_name(&type_anno, source) else { return };
+    for i in 0..name_node.child_count() {
+        let Some(inner) = name_node.child(i) else { continue };
+        if inner.kind() == "rest_pattern" || inner.kind() == "rest_element" {
+            // rest_pattern/rest_element node: `...identifier` — the identifier
+            // is at child index 1 (mirrors collect_object_rest_params).
+            let rest_id = inner.child(1).or_else(|| inner.child_by_field_name("name"));
+            if let Some(rest_id) = rest_id {
+                if rest_id.kind() == "identifier" {
+                    push_type_map_entry(
+                        symbols,
+                        node_text(&rest_id, source).to_string(),
+                        type_name.to_string(),
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -5067,18 +5112,32 @@ fn collect_object_rest_params(node: &Node, source: &[u8], symbols: &mut FileSymb
         if ct == "," || ct == "(" || ct == ")" {
             continue;
         }
-        if ct == "object_pattern" {
-            for j in 0..child.child_count() {
-                let Some(inner) = child.child(j) else { continue };
-                if inner.kind() == "rest_pattern" || inner.kind() == "rest_element" {
-                    let rest_id = inner.child(1).or_else(|| inner.child_by_field_name("name"));
-                    if let Some(rest_id) = rest_id {
-                        if rest_id.kind() == "identifier" {
-                            symbols.object_rest_param_bindings.push(ObjectRestParamBinding {
-                                callee: fn_name.clone(),
-                                rest_name: node_text(&rest_id, source).to_string(),
-                                arg_index: param_idx,
-                            });
+        // TypeScript wraps EVERY parameter — typed or not — in a
+        // required_parameter/optional_parameter node (confirmed by parsing
+        // `function f({ ...rest }) {}` with tree-sitter-typescript, which
+        // still wraps despite no type annotation at all), unlike plain JS
+        // where the object_pattern is a direct child. Without unwrapping,
+        // object-rest-param bindings were silently never recorded for any
+        // .ts/.tsx file, not just ones using a type annotation (#2080).
+        let pattern_node = if ct == "required_parameter" || ct == "optional_parameter" {
+            child.child_by_field_name("pattern")
+        } else {
+            Some(child)
+        };
+        if let Some(pattern_node) = pattern_node {
+            if pattern_node.kind() == "object_pattern" {
+                for j in 0..pattern_node.child_count() {
+                    let Some(inner) = pattern_node.child(j) else { continue };
+                    if inner.kind() == "rest_pattern" || inner.kind() == "rest_element" {
+                        let rest_id = inner.child(1).or_else(|| inner.child_by_field_name("name"));
+                        if let Some(rest_id) = rest_id {
+                            if rest_id.kind() == "identifier" {
+                                symbols.object_rest_param_bindings.push(ObjectRestParamBinding {
+                                    callee: fn_name.clone(),
+                                    rest_name: node_text(&rest_id, source).to_string(),
+                                    arg_index: param_idx,
+                                });
+                            }
                         }
                     }
                 }
@@ -8038,6 +8097,74 @@ mod tests {
         let b = s.object_rest_param_bindings.iter().find(|b| b.rest_name == "rest");
         assert!(b.is_some(), "object_rest_param_bindings missing; got: {:?}", s.object_rest_param_bindings);
         assert_eq!(b.unwrap().callee, "Svc.handle");
+    }
+
+    // #2080: TypeScript wraps EVERY parameter (typed or not) in a
+    // required_parameter/optional_parameter node, unlike plain JS where the
+    // object_pattern is a direct formal_parameters child. Without unwrapping
+    // that wrapper, object_rest_param_bindings was never recorded for any
+    // .ts/.tsx file at all — not just ones using a type annotation.
+    #[test]
+    fn object_rest_param_binding_recorded_in_typescript_without_type_annotation() {
+        let s = parse_ts("function f3({ e1, ...eerest }) { eerest.e4(); }");
+        let b = s.object_rest_param_bindings.iter().find(|b| b.callee == "f3");
+        assert!(b.is_some(), "object_rest_param_bindings missing; got: {:?}", s.object_rest_param_bindings);
+        assert_eq!(b.unwrap().rest_name, "eerest");
+    }
+
+    #[test]
+    fn object_rest_param_binding_recorded_in_typescript_with_type_annotation() {
+        let s = parse_ts("function dispatchRest({ ...rest }: IWorker) { rest.doWork(); }");
+        let b = s.object_rest_param_bindings.iter().find(|b| b.callee == "dispatchRest");
+        assert!(b.is_some(), "object_rest_param_bindings missing; got: {:?}", s.object_rest_param_bindings);
+        assert_eq!(b.unwrap().rest_name, "rest");
+    }
+
+    // #2080: a type-annotated object-rest parameter (`{ ...rest }: IWorker`)
+    // should seed a direct type_map entry on the rest binding's own name,
+    // the same way a plain typed parameter (`worker: IWorker`) does — so
+    // CHA/interface dispatch through the rest binding can resolve.
+    #[test]
+    fn object_rest_param_type_annotation_seeds_type_map() {
+        let s = parse_ts("function dispatchRest({ ...rest }: IWorker) { rest.doWork(); }");
+        let tm = s.type_map.iter().find(|t| t.name == "rest");
+        assert!(tm.is_some(), "type_map should contain an entry for 'rest'; got: {:?}", s.type_map);
+        assert_eq!(tm.unwrap().type_name, "IWorker");
+        assert_eq!(tm.unwrap().confidence, 0.9);
+    }
+
+    #[test]
+    fn object_rest_param_without_type_annotation_does_not_seed_type_map() {
+        let s = parse_ts("function f3({ ...rest }) { rest.go(); }");
+        let tm = s.type_map.iter().find(|t| t.name == "rest");
+        assert!(tm.is_none(), "type_map should not contain an entry for untyped 'rest'; got: {:?}", s.type_map);
+    }
+
+    // #2080 review (Greptile): a named property alongside the rest element
+    // excludes that property from rest's real type (`Omit<IWorker,
+    // 'doWork'>`), so seeding the full IWorker type onto `rest` would let a
+    // call like `rest.doWork()` — invalid, since doWork was destructured
+    // away — falsely resolve via CHA dispatch.
+    #[test]
+    fn object_rest_param_with_sibling_property_does_not_seed_full_type() {
+        let s = parse_ts("function f({ doWork, ...rest }: IWorker) { rest.other(); }");
+        let tm = s.type_map.iter().find(|t| t.name == "rest");
+        assert!(
+            tm.is_none(),
+            "type_map should not seed the full annotation type onto 'rest' when a sibling property is destructured out; got: {:?}",
+            s.type_map
+        );
+    }
+
+    // The object_rest_param_bindings extraction itself (the value-chase
+    // mechanism, #1336) is unaffected by the sibling-property guard above —
+    // it always recorded the rest binding regardless of sibling properties.
+    #[test]
+    fn object_rest_param_binding_still_recorded_with_sibling_property() {
+        let s = parse_ts("function f({ doWork, ...rest }: IWorker) { rest.other(); }");
+        let b = s.object_rest_param_bindings.iter().find(|b| b.callee == "f");
+        assert!(b.is_some(), "object_rest_param_bindings missing; got: {:?}", s.object_rest_param_bindings);
+        assert_eq!(b.unwrap().rest_name, "rest");
     }
 
     #[test]
