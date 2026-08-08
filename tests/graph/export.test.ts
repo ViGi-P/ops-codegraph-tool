@@ -287,6 +287,75 @@ describe('exportJSON', () => {
     expect(functionLevel.nodes.some((n) => n.kind === 'function')).toBe(true);
     db.close();
   });
+
+  it('file-level edges carry sourceId/targetId that join against nodes[].id (#2144)', () => {
+    const db = createTestDb();
+    const a = insertNode(db, 'src/a.js', 'file', 'src/a.js', 0);
+    const b = insertNode(db, 'src/b.js', 'file', 'src/b.js', 0);
+    insertEdge(db, a, b, 'imports');
+
+    const data = exportJSON(db);
+    const nodeIds = new Set(data.nodes.map((n) => n.id));
+    expect(data.edges.length).toBeGreaterThan(0);
+    for (const edge of data.edges) {
+      // source/target remain file path strings for backward compatibility —
+      // sourceId/targetId are the additive, node-id-based join.
+      expect(typeof edge.source).toBe('string');
+      expect(typeof edge.target).toBe('string');
+      expect(nodeIds.has(edge.sourceId)).toBe(true);
+      expect(nodeIds.has(edge.targetId)).toBe(true);
+    }
+    db.close();
+  });
+
+  it("resolves sourceId/targetId to file nodes (not the edge's own function-level endpoints) for a cross-file calls edge, and does not widen DISTINCT aggregation (#2144 review)", () => {
+    const db = createTestDb();
+    const fileA = insertNode(db, 'src/a.js', 'file', 'src/a.js', 0);
+    const fileB = insertNode(db, 'src/b.js', 'file', 'src/b.js', 0);
+    // Two DIFFERENT function pairs between the same two files — a file-level
+    // `calls` edge's actual e.source_id/e.target_id point at these function
+    // nodes, never at fileA/fileB directly.
+    const fn1 = insertNode(db, 'doWork', 'function', 'src/a.js', 5);
+    const fn2 = insertNode(db, 'helper', 'function', 'src/b.js', 10);
+    const fn3 = insertNode(db, 'doOtherWork', 'function', 'src/a.js', 20);
+    const fn4 = insertNode(db, 'helper2', 'function', 'src/b.js', 30);
+    insertEdge(db, fn1, fn2, 'calls');
+    insertEdge(db, fn3, fn4, 'calls');
+
+    const data = exportJSON(db);
+    const fileLevelEdges = data.edges.filter(
+      (e) => e.source === 'src/a.js' && e.target === 'src/b.js',
+    );
+    // Both function-pair edges collapse into a single file-level row —
+    // asserting this BEFORE checking sourceId/targetId, since a regression
+    // that widens DISTINCT would otherwise still "pass" a naive per-edge check.
+    expect(fileLevelEdges).toHaveLength(1);
+    expect(fileLevelEdges[0]?.sourceId).toBe(fileA);
+    expect(fileLevelEdges[0]?.targetId).toBe(fileB);
+    // Must NOT be the raw function-node ids the edge itself points at.
+    expect(fileLevelEdges[0]?.sourceId).not.toBe(fn1);
+    expect(fileLevelEdges[0]?.sourceId).not.toBe(fn3);
+    expect(fileLevelEdges[0]?.targetId).not.toBe(fn2);
+    expect(fileLevelEdges[0]?.targetId).not.toBe(fn4);
+    db.close();
+  });
+
+  it('sourceId is null (not a directory-node id) for a contains edge whose source is a directory (#2144 review)', () => {
+    const db = createTestDb();
+    const dir = insertNode(db, 'src', 'directory', 'src', 0);
+    const fileA = insertNode(db, 'src/a.js', 'file', 'src/a.js', 0);
+    insertEdge(db, dir, fileA, 'contains');
+
+    const data = exportJSON(db);
+    const edge = data.edges.find((e) => e.source === 'src' && e.target === 'src/a.js');
+    expect(edge).toBeDefined();
+    // Directories have no entry in this file-only nodes[] array, so their
+    // id can never be a meaningful join target — null makes that explicit
+    // rather than silently resolving to something wrong (or being omitted).
+    expect(edge?.sourceId).toBeNull();
+    expect(edge?.targetId).toBe(fileA);
+    db.close();
+  });
 });
 
 describe('exportGraphML', () => {

@@ -354,7 +354,36 @@ export function exportJSON(
       .all(minConf) as Array<{ source: string; target: string; kind: string; confidence: number }>;
     if (noTests) edges = edges.filter((e) => !isTestFile(e.source) && !isTestFile(e.target));
 
-    const base = { nodes, edges };
+    // sourceId/targetId (#2144): file-level edges' source/target are file
+    // path strings for backward compatibility with existing `codegraph
+    // export -f json` consumers, but that means they don't join against
+    // this same payload's nodes[].id the way function-level mode's edges
+    // do. sourceId/targetId are purely additive so a consumer that wants
+    // the same id-based join function-level mode already supports can use
+    // them without breaking anyone reading source/target as file paths.
+    //
+    // Looked up from the already-fetched file-kind `nodes` list (by file
+    // path) rather than from the edge query's own n1.id/n2.id — those are
+    // the edge's ACTUAL endpoints, which for a cross-file `calls` edge are
+    // function/class/etc. nodes, not the file nodes this payload's `nodes`
+    // array contains. Using them directly would both fail to resolve
+    // against `nodes[].id` and (worse) widen this query's DISTINCT
+    // aggregation, since two different function-to-function edges between
+    // the same file pair would then produce two distinct rows instead of
+    // collapsing into one.
+    //
+    // null (not omitted) when source/target is a directory rather than a
+    // file — `contains` edges include directory→file containment, and
+    // directories have no corresponding entry in this file-only `nodes`
+    // array to resolve against.
+    const fileNodeIdByPath = new Map(nodes.map((n) => [n.file, n.id]));
+    const edgesWithIds = edges.map((e) => ({
+      ...e,
+      sourceId: fileNodeIdByPath.get(e.source) ?? null,
+      targetId: fileNodeIdByPath.get(e.target) ?? null,
+    }));
+
+    const base = { nodes, edges: edgesWithIds };
     return paginateResult(base, 'edges', { limit: opts.limit, offset: opts.offset }) as {
       nodes: unknown[];
       edges: unknown[];
