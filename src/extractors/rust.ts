@@ -252,6 +252,63 @@ function handleRustMacroInvocation(node: TreeSitterNode, ctx: ExtractorOutput): 
   if (macroNode) {
     ctx.calls.push({ name: `${macroNode.text}!`, line: node.startPosition.row + 1 });
   }
+  // Macro arguments (`println!("{}", user.display_name())`) are an opaque
+  // `token_tree` to tree-sitter-rust — macros can have arbitrary token syntax, so
+  // the grammar never parses their contents into call_expression/field_expression
+  // nodes the way it does everywhere else. walkRustNode's generic recursion still
+  // visits every token inside, but none of them match `call_expression`, so a real
+  // call embedded in a macro argument (the common `println!`/`format!`/`write!`/
+  // `assert!` case) was silently invisible to call-edge resolution. Scan the flat
+  // token sequence directly for the two call shapes tree-sitter still tokenizes
+  // recognizably — bare `ident(...)` and single-hop method `ident.ident(...)` — and
+  // record them the same way handleRustCallExpr would (#2214).
+  for (let i = 0; i < node.childCount; i++) {
+    const child = node.child(i);
+    if (child?.type === 'token_tree') scanMacroTokensForCalls(child, ctx);
+  }
+}
+
+function scanMacroTokensForCalls(tokenTree: TreeSitterNode, ctx: ExtractorOutput): void {
+  const children: TreeSitterNode[] = [];
+  for (let i = 0; i < tokenTree.childCount; i++) {
+    const child = tokenTree.child(i);
+    if (child) children.push(child);
+  }
+  for (let i = 0; i < children.length; i++) {
+    const c = children[i];
+    if (!c) continue;
+    if (c.type === 'token_tree') {
+      scanMacroTokensForCalls(c, ctx);
+      continue;
+    }
+    if (c.type !== 'identifier') continue;
+
+    // `receiver . method ( ... )` — single-hop method call.
+    const dot = children[i + 1];
+    const methodName = children[i + 2];
+    const argsAfterMethod = children[i + 3];
+    if (
+      dot?.type === '.' &&
+      methodName?.type === 'identifier' &&
+      argsAfterMethod?.type === 'token_tree' &&
+      argsAfterMethod.text.startsWith('(')
+    ) {
+      ctx.calls.push({
+        name: methodName.text,
+        line: methodName.startPosition.row + 1,
+        receiver: c.text,
+      });
+      i += 3;
+      continue;
+    }
+
+    // Bare `name ( ... )` — free-function call.
+    const argsAfterBare = children[i + 1];
+    if (argsAfterBare?.type === 'token_tree' && argsAfterBare.text.startsWith('(')) {
+      ctx.calls.push({ name: c.text, line: c.startPosition.row + 1 });
+      i += 1;
+    }
+  }
 }
 
 const RUST_IMPL_TYPES = ['impl_item'] as const;
@@ -357,21 +414,96 @@ function extractRustTypeName(typeNode: TreeSitterNode): string | null {
   const t = typeNode.type;
   if (t === 'type_identifier' || t === 'identifier') return typeNode.text;
   if (t === 'scoped_type_identifier') return typeNode.text;
-  // Reference: &MyType or &mut MyType → MyType
+  // Reference: &MyType, &mut MyType, &Option<User> → recurse on the referent
+  // via the `type` field (ignoring lifetime/mut modifiers, which aren't part of
+  // it) rather than hand-matching type_identifier/scoped_type_identifier — a
+  // referent that's itself generic (&Option<User>) previously matched neither
+  // arm of the old child-loop and silently returned null, dropping the return
+  // type before the Option/Result unwrap logic ever saw it (Greptile review,
+  // PR #2371).
   if (t === 'reference_type') {
-    for (let i = 0; i < typeNode.childCount; i++) {
-      const child = typeNode.child(i);
-      if (child && (child.type === 'type_identifier' || child.type === 'scoped_type_identifier')) {
-        return child.text;
-      }
-    }
+    const referent = typeNode.childForFieldName('type');
+    return referent ? extractRustTypeName(referent) : null;
   }
-  // Generic: Vec<T> → Vec
+  // For every OTHER generic type (Vec<T>, HashMap<K, V>, a user-defined
+  // Container<T>, ...), keep the original nominal-base-name behavior — impl
+  // blocks' own qualified names use the source-literal generic syntax too
+  // (`impl<T> Container<T>` extracts as "Container<T>", not "Container"), so a
+  // concretely-instantiated receiver ("Container<User>") could never match it
+  // either way; but CHA/RTA's instantiated-types matching (buildChaContext in
+  // cha.ts) DOES compare bare typeMap entries against trait-implementor names,
+  // so keeping other generics parameterized here would silently break that
+  // unrelated, currently-working nominal match (Greptile review, PR #2371).
+  // Option/Result are the only shapes this fix actually needs full text for — a
+  // Some(x)/Ok(x) if-let/while-let binding's real type is the type ARGUMENT, not
+  // the wrapper, and unwrapOptionResultType() in build-edges.ts needs that
+  // argument text to compute it.
   if (t === 'generic_type') {
-    const first = typeNode.child(0);
-    return first ? first.text : null;
+    const text = typeNode.text;
+    const base = text.split('<')[0]?.trim() ?? text;
+    return isOptionOrResultBase(base) ? text : base;
   }
   return null;
+}
+
+/**
+ * True when `base` names Option/Result, bare (`Option`) or fully qualified
+ * (`std::option::Option`, `core::result::Result`) — both spellings are valid
+ * Rust and equally common in a `-> ReturnType` position. Mirrors
+ * `is_option_or_result_base` in `rust_lang.rs` and is checked identically at
+ * unwrap time by `unwrapOptionResultType` in `build-edges.ts` (#2214, Greptile
+ * review on PR #2371 — a qualified spelling was silently treated as an
+ * unrelated generic, dropping the type argument a Some(x)/Ok(x) binding needs).
+ */
+export function isOptionOrResultBase(base: string): boolean {
+  return (
+    base === 'Option' || base === 'Result' || base.endsWith('::Option') || base.endsWith('::Result')
+  );
+}
+
+/**
+ * If `pattern` is a single-argument `Some(x)`/`Ok(x)` tuple-struct pattern,
+ * return its inner `x` pattern — so `if let Some(x) = expr`/`if let Ok(x) = expr`
+ * (and the `while let`/`let-else` equivalents) can be treated as a call-assignment
+ * binding `x`, the same way `let x = expr;` already is. Returns `pattern`
+ * unchanged for any other shape (a bare identifier, `None`, `Err(_)`, or any
+ * other variant this isn't confident unwrapping). Mirrors
+ * `unwrap_option_result_pattern` in `rust_lang.rs`.
+ */
+/**
+ * Unwrap zero or more layers of `Some(...)`/`Ok(...)` wrapping — e.g.
+ * `Some(Some(user))` for a `Option<Option<User>>`-returning call, not just one
+ * layer — returning the innermost non-Some/Ok pattern and how many layers were
+ * stripped. The caller unwraps the callee's declared return type the same
+ * number of times (#2214, Greptile review on PR #2371 — a single unwrap left a
+ * doubly-nested pattern's binding untyped entirely, since `Some(Some(x))`'s
+ * inner pattern is itself a `tuple_struct_pattern`, not an `identifier`, and
+ * the original single-pass version gave up on it).
+ */
+function unwrapOptionResultPattern(pattern: TreeSitterNode): {
+  pattern: TreeSitterNode;
+  depth: number;
+} {
+  let current = pattern;
+  let depth = 0;
+  while (true) {
+    if (current.type !== 'tuple_struct_pattern') return { pattern: current, depth };
+    const typeNode = current.childForFieldName('type');
+    if (!typeNode) return { pattern: current, depth };
+    const variant = typeNode.text;
+    if (variant !== 'Some' && variant !== 'Ok') return { pattern: current, depth };
+    let next: TreeSitterNode | undefined;
+    for (let i = 0; i < current.namedChildCount; i++) {
+      const child = current.namedChild(i);
+      if (child && child.id !== typeNode.id) {
+        next = child;
+        break;
+      }
+    }
+    if (!next) return { pattern: current, depth };
+    current = next;
+    depth++;
+  }
 }
 
 // ── Return-type map extraction (Phase 8.2 parity, #1876) ────────────────────
@@ -449,7 +581,10 @@ function extractRustCallAssignmentsDepth(
   depth: number,
 ): void {
   if (depth >= MAX_WALK_DEPTH) return;
-  if (node.type === 'let_declaration') {
+  // `let_declaration` covers `let x = expr;` (and `let Some(x) = expr else {...};`
+  // let-else); `let_condition` is the `if let`/`while let` condition node (#2214) —
+  // both have `pattern`/`value` fields shaped identically.
+  if (node.type === 'let_declaration' || node.type === 'let_condition') {
     recordRustCallAssignment(node, ctx);
   }
   for (let i = 0; i < node.childCount; i++) {
@@ -460,22 +595,36 @@ function extractRustCallAssignmentsDepth(
 
 function recordRustCallAssignment(node: TreeSitterNode, ctx: ExtractorOutput): void {
   if (!ctx.callAssignments) return;
-  const pattern = node.childForFieldName('pattern');
+  const rawPattern = node.childForFieldName('pattern');
   const value = node.childForFieldName('value');
-  if (pattern?.type !== 'identifier' || value?.type !== 'call_expression') return;
+  if (!rawPattern || value?.type !== 'call_expression') return;
+  const { pattern, depth: unwrapDepth } = unwrapOptionResultPattern(rawPattern);
+  if (pattern.type !== 'identifier') return;
+  // A bare fieldless-variant/unit-struct pattern (`if let None = expr`, `if let
+  // NameValidator = expr`) is syntactically identical to a variable binding —
+  // tree-sitter has no way to distinguish them by grammar alone. By Rust
+  // convention a real binding is snake_case, so an uppercase-leading name is a
+  // pattern match against a value, not a new variable — recording it as one
+  // would fabricate a call-assignment for a variable that doesn't exist (#2214).
+  if (/^[A-Z]/.test(pattern.text)) return;
   const fn = value.childForFieldName('function');
   if (!fn) return;
   const varName = pattern.text;
 
   if (fn.type === 'identifier') {
-    ctx.callAssignments.push({ varName, calleeName: fn.text });
+    ctx.callAssignments.push({ varName, calleeName: fn.text, unwrapDepth });
     return;
   }
   if (fn.type === 'scoped_identifier') {
     const name = fn.childForFieldName('name');
     const path = fn.childForFieldName('path');
     if (name && path) {
-      ctx.callAssignments.push({ varName, calleeName: name.text, receiverTypeName: path.text });
+      ctx.callAssignments.push({
+        varName,
+        calleeName: name.text,
+        receiverTypeName: path.text,
+        unwrapDepth,
+      });
     }
     return;
   }
@@ -486,7 +635,19 @@ function recordRustCallAssignment(node: TreeSitterNode, ctx: ExtractorOutput): v
       const receiverEntry = ctx.typeMap?.get(receiver.text);
       const receiverTypeName =
         typeof receiverEntry === 'string' ? receiverEntry : receiverEntry?.type;
-      ctx.callAssignments.push({ varName, calleeName: field.text, receiverTypeName });
+      // Preserve the raw receiver identifier even when its type isn't known yet
+      // at extraction time (e.g. `service` in `service.get_user(1)`, whose type
+      // only becomes known via cross-file return-type propagation) so injection
+      // can retry resolution once the receiver's own call-assignment has itself
+      // been injected earlier in the same pass (#2214).
+      const receiverVarName = receiverTypeName === undefined ? receiver.text : undefined;
+      ctx.callAssignments.push({
+        varName,
+        calleeName: field.text,
+        receiverTypeName,
+        receiverVarName,
+        unwrapDepth,
+      });
     }
   }
 }

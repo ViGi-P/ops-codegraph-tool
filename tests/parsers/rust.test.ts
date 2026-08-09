@@ -178,4 +178,137 @@ impl Display for Foo {}`);
       }),
     );
   });
+
+  // ── if-let/while-let pattern-binding call assignments (#2214) ────────────
+
+  it('records a call assignment for an if-let Some-bound method call', () => {
+    const symbols = parseRust(
+      `fn f() {\n  let service = build_service();\n  if let Some(user) = service.get_user(1) {}\n}`,
+    );
+    const ca = symbols.callAssignments.find((c) => c.varName === 'user');
+    expect(ca).toEqual(
+      expect.objectContaining({
+        calleeName: 'get_user',
+        receiverTypeName: undefined,
+        receiverVarName: 'service',
+        unwrapDepth: 1,
+      }),
+    );
+  });
+
+  it('records a call assignment for an if-let Ok-bound bare call', () => {
+    const symbols = parseRust(`fn f() {\n  if let Ok(user) = build_user() {}\n}`);
+    const ca = symbols.callAssignments.find((c) => c.varName === 'user');
+    expect(ca).toEqual(expect.objectContaining({ calleeName: 'build_user', unwrapDepth: 1 }));
+  });
+
+  it('unwraps a while-let Some-bound call assignment too', () => {
+    const symbols = parseRust(`fn f() {\n  while let Some(item) = next_item() {}\n}`);
+    const ca = symbols.callAssignments.find((c) => c.varName === 'item');
+    expect(ca).toEqual(expect.objectContaining({ calleeName: 'next_item', unwrapDepth: 1 }));
+  });
+
+  it('does not mark a plain let binding as unwrapped', () => {
+    const symbols = parseRust(`fn f() {\n  let service = build_service();\n}`);
+    const ca = symbols.callAssignments.find((c) => c.varName === 'service');
+    expect(ca?.unwrapDepth).toBe(0);
+  });
+
+  it('records a doubly-nested Some pattern with depth two', () => {
+    // `Some(Some(x))` — destructuring a doubly-nested `Option<Option<T>>` in a
+    // single pattern, the idiomatic way to do it, not two sequential if-lets —
+    // must unwrap both layers, not give up after the first (Greptile review,
+    // PR #2371).
+    const symbols = parseRust(`fn f() {\n  if let Some(Some(user)) = get_nested_option() {}\n}`);
+    const ca = symbols.callAssignments.find((c) => c.varName === 'user');
+    expect(ca).toEqual(
+      expect.objectContaining({ calleeName: 'get_nested_option', unwrapDepth: 2 }),
+    );
+  });
+
+  it('does not treat a None/unit-variant pattern as a call assignment', () => {
+    // `None` is syntactically identical to a bare identifier binding — must not
+    // be recorded as if it were a new variable named "None".
+    const symbols = parseRust(`fn f() {\n  if let None = build_service() {}\n}`);
+    expect(symbols.callAssignments).toHaveLength(0);
+  });
+
+  // ── Full generic return types (#2214) ─────────────────────────────────────
+
+  it('preserves the full generic return type (Option<T>, not just Option)', () => {
+    const symbols = parseRust(`fn get_user() -> Option<User> { None }`);
+    expect(symbols.returnTypeMap.get('get_user')).toEqual(
+      expect.objectContaining({ type: 'Option<User>' }),
+    );
+  });
+
+  it('keeps the bare base name for non-Option/Result generics (Vec<T>, etc.)', () => {
+    // Only Option/Result need the type argument preserved (to unwrap a
+    // Some(x)/Ok(x) binding) — every other generic keeps its original bare name
+    // so CHA/RTA's instantiated-types matching against trait-implementor names is
+    // unaffected (Greptile review, PR #2371).
+    const symbols = parseRust(`fn get_users() -> Vec<User> { Vec::new() }`);
+    expect(symbols.returnTypeMap.get('get_users')).toEqual(
+      expect.objectContaining({ type: 'Vec' }),
+    );
+  });
+
+  it('preserves the full text for a fully-qualified Option (std::option::Option<T>)', () => {
+    // `std::option::Option<User>` is just as valid as the bare `Option<User>`
+    // spelling and must be recognized the same way (Greptile review, PR #2371).
+    const symbols = parseRust(`fn get_user() -> std::option::Option<User> { None }`);
+    expect(symbols.returnTypeMap.get('get_user')).toEqual(
+      expect.objectContaining({ type: 'std::option::Option<User>' }),
+    );
+  });
+
+  it('preserves the full text for a reference-wrapped Option (Option<&T>)', () => {
+    // `Option<&User>` (a common shape for a cached-field getter) must preserve
+    // the type argument, including the reference sigil, the same way any other
+    // Option<T> does — unwrapOptionResultType in build-edges.ts strips the `&`
+    // at injection time, not extraction time (Greptile review, PR #2371).
+    const symbols = parseRust(
+      `struct UserService { cached: User }\nimpl UserService {\n  fn get_user_ref(&self) -> Option<&User> { Some(&self.cached) }\n}`,
+    );
+    expect(symbols.returnTypeMap.get('UserService.get_user_ref')).toEqual(
+      expect.objectContaining({ type: 'Option<&User>' }),
+    );
+  });
+
+  it('preserves a reference to a generic Option (&Option<T>)', () => {
+    // `&Option<User>` (a reference TO the Option, not a reference stored
+    // inside it) — the old reference_type handling only matched a bare
+    // type_identifier/scoped_type_identifier child, never a generic_type
+    // child, so this shape returned null entirely and the whole return type
+    // was dropped (Greptile review, PR #2371).
+    const symbols = parseRust(`fn get_user() -> &Option<User> { &None }`);
+    expect(symbols.returnTypeMap.get('get_user')).toEqual(
+      expect.objectContaining({ type: 'Option<User>' }),
+    );
+  });
+
+  // ── Calls embedded in macro invocation arguments (#2214) ──────────────────
+
+  it('scans macro arguments for a method call', () => {
+    const symbols = parseRust(`fn f() { println!("{}", user.display_name()); }`);
+    expect(symbols.calls).toContainEqual(
+      expect.objectContaining({ name: 'display_name', receiver: 'user' }),
+    );
+    expect(symbols.calls).toContainEqual(expect.objectContaining({ name: 'println!' }));
+  });
+
+  it('scans macro arguments for a bare function call', () => {
+    const symbols = parseRust(`fn f() { println!("{}", compute_total()); }`);
+    const call = symbols.calls.find((c) => c.name === 'compute_total');
+    expect(call).toBeDefined();
+    expect(call?.receiver).toBeUndefined();
+  });
+
+  it('scans nested macro arguments recursively', () => {
+    const symbols = parseRust(`fn f() { assert_eq!(compute_total(), other.value()); }`);
+    expect(symbols.calls).toContainEqual(expect.objectContaining({ name: 'compute_total' }));
+    expect(symbols.calls).toContainEqual(
+      expect.objectContaining({ name: 'value', receiver: 'other' }),
+    );
+  });
 });

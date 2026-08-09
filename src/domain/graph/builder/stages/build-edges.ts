@@ -9,6 +9,7 @@ import { performance } from 'node:perf_hooks';
 import { getNodeId } from '../../../../db/index.js';
 import { setTypeMapEntry } from '../../../../extractors/helpers.js';
 import { PROPAGATION_HOP_PENALTY } from '../../../../extractors/javascript.js';
+import { isOptionOrResultBase } from '../../../../extractors/rust.js';
 import { debug } from '../../../../infrastructure/logger.js';
 import { loadNative } from '../../../../infrastructure/native.js';
 import { getOrCreatePerDbChunkStmt } from '../../../../shared/chunked-stmt-cache.js';
@@ -614,9 +615,23 @@ function propagateReturnTypesAcrossFiles(
     for (const ca of symbols.callAssignments) {
       if (symbols.typeMap.has(ca.varName)) continue; // already resolved locally
 
+      // A method call whose receiver's type wasn't known at extraction time
+      // (ca.receiverVarName) may have just been resolved by an earlier
+      // call-assignment in this same file — e.g. `service` in `const service =
+      // buildService(); ... service.getUser(1)` only becomes typed once
+      // `service`'s own cross-file return type is injected into symbols.typeMap
+      // (mutated in place by this same loop, below). Retry against the
+      // receiver's now-resolved type before falling back to a bare
+      // global-function lookup (#2214).
+      const receiverResolvedType = ca.receiverVarName
+        ? symbols.typeMap.get(ca.receiverVarName)?.type
+        : undefined;
+
       let returnEntry: TypeMapEntry | undefined;
       if (ca.receiverTypeName) {
         returnEntry = globalReturnTypeMap.get(`${ca.receiverTypeName}.${ca.calleeName}`);
+      } else if (receiverResolvedType) {
+        returnEntry = globalReturnTypeMap.get(`${receiverResolvedType}.${ca.calleeName}`);
       } else {
         const importedFrom = importedNamesMap.get(ca.calleeName);
         // The return-type index for the imported file is keyed by the
@@ -627,12 +642,92 @@ function propagateReturnTypesAcrossFiles(
       }
 
       if (returnEntry) {
+        // ca.unwrapDepth means the binding came from unwrapping that many
+        // layers of a refutable `Some(x)`/`Ok(x)` pattern — `Some(Some(x))` is
+        // 2, not 1. The callee's declared return type is itself wrapped that
+        // many layers deep (`Option<Option<T>>` for depth 2), and `x`'s real
+        // type is what's left after unwrapping all of them, not the wrapper.
+        // If a layer turns out not to actually be a generic Option/Result (a
+        // mismatch between the pattern and the callee's real signature),
+        // decline to inject rather than propagate a half-unwrapped type as if
+        // it were `x`'s type (#2214).
+        let resolvedType: string | undefined = returnEntry.type;
+        for (let i = 0; i < (ca.unwrapDepth ?? 0); i++) {
+          resolvedType =
+            resolvedType === undefined ? undefined : unwrapOptionResultType(resolvedType);
+        }
+        if (resolvedType === undefined) continue;
+
         const propagatedConf = returnEntry.confidence - PROPAGATION_HOP_PENALTY;
         if (propagatedConf > 0)
-          setTypeMapEntry(symbols.typeMap, ca.varName, returnEntry.type, propagatedConf);
+          setTypeMapEntry(symbols.typeMap, ca.varName, resolvedType, propagatedConf);
       }
     }
   }
+}
+
+/**
+ * If `typeName` is `Option<T>` or `Result<T, E>`, return `T` — the type a
+ * refutable `Some(x)`/`Ok(x)` pattern (`if let`/`while let`/`let-else`) binds
+ * `x` to. Handles nested generics in the first type argument
+ * (`Result<Vec<User>, String>` → `Vec<User>`) by tracking bracket depth rather
+ * than splitting on the first comma. Returns `undefined` for any other shape,
+ * including a malformed generic string, so the caller can decline to inject a
+ * guessed type rather than propagate something wrong. Mirrors
+ * `unwrap_option_result_type` in `pipeline.rs` (#2214).
+ */
+function unwrapOptionResultType(typeName: string): string | undefined {
+  const ltIdx = typeName.indexOf('<');
+  if (ltIdx === -1 || !typeName.endsWith('>')) return undefined;
+  const base = typeName.slice(0, ltIdx).trim();
+  if (!isOptionOrResultBase(base)) return undefined;
+  const inner = typeName.slice(ltIdx + 1, -1);
+  let depth = 0;
+  for (let i = 0; i < inner.length; i++) {
+    const c = inner[i];
+    if (c === '<') depth++;
+    else if (c === '>') depth--;
+    else if (c === ',' && depth === 0) {
+      return normalizeUnwrappedGenericArg(inner.slice(0, i).trim());
+    }
+  }
+  return normalizeUnwrappedGenericArg(inner.trim());
+}
+
+/**
+ * Apply the same nominal-vs-full-generic rule extractRustTypeName applies at
+ * extraction time to an unwrapped Some(x)/Ok(x) binding's inner type — bare for
+ * an ordinary generic (Option<Vec<User>>'s inner Vec<User> becomes x's type
+ * Vec, matching how a direct `let x: Vec<User> = ...` annotation would type
+ * it), full text for a nested Option/Result (Option<Option<User>>'s inner
+ * Option<User> stays Option<User> — if-let only strips one layer, so x's real
+ * type still needs its own type argument for a later unwrap). Without this, a
+ * nested generic payload would inject a parameterized name where every other
+ * path in this pipeline injects a bare one (Greptile review, PR #2371).
+ */
+function normalizeUnwrappedGenericArg(arg: string): string | undefined {
+  const stripped = stripReferenceSigil(arg.trim());
+  if (!stripped) return undefined;
+  const ltIdx = stripped.indexOf('<');
+  if (ltIdx === -1) return stripped;
+  const innerBase = stripped.slice(0, ltIdx).trim();
+  return isOptionOrResultBase(innerBase) ? stripped : innerBase;
+}
+
+/**
+ * Strip a leading `&`/`&mut `/`&'a `/`&'a mut ` reference sigil, the same way
+ * extractRustTypeName's reference_type branch does for a direct annotation —
+ * Option<&User>/Option<&'a mut User>'s bound value's real receiver type is
+ * User, not the reference syntax around it (Greptile review, PR #2371).
+ */
+function stripReferenceSigil(s: string): string {
+  if (!s.startsWith('&')) return s;
+  let rest = s.slice(1).trimStart();
+  if (rest.startsWith("'")) {
+    const idx = rest.search(/\s/);
+    if (idx !== -1) rest = rest.slice(idx).trimStart();
+  }
+  return rest.startsWith('mut ') ? rest.slice(4).trimStart() : rest;
 }
 
 // ── Call edges (native engine) ──────────────────────────────────────────

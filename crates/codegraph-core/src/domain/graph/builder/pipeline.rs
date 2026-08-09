@@ -1722,6 +1722,80 @@ fn build_return_type_index(
     (return_type_index, global_return_types)
 }
 
+/// If `type_name` is `Option<T>` or `Result<T, E>`, return `T` — the type a
+/// refutable `Some(x)`/`Ok(x)` pattern (`if let`/`while let`/`let-else`) binds
+/// `x` to. Handles nested generics in the first type argument
+/// (`Result<Vec<User>, String>` → `Vec<User>`) by tracking bracket depth rather
+/// than splitting on the first comma. Returns `None` for any other shape,
+/// including a malformed generic string, so the caller can decline to inject a
+/// guessed type rather than propagate something wrong. Mirrors
+/// `unwrapOptionResultType` in `build-edges.ts` (#2214).
+fn unwrap_option_result_type(type_name: &str) -> Option<&str> {
+    let (base, rest) = type_name.split_once('<')?;
+    if !crate::extractors::rust_lang::is_option_or_result_base(base.trim()) {
+        return None;
+    }
+    let inner = rest.strip_suffix('>')?;
+    let mut depth = 0i32;
+    for (i, c) in inner.char_indices() {
+        match c {
+            '<' => depth += 1,
+            '>' => depth -= 1,
+            ',' if depth == 0 => {
+                let first = inner[..i].trim();
+                return normalize_unwrapped_generic_arg(first);
+            }
+            _ => {}
+        }
+    }
+    normalize_unwrapped_generic_arg(inner.trim())
+}
+
+/// Apply the same nominal-vs-full-generic rule `extract_rust_type_name` applies
+/// at extraction time to an unwrapped `Some(x)`/`Ok(x)` binding's inner type —
+/// bare for an ordinary generic (`Option<Vec<User>>`'s inner `Vec<User>` becomes
+/// `x`'s type `Vec`, matching how a direct `let x: Vec<User> = ...` annotation
+/// would type it), full text for a nested Option/Result (`Option<Option<User>>`'s
+/// inner `Option<User>` stays `Option<User>` — if-let only strips one layer, so
+/// `x`'s real type still needs its own type argument for a later unwrap).
+/// Without this, a nested generic payload would inject a parameterized name where
+/// every other path in this pipeline injects a bare one (Greptile review, PR #2371).
+fn normalize_unwrapped_generic_arg(arg: &str) -> Option<&str> {
+    let arg = strip_reference_sigil(arg.trim());
+    if arg.is_empty() {
+        return None;
+    }
+    let Some((inner_base, _rest)) = arg.split_once('<') else {
+        return Some(arg);
+    };
+    let inner_base = inner_base.trim();
+    if crate::extractors::rust_lang::is_option_or_result_base(inner_base) {
+        Some(arg)
+    } else {
+        Some(inner_base)
+    }
+}
+
+/// Strip a leading `&`/`&mut `/`&'a `/`&'a mut ` reference sigil, the same way
+/// `extract_rust_type_name`'s `reference_type` branch does for a direct
+/// annotation — `Option<&User>`/`Option<&'a mut User>`'s bound value's real
+/// receiver type is `User`, not the reference syntax around it (Greptile
+/// review, PR #2371).
+fn strip_reference_sigil(s: &str) -> &str {
+    let Some(rest) = s.strip_prefix('&') else {
+        return s;
+    };
+    let mut rest = rest.trim_start();
+    if rest.starts_with('\'') {
+        if let Some(idx) = rest.find(char::is_whitespace) {
+            rest = rest[idx..].trim_start();
+        }
+    }
+    rest.strip_prefix("mut ")
+        .map(str::trim_start)
+        .unwrap_or(rest)
+}
+
 /// Inject cross-file return types into a single file's `type_map`.
 ///
 /// For each call-assignment in the file (`const x = callee()`), looks up the
@@ -1761,9 +1835,36 @@ fn inject_return_types_for_file(
             continue;
         }
 
-        let found = match &ca.receiver_type_name {
-            Some(receiver) => global_return_types.get(&format!("{receiver}.{}", ca.callee_name)),
-            None => imported_map.get(&ca.callee_name).and_then(|from| {
+        // A method call whose receiver's type wasn't known at extraction time
+        // (`ca.receiver_var_name`) may have just been resolved by an earlier
+        // call-assignment in this same file — e.g. `service` in `let service =
+        // build_service(); ... service.get_user(1)` only becomes typed once
+        // `service`'s own cross-file return type is injected. Retry against the
+        // receiver's now-resolved type (its original same-file type_map entry,
+        // or an injection already added earlier in this loop) before falling
+        // back to a bare global-function lookup (#2214).
+        let receiver_resolved_type = ca.receiver_var_name.as_ref().and_then(|receiver_var| {
+            symbols
+                .type_map
+                .iter()
+                .find(|t| &t.name == receiver_var)
+                .map(|t| t.type_name.as_str())
+                .or_else(|| {
+                    injections
+                        .iter()
+                        .find(|t| &t.name == receiver_var)
+                        .map(|t| t.type_name.as_str())
+                })
+        });
+
+        let found = match (&ca.receiver_type_name, receiver_resolved_type) {
+            (Some(receiver), _) => {
+                global_return_types.get(&format!("{receiver}.{}", ca.callee_name))
+            }
+            (None, Some(receiver_type)) => {
+                global_return_types.get(&format!("{receiver_type}.{}", ca.callee_name))
+            }
+            (None, None) => imported_map.get(&ca.callee_name).and_then(|from| {
                 // The return-type index for the imported file is keyed by the
                 // function's own declared name — use the original (pre-rename)
                 // name when the callee is a renamed import binding (#1730).
@@ -1777,11 +1878,36 @@ fn inject_return_types_for_file(
         };
 
         if let Some((type_name, confidence)) = found {
+            // `ca.unwrap_depth` means the binding came from unwrapping that many
+            // layers of a refutable `Some(x)`/`Ok(x)` pattern — `Some(Some(x))`
+            // is 2, not 1. The callee's declared return type is itself wrapped
+            // that many layers deep (`Option<Option<T>>` for depth 2), and `x`'s
+            // real type is what's left after unwrapping all of them, not the
+            // wrapper. If a layer turns out not to actually be a generic
+            // Option/Result (a mismatch between the pattern and the callee's
+            // real signature), decline to inject rather than propagate a
+            // half-unwrapped type as if it were `x`'s type (#2214).
+            let mut current = type_name.as_str();
+            let mut unwrap_failed = false;
+            for _ in 0..ca.unwrap_depth {
+                match unwrap_option_result_type(current) {
+                    Some(inner) => current = inner,
+                    None => {
+                        unwrap_failed = true;
+                        break;
+                    }
+                }
+            }
+            if unwrap_failed {
+                continue;
+            }
+            let resolved_type_name = current.to_string();
+
             let propagated = confidence - hop_penalty;
             if propagated > 0.0 {
                 injections.push(TypeMapEntry {
                     name: ca.var_name.clone(),
-                    type_name: type_name.clone(),
+                    type_name: resolved_type_name,
                     confidence: propagated,
                 });
                 injected.insert(ca.var_name.clone());
@@ -2468,6 +2594,8 @@ mod tests {
                 var_name: "svc".to_string(),
                 callee_name: "buildService".to_string(),
                 receiver_type_name: None,
+                receiver_var_name: None,
+                unwrap_depth: 0,
             });
 
         let mut file_symbols = BTreeMap::new();
@@ -2504,6 +2632,8 @@ mod tests {
                 var_name: "w".to_string(),
                 callee_name: "create".to_string(),
                 receiver_type_name: Some("Factory".to_string()),
+                receiver_var_name: None,
+                unwrap_depth: 0,
             });
 
         let mut file_symbols = BTreeMap::new();
@@ -2522,6 +2652,110 @@ mod tests {
             .expect("w seeded");
         assert_eq!(seeded.type_name, "Widget");
         assert!((seeded.confidence - 0.9).abs() < 1e-9);
+    }
+
+    // ── if-let/while-let Option/Result unwrap + two-hop receiver resolution (#2214) ─
+
+    #[test]
+    fn unwraps_option_return_type_for_if_let_bound_call_assignment() {
+        let mut service = FileSymbols::new("service.rs".to_string());
+        service
+            .return_type_map
+            .push(entry("UserService.get_user", "Option<User>", 1.0));
+
+        let mut main = FileSymbols::new("main.rs".to_string());
+        // `service`'s own type is already resolved locally — simulating that its
+        // cross-file call-assignment was injected earlier in this same pass.
+        main.type_map.push(entry("service", "UserService", 0.9));
+        main.call_assignments
+            .push(crate::types::NativeCallAssignment {
+                var_name: "user".to_string(),
+                callee_name: "get_user".to_string(),
+                receiver_type_name: None,
+                receiver_var_name: Some("service".to_string()),
+                unwrap_depth: 1,
+            });
+
+        let mut file_symbols = BTreeMap::new();
+        file_symbols.insert("service.rs".to_string(), service);
+        file_symbols.insert("main.rs".to_string(), main);
+        let import_ctx = make_import_ctx(&file_symbols);
+
+        let conn = Connection::open_in_memory().unwrap();
+        propagate_return_types_across_files(&conn, &mut file_symbols, &import_ctx);
+
+        let main = &file_symbols["main.rs"];
+        let seeded = main
+            .type_map
+            .iter()
+            .find(|t| t.name == "user")
+            .expect("user should be seeded, unwrapped from Option<User>");
+        assert_eq!(seeded.type_name, "User");
+    }
+
+    #[test]
+    fn declines_to_inject_when_unwrap_generic_but_declared_type_is_not_generic() {
+        let mut service = FileSymbols::new("service.rs".to_string());
+        // Declared type doesn't actually match the if-let's Some/Ok assumption —
+        // a mismatch between the pattern and the callee's real signature.
+        service
+            .return_type_map
+            .push(entry("UserService.get_user", "User", 1.0));
+
+        let mut main = FileSymbols::new("main.rs".to_string());
+        main.type_map.push(entry("service", "UserService", 0.9));
+        main.call_assignments
+            .push(crate::types::NativeCallAssignment {
+                var_name: "user".to_string(),
+                callee_name: "get_user".to_string(),
+                receiver_type_name: None,
+                receiver_var_name: Some("service".to_string()),
+                unwrap_depth: 1,
+            });
+
+        let mut file_symbols = BTreeMap::new();
+        file_symbols.insert("service.rs".to_string(), service);
+        file_symbols.insert("main.rs".to_string(), main);
+        let import_ctx = make_import_ctx(&file_symbols);
+
+        let conn = Connection::open_in_memory().unwrap();
+        propagate_return_types_across_files(&conn, &mut file_symbols, &import_ctx);
+
+        let main = &file_symbols["main.rs"];
+        assert!(main.type_map.iter().all(|t| t.name != "user"));
+    }
+
+    #[test]
+    fn resolves_receiver_var_name_via_type_map_when_receiver_type_name_absent() {
+        let mut repo = FileSymbols::new("repo.rs".to_string());
+        repo.return_type_map
+            .push(entry("UserRepository.find_by_id", "User", 1.0));
+
+        let mut main = FileSymbols::new("main.rs".to_string());
+        main.type_map.push(entry("repo", "UserRepository", 1.0));
+        main.call_assignments
+            .push(crate::types::NativeCallAssignment {
+                var_name: "user".to_string(),
+                callee_name: "find_by_id".to_string(),
+                receiver_type_name: None,
+                receiver_var_name: Some("repo".to_string()),
+                unwrap_depth: 0,
+            });
+
+        let mut file_symbols = BTreeMap::new();
+        file_symbols.insert("repo.rs".to_string(), repo);
+        file_symbols.insert("main.rs".to_string(), main);
+        let import_ctx = make_import_ctx(&file_symbols);
+
+        let conn = Connection::open_in_memory().unwrap();
+        propagate_return_types_across_files(&conn, &mut file_symbols, &import_ctx);
+
+        let main = &file_symbols["main.rs"];
+        let seeded =
+            main.type_map.iter().find(|t| t.name == "user").expect(
+                "user should resolve via receiver_var_name -> type_map -> global_return_types",
+            );
+        assert_eq!(seeded.type_name, "User");
     }
 
     #[test]
@@ -2544,6 +2778,8 @@ mod tests {
                 var_name: "svc".to_string(),
                 callee_name: "buildService".to_string(),
                 receiver_type_name: None,
+                receiver_var_name: None,
+                unwrap_depth: 0,
             });
 
         let mut file_symbols = BTreeMap::new();
@@ -2562,5 +2798,155 @@ mod tests {
             "no duplicate entry should be injected"
         );
         assert_eq!(svc_entries[0].type_name, "LocalOverride");
+    }
+
+    #[test]
+    fn unwrap_option_result_type_unwraps_option() {
+        assert_eq!(unwrap_option_result_type("Option<User>"), Some("User"));
+    }
+
+    #[test]
+    fn unwrap_option_result_type_unwraps_result_taking_the_first_type_argument() {
+        assert_eq!(
+            unwrap_option_result_type("Result<User, String>"),
+            Some("User")
+        );
+    }
+
+    #[test]
+    fn unwrap_option_result_type_normalizes_an_ordinary_generic_inner_type_to_its_bare_name() {
+        // Result<Vec<User>, String>'s inner type argument is itself a generic —
+        // the unwrapped type must be bare "Vec", matching how a direct
+        // `let x: Vec<User> = ...` annotation would type it, not the
+        // parameterized "Vec<User>" (Greptile review, PR #2371).
+        assert_eq!(
+            unwrap_option_result_type("Result<Vec<User>, String>"),
+            Some("Vec")
+        );
+    }
+
+    #[test]
+    fn unwrap_option_result_type_keeps_a_nested_option_result_inner_type_parameterized() {
+        // if-let only strips one layer — Option<Option<User>>'s inner type
+        // argument is itself Option/Result, so it keeps its own type argument
+        // (needed for a later unwrap), unlike an ordinary generic.
+        assert_eq!(
+            unwrap_option_result_type("Option<Option<User>>"),
+            Some("Option<User>")
+        );
+    }
+
+    #[test]
+    fn unwrap_option_result_type_strips_a_reference_sigil() {
+        // Option<&User>'s bound value's real receiver type is User, not the
+        // reference syntax around it (Greptile review, PR #2371).
+        assert_eq!(unwrap_option_result_type("Option<&User>"), Some("User"));
+    }
+
+    #[test]
+    fn end_to_end_injects_bare_nominal_type_for_a_reference_wrapped_option() {
+        let mut service = FileSymbols::new("service.rs".to_string());
+        service
+            .return_type_map
+            .push(entry("UserService.get_user_ref", "Option<&User>", 1.0));
+
+        let mut main = FileSymbols::new("main.rs".to_string());
+        main.type_map.push(entry("service", "UserService", 0.9));
+        main.call_assignments
+            .push(crate::types::NativeCallAssignment {
+                var_name: "user".to_string(),
+                callee_name: "get_user_ref".to_string(),
+                receiver_type_name: None,
+                receiver_var_name: Some("service".to_string()),
+                unwrap_depth: 1,
+            });
+
+        let mut file_symbols = BTreeMap::new();
+        file_symbols.insert("service.rs".to_string(), service);
+        file_symbols.insert("main.rs".to_string(), main);
+        let import_ctx = make_import_ctx(&file_symbols);
+
+        let conn = Connection::open_in_memory().unwrap();
+        propagate_return_types_across_files(&conn, &mut file_symbols, &import_ctx);
+
+        let main = &file_symbols["main.rs"];
+        let seeded = main
+            .type_map
+            .iter()
+            .find(|t| t.name == "user")
+            .expect("user should be seeded, unwrapped from Option<&User> to bare User");
+        assert_eq!(seeded.type_name, "User");
+    }
+
+    #[test]
+    fn end_to_end_injects_correctly_for_a_doubly_nested_option_at_depth_two() {
+        // `if let Some(Some(user)) = get_nested_option()` — the callee's
+        // Option<Option<User>> return must be unwrapped twice, not once
+        // (Greptile review, PR #2371).
+        let mut service = FileSymbols::new("service.js".to_string());
+        service
+            .return_type_map
+            .push(entry("get_nested_option", "Option<Option<User>>", 1.0));
+
+        let mut driver = FileSymbols::new("driver.js".to_string());
+        driver.imports.push(Import::new(
+            "./service.js".to_string(),
+            vec!["get_nested_option".to_string()],
+            1,
+        ));
+        driver
+            .call_assignments
+            .push(crate::types::NativeCallAssignment {
+                var_name: "user".to_string(),
+                callee_name: "get_nested_option".to_string(),
+                receiver_type_name: None,
+                receiver_var_name: None,
+                unwrap_depth: 2,
+            });
+
+        let mut file_symbols = BTreeMap::new();
+        file_symbols.insert("service.js".to_string(), service);
+        file_symbols.insert("driver.js".to_string(), driver);
+        let import_ctx = make_import_ctx(&file_symbols);
+
+        let conn = Connection::open_in_memory().unwrap();
+        propagate_return_types_across_files(&conn, &mut file_symbols, &import_ctx);
+
+        let driver = &file_symbols["driver.js"];
+        let seeded = driver
+            .type_map
+            .iter()
+            .find(|t| t.name == "user")
+            .expect("user should be seeded, unwrapped twice from Option<Option<User>> to User");
+        assert_eq!(seeded.type_name, "User");
+    }
+
+    #[test]
+    fn unwrap_option_result_type_strips_a_mut_reference_with_a_lifetime() {
+        assert_eq!(
+            unwrap_option_result_type("Result<&'a mut User, String>"),
+            Some("User")
+        );
+    }
+
+    #[test]
+    fn unwrap_option_result_type_returns_none_for_a_non_generic_type() {
+        assert_eq!(unwrap_option_result_type("User"), None);
+    }
+
+    #[test]
+    fn unwrap_option_result_type_returns_none_for_an_unrelated_generic() {
+        assert_eq!(unwrap_option_result_type("Vec<User>"), None);
+    }
+
+    #[test]
+    fn unwrap_option_result_type_unwraps_a_fully_qualified_option() {
+        // `fn f() -> std::option::Option<User>` is valid Rust and just as common
+        // as the bare `Option<User>` spelling in no-std or disambiguating code
+        // (Greptile review, PR #2371).
+        assert_eq!(
+            unwrap_option_result_type("std::option::Option<User>"),
+            Some("User")
+        );
     }
 }
