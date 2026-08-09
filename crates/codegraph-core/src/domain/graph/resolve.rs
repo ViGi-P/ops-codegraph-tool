@@ -10,17 +10,23 @@ use crate::types::{ImportResolutionInput, PathAliases, ResolvedImport, Workspace
 /// Check file existence using known_files set when available, falling back to FS.
 ///
 /// When `known_files` is provided, candidates may be absolute paths while
-/// the set contains relative paths (normalized with forward slashes).
-/// We try both the raw path and the root-relative version so extension
-/// probing works regardless of the path format (#804).
+/// the set contains relative paths (normalized with forward slashes) — or,
+/// via `normalize_known_files`, absolute paths that are themselves already
+/// forward-slash normalized. `path` is normalized here (not just at the
+/// handful of Rust crate-path call sites that already did their own
+/// `.replace('\\', "/")`) so every caller — including the alias/exports/
+/// js-to-ts-remap resolvers, which pass their candidate through unmodified —
+/// gets a forward-slash-consistent comparison on Windows. We try both the
+/// normalized path and the root-relative version so extension probing works
+/// regardless of the path format (#804, #2216).
 fn file_exists(path: &str, known: Option<&HashSet<String>>, root_dir: &str) -> bool {
     match known {
         Some(set) => {
-            if set.contains(path) {
+            let normalized = path.replace('\\', "/");
+            if set.contains(&normalized) {
                 return true;
             }
             // Candidates are often absolute; known_files are relative — try stripping root
-            let normalized = path.replace('\\', "/");
             let root_normalized = root_dir.replace('\\', "/");
             let root_prefix = if root_normalized.ends_with('/') {
                 root_normalized
@@ -489,6 +495,23 @@ fn is_workspace_resolved(path: &str) -> bool {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .contains(path)
+}
+
+/// Normalize each `known_files` entry to forward slashes.
+///
+/// Callers across the NAPI boundary (`resolve_import`/`resolve_imports` in
+/// `lib.rs`) may pass either the root-relative form (as stored in the
+/// `nodes` table) or the absolute form (as JS's `ctx.allFiles` /
+/// `getKnownFilesForIncremental` populate it) — and on Windows, an absolute
+/// path arrives with backslashes while `file_exists` always forward-slash
+/// normalizes the *candidate* paths it checks against this set before
+/// comparing. Without normalizing the set's own entries the same way, an
+/// absolute Windows candidate could never exact-match a set built from raw,
+/// backslash-separated JS strings — the in-process pipeline caller
+/// (`resolve_pipeline_imports`) doesn't need this because it builds
+/// `known_files` from `relative_path()`, which already normalizes.
+pub fn normalize_known_files(files: Vec<String>) -> HashSet<String> {
+    files.into_iter().map(|f| f.replace('\\', "/")).collect()
 }
 
 /// Resolve a single import path, mirroring `resolveImportPath()` in builder.js.
@@ -1176,6 +1199,27 @@ mod tests {
     }
 
     #[test]
+    fn file_exists_matches_unnormalized_backslash_candidate_against_absolute_known_files() {
+        // Regression test for #2216: on Windows, callers like
+        // resolve_via_alias build their candidate via PathBuf::display()
+        // without normalizing it — and known_files may be the absolute
+        // convention (ctx.allFiles / getKnownFilesForIncremental, normalized
+        // via normalize_known_files). Simulating that with a literal
+        // backslash-separated candidate string, on a Set already containing
+        // the forward-slash form, must still match — file_exists normalizes
+        // the query path itself rather than relying on the caller to have
+        // done so.
+        let mut known = HashSet::new();
+        known.insert("C:/project/src/index.ts".to_string());
+
+        assert!(file_exists(
+            "C:\\project\\src\\index.ts",
+            Some(&known),
+            "C:/project"
+        ));
+    }
+
+    #[test]
     fn resolve_with_known_files_probes_extensions() {
         // Regression test for #804: when from_file is absolute and known_files
         // are relative, extension probing should still resolve ./bar to src/bar.ts
@@ -1644,6 +1688,30 @@ mod tests {
         .iter()
         .map(|s| s.to_string())
         .collect()
+    }
+
+    #[test]
+    fn normalize_known_files_converts_backslashes_to_forward_slashes() {
+        // Regression test for #2216: on Windows, JS callers across the NAPI
+        // boundary (ctx.allFiles / getKnownFilesForIncremental) pass absolute
+        // paths with backslashes, while file_exists always forward-slash
+        // normalizes the candidate it checks against this set — without this
+        // normalization those two could never exact-match.
+        let input = vec![
+            "C:\\project\\main.rs".to_string(),
+            "C:\\project\\service\\nested.rs".to_string(),
+        ];
+        let normalized = normalize_known_files(input);
+        assert!(normalized.contains("C:/project/main.rs"));
+        assert!(normalized.contains("C:/project/service/nested.rs"));
+    }
+
+    #[test]
+    fn normalize_known_files_is_a_no_op_for_already_forward_slash_paths() {
+        let input = vec!["/project/main.rs".to_string(), "service.rs".to_string()];
+        let normalized = normalize_known_files(input);
+        assert!(normalized.contains("/project/main.rs"));
+        assert!(normalized.contains("service.rs"));
     }
 
     #[test]

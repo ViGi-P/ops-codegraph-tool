@@ -212,6 +212,31 @@ function findReverseDeps(db: BetterSqlite3Database, relPath: string): string[] {
   return (findRevDepsStmt.all(relPath, relPath) as Array<{ file: string }>).map((r) => r.file);
 }
 
+/**
+ * Project-wide known-files list for `resolveImportPath`'s Rust `crate::`/
+ * `self::`/`super::` resolution (#2007) — absolute paths, matching
+ * `ctx.allFiles`'s format on the full-build path (`resolve-imports.ts`).
+ * The full-build path already has this in memory before import resolution
+ * runs; a single-file incremental rebuild has no such list, so this queries
+ * it from the DB once per `rebuildFile` call and threads it down to every
+ * `resolveImportPath` call site in this file (#2216) — without it, a
+ * `crate::`/`self::`/`super::` import in a file processed via `codegraph
+ * watch` silently fails to resolve even though the same file would resolve
+ * correctly in a full rebuild.
+ */
+function getKnownFilesForIncremental(db: BetterSqlite3Database, rootDir: string): string[] {
+  const rows = db.prepare("SELECT DISTINCT file FROM nodes WHERE kind = 'file'").all() as Array<{
+    file: string;
+  }>;
+  // `r.file` is stored forward-slash-normalized (cross-platform DB
+  // consistency) even for a nested relative path like "service/nested.rs".
+  // Joining it into rootDir in one path.join() call would leave those
+  // internal forward slashes intact on Windows, producing a mixed-separator
+  // absolute path that can't exact-match a purely-backslash candidate built
+  // elsewhere — so join one segment at a time instead.
+  return rows.map((r) => path.join(rootDir, ...r.file.split('/')));
+}
+
 function deleteOutgoingEdges(db: BetterSqlite3Database, relPath: string): void {
   const { deleteDataflowByCallEdgeStmt, deleteOutEdgesStmt } = getRevDepStmts(db);
   // Clear any inter-procedural dataflow rows that reference outgoing edges via
@@ -247,6 +272,8 @@ function rebuildReverseDepEdges(
   symbols: ExtractorOutput,
   stmts: IncrementalStmts,
   skipBarrel: boolean,
+  // #2216: see getKnownFilesForIncremental's doc comment.
+  knownFiles: readonly string[],
   // #2077: forwarded to buildCallEdges — see its own param doc.
   maxIterations?: number,
 ): number {
@@ -255,7 +282,7 @@ function rebuildReverseDepEdges(
 
   // #1967: keep this reverse-dep's persisted barrel rename table current if
   // it's itself a barrel — independent of the edges rebuilt below.
-  persistReexportRenamesForFile(db, depRelPath, symbols, rootDir);
+  persistReexportRenamesForFile(db, depRelPath, symbols, rootDir, knownFiles);
 
   const aliases: PathAliases = { baseUrl: null, paths: {} };
   let edgesAdded = buildContainmentEdges(db, stmts, depRelPath, symbols);
@@ -268,6 +295,7 @@ function rebuildReverseDepEdges(
     fileNodeRow.id,
     aliases,
     skipBarrel ? null : db,
+    knownFiles,
   );
   const { importedNames, importedOriginalNames } = buildImportedNamesMap(
     symbols,
@@ -275,6 +303,7 @@ function rebuildReverseDepEdges(
     depRelPath,
     aliases,
     db,
+    knownFiles,
   );
   edgesAdded += buildCallEdges(
     db,
@@ -519,6 +548,7 @@ function persistReexportRenamesForFile(
   relPath: string,
   symbols: ExtractorOutput,
   rootDir: string,
+  knownFiles: readonly string[],
 ): void {
   const { renameDeleteStmt, renameInsertStmt } = getBarrelStmts(db);
   renameDeleteStmt.run(relPath);
@@ -539,7 +569,13 @@ function persistReexportRenamesForFile(
   const aliases = loadPathAliases(rootDir);
   for (const imp of reexports) {
     if (!imp.renamedImports?.length) continue;
-    const source = resolveImportPath(path.join(rootDir, relPath), imp.source, rootDir, aliases);
+    const source = resolveImportPath(
+      path.join(rootDir, relPath),
+      imp.source,
+      rootDir,
+      aliases,
+      knownFiles,
+    );
     for (const rename of imp.renamedImports) {
       renameInsertStmt.run(relPath, rename.local, rename.imported, source);
     }
@@ -715,8 +751,15 @@ function emitEdgesForImport(
   rootDir: string,
   aliases: PathAliases,
   db: BetterSqlite3Database | null,
+  knownFiles: readonly string[],
 ): number {
-  const resolvedPath = resolveImportPath(path.join(rootDir, relPath), imp.source, rootDir, aliases);
+  const resolvedPath = resolveImportPath(
+    path.join(rootDir, relPath),
+    imp.source,
+    rootDir,
+    aliases,
+    knownFiles,
+  );
   const targetRow = stmts.getNodeId.get(resolvedPath, 'file', resolvedPath, 0);
   if (!targetRow) return 0;
 
@@ -761,10 +804,20 @@ function buildImportEdges(
   fileNodeId: number,
   aliases: PathAliases,
   db: BetterSqlite3Database | null,
+  knownFiles: readonly string[],
 ): number {
   let edgesAdded = 0;
   for (const imp of symbols.imports) {
-    edgesAdded += emitEdgesForImport(stmts, imp, fileNodeId, relPath, rootDir, aliases, db);
+    edgesAdded += emitEdgesForImport(
+      stmts,
+      imp,
+      fileNodeId,
+      relPath,
+      rootDir,
+      aliases,
+      db,
+      knownFiles,
+    );
   }
   return edgesAdded;
 }
@@ -783,6 +836,7 @@ function buildImportedNamesMap(
   relPath: string,
   aliases: PathAliases,
   db: BetterSqlite3Database,
+  knownFiles: readonly string[],
 ): { importedNames: Map<string, string>; importedOriginalNames: Map<string, string> } {
   const importedNames = new Map<string, string>();
   const importedOriginalNames = new Map<string, string>();
@@ -792,6 +846,7 @@ function buildImportedNamesMap(
       imp.source,
       rootDir,
       aliases,
+      knownFiles,
     );
     for (const { local, original } of importNamePairs(imp)) {
       // Mirror full-build's `buildImportedNamesMap`: follow barrel re-exports so
@@ -1613,23 +1668,36 @@ function rebuildEdgesForTargetFile(
   symbols: ExtractorOutput,
   fileNodeRow: { id: number },
   rootDir: string,
+  // #2216: project-wide known-files list, needed for Rust crate::/self::/
+  // super:: resolution (#2007) — see getKnownFilesForIncremental's doc comment.
+  knownFiles: readonly string[],
   // #2077: forwarded to buildCallEdges — see its own param doc.
   maxIterations?: number,
 ): number {
   // #1967: keep this file's persisted barrel rename table current if it's
   // itself a barrel — independent of the edges rebuilt below.
-  persistReexportRenamesForFile(db, relPath, symbols, rootDir);
+  persistReexportRenamesForFile(db, relPath, symbols, rootDir, knownFiles);
 
   const aliases: PathAliases = { baseUrl: null, paths: {} };
   let edgesAdded = buildContainmentEdges(db, stmts, relPath, symbols);
   edgesAdded += rebuildDirContainment(db, stmts, relPath);
-  edgesAdded += buildImportEdges(stmts, relPath, symbols, rootDir, fileNodeRow.id, aliases, db);
+  edgesAdded += buildImportEdges(
+    stmts,
+    relPath,
+    symbols,
+    rootDir,
+    fileNodeRow.id,
+    aliases,
+    db,
+    knownFiles,
+  );
   const { importedNames, importedOriginalNames } = buildImportedNamesMap(
     symbols,
     rootDir,
     relPath,
     aliases,
     db,
+    knownFiles,
   );
   edgesAdded += buildCallEdges(
     db,
@@ -1690,6 +1758,7 @@ function emitBarrelImportEdgesForReverseDeps(
   stmts: IncrementalStmts,
   depSymbols: Map<string, ExtractorOutput>,
   rootDir: string,
+  knownFiles: readonly string[],
 ): number {
   let edgesAdded = 0;
   for (const [depRelPath, symbols_] of depSymbols) {
@@ -1703,6 +1772,7 @@ function emitBarrelImportEdgesForReverseDeps(
         imp.source,
         rootDir,
         aliases_,
+        knownFiles,
       );
       edgesAdded += resolveBarrelImportEdges(db, stmts, fileNodeRow_.id, resolvedPath, imp);
     }
@@ -1726,6 +1796,8 @@ async function runReverseDepCascade(
   stmts: IncrementalStmts,
   engineOpts: EngineOpts,
   cache: unknown,
+  // #2216: see getKnownFilesForIncremental's doc comment.
+  knownFiles: readonly string[],
 ): Promise<{
   edgesAdded: number;
   reverseDepsEdgesBefore: number;
@@ -1750,11 +1822,12 @@ async function runReverseDepCascade(
       symbols_,
       stmts,
       true,
+      knownFiles,
       engineOpts.pointsToMaxIterations,
     );
   }
   // Pass 2: add barrel import edges (reexports edges now exist)
-  edgesAdded += emitBarrelImportEdgesForReverseDeps(db, stmts, depSymbols, rootDir);
+  edgesAdded += emitBarrelImportEdgesForReverseDeps(db, stmts, depSymbols, rootDir, knownFiles);
   return { edgesAdded, reverseDepsEdgesBefore, depSymbols };
 }
 
@@ -2107,6 +2180,12 @@ export async function rebuildFile(
       edgesBefore,
     };
 
+  // #2216: computed once per rebuild (this file's own node row is already
+  // inserted above, so it's included) and threaded through every
+  // resolveImportPath call below — see getKnownFilesForIncremental's doc
+  // comment for why a single-file incremental rebuild needs this at all.
+  const knownFiles = getKnownFilesForIncremental(db, rootDir);
+
   let edgesAdded = rebuildEdgesForTargetFile(
     db,
     stmts,
@@ -2114,13 +2193,14 @@ export async function rebuildFile(
     symbols,
     fileNodeRow,
     rootDir,
+    knownFiles,
     engineOpts.pointsToMaxIterations,
   );
   const {
     edgesAdded: cascadeEdges,
     reverseDepsEdgesBefore,
     depSymbols,
-  } = await runReverseDepCascade(db, rootDir, reverseDeps, stmts, engineOpts, cache);
+  } = await runReverseDepCascade(db, rootDir, reverseDeps, stmts, engineOpts, cache, knownFiles);
   edgesAdded += cascadeEdges;
 
   // Phase 8.5 CHA + RTA dispatch expansion post-pass (#1852) — runs after all
