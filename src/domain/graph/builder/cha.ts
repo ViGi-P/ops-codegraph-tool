@@ -354,19 +354,35 @@ export function resolveThisDispatch(
         // name, so `current` may be an unrelated class that merely shares a
         // name with the caller's real ancestor (issue #2062) — e.g. two
         // independent files each defining their own `Shape` class. Before
-        // accepting a cross-file match, check whether a class named
-        // `current` is ALSO declared in the caller's own file: if so, that
-        // same-file class IS the caller's real ancestor at this step (it
-        // simply doesn't define `methodName` — an implicit default
-        // constructor, for instance), so a same-named method from a
+        // accepting a cross-file match, check whether a HERITAGE-CAPABLE
+        // declaration named `current` is ALSO declared in the caller's own
+        // file: if so, that same-file declaration IS the caller's real
+        // ancestor reference at this step, so a same-named method from a
         // different file is a false match, not a legitimate inherited
-        // method. Keep walking instead of accepting it. Only accept the
-        // cross-file match when `current` is NOT declared anywhere in the
-        // caller's own file — a genuine cross-file heritage reference
-        // (e.g. `import { Base } from './base'; class Foo extends Base`).
+        // method. Keep walking instead of accepting it.
+        //
+        // "Heritage-capable" is RECEIVER_KINDS (class/struct/interface/etc.)
+        // *plus* a MODULE/CLASS-SCOPE `function` — a plain constructor
+        // FUNCTION (`function A() {}`) is exactly as legitimate an
+        // `extends`/`super()` target as a class is (functions have no
+        // `.constructor` method to find, by definition), and is just as
+        // disqualifying as a same-named class would be (issue #2238; a
+        // same-named plain function was wrongly treated as "not declared
+        // here" and fell through to an unrelated file's same-named class).
+        // It must NOT be widened further than that: an unrelated same-named
+        // local variable/parameter (Greptile finding on PR #2400) — nor a
+        // NESTED function declared inside some other, unrelated function or
+        // method body (a nested function can never be an `extends`/prototype
+        // target; second Greptile finding on the same PR) — has anything to
+        // do with the class hierarchy, and must not block a genuine
+        // cross-file heritage reference from resolving.
         const sameNameInCallerFile = lookup
           .byNameAndFile(current, callerFile)
-          .some((n) => RECEIVER_KINDS.has(n.kind ?? ''));
+          .some(
+            (n) =>
+              RECEIVER_KINDS.has(n.kind ?? '') ||
+              (n.kind === 'function' && !lookup.hasEnclosingCallable(callerFile, n.line, n.id)),
+          );
         if (!sameNameInCallerFile) return found;
         // `current` is a same-named collision: it's genuinely declared in
         // callerFile but a different, unrelated file's class of the same

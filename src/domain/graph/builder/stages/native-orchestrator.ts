@@ -1318,8 +1318,28 @@ function prepareCallerByLineStmt(db: BetterSqlite3Database) {
  * {@link prepareCallerByLineStmt} instead of `findCaller`'s per-file
  * `definitions` array) so it is intentionally left unimplemented.
  */
+/** Callable (function/method) span, for the containment check `hasEnclosingCallable` needs. */
+interface CallableSpan {
+  id: number;
+  line: number;
+  endLine: number | null;
+}
+
 function makePostNativeCallLookup(db: BetterSqlite3Database): CallNodeLookup {
   const findByNameStmt = db.prepare(`SELECT id, file, kind, line FROM nodes WHERE name = ?`);
+  // Loaded once per post-pass (not per resolveThisDispatch candidate) —
+  // querying per-candidate caused a 49%/166% full/incremental-build
+  // regression on the native benchmark (issue #2238 follow-up, Greptile
+  // finding on PR #2400). Mirrors build-edges.ts's ctx.callablesByFile.
+  const callablesByFile = new Map<string, CallableSpan[]>();
+  for (const row of db
+    .prepare(
+      `SELECT id, file, line, end_line AS endLine FROM nodes WHERE kind IN ('method', 'function')`,
+    )
+    .all() as Array<{ id: number; file: string; line: number; endLine: number | null }>) {
+    if (!callablesByFile.has(row.file)) callablesByFile.set(row.file, []);
+    callablesByFile.get(row.file)!.push({ id: row.id, line: row.line, endLine: row.endLine });
+  }
   return {
     byName: (name) => findByNameStmt.all(name) as Array<ResolvedCandidate>,
     byNameAndFile: (name, file) =>
@@ -1327,6 +1347,10 @@ function makePostNativeCallLookup(db: BetterSqlite3Database): CallNodeLookup {
     isBarrel: () => false,
     resolveBarrel: () => null,
     nodeId: () => undefined,
+    hasEnclosingCallable: (file, line, excludeId) =>
+      (callablesByFile.get(file) ?? []).some(
+        (c) => c.id !== excludeId && c.line <= line && (c.endLine == null || c.endLine >= line),
+      ),
   };
 }
 

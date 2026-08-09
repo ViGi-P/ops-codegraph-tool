@@ -17,12 +17,21 @@ import {
 } from '../../src/domain/graph/builder/cha.js';
 
 type Candidate = { id: number; file: string; kind: string; line: number };
+/** `{file}|{line}` entries describing a function/method's OWN enclosing
+ * callable, if any — the fixture-level equivalent of the DB's `end_line`
+ * containment query `hasEnclosingCallable` backs (issue #2238 follow-up,
+ * Greptile finding on PR #2400). */
+type EnclosingKey = string;
 
 /** Build a CallNodeLookup backed by two maps: qualified-name → candidates
- * (byName), and bare-name+file → candidates (byNameAndFile). */
+ * (byName), and bare-name+file → candidates (byNameAndFile). `nestedLines`
+ * lists `${file}|${line}` keys for candidates that are themselves nested
+ * inside another callable — `hasEnclosingCallable` returns true for exactly
+ * those. */
 function makeLookup(
   byNameMap: Record<string, Candidate[]>,
   byNameAndFileMap: Record<string, Record<string, Candidate[]>> = {},
+  nestedLines: ReadonlySet<EnclosingKey> = new Set(),
 ): CallNodeLookup {
   return {
     byName(name) {
@@ -39,6 +48,9 @@ function makeLookup(
     },
     nodeId() {
       return undefined;
+    },
+    hasEnclosingCallable(file, line) {
+      return nestedLines.has(`${file}|${line}`);
     },
   };
 }
@@ -94,6 +106,30 @@ describe('resolveThisDispatch — cross-file name collision (issue #2062)', () =
     expect(result).toEqual([]);
   });
 
+  it('does not resolve super() to an unrelated same-named class when the base is a plain constructor function (issue #2238)', () => {
+    // classes.js's own `A` is a plain function constructor (`function A(x)
+    // {...}`) — functions have no `.constructor` method to find, by
+    // definition. An unrelated file's `class A { constructor() {} }` must
+    // not be treated as the real ancestor just because the #2062 same-file
+    // check only looked for a class/interface/etc.-kind `A`, not a
+    // function-kind one.
+    const lookup = makeLookup(
+      { 'A.constructor': [{ id: 1, file: 'super.js', kind: 'method', line: 1 }] },
+      { A: { 'classes.js': [{ id: 2, file: 'classes.js', kind: 'function', line: 1 }] } },
+    );
+    const chaCtx = makeChaCtx({ D: 'A' }, { 'D|classes.js': 'A' });
+
+    const result = resolveThisDispatch(
+      'constructor',
+      'D.constructor',
+      'super',
+      chaCtx,
+      lookup,
+      'classes.js',
+    );
+    expect(result).toEqual([]);
+  });
+
   it('resolves a legitimate cross-file super call when the base class is not declared in the caller file at all', () => {
     // dog.ts imports Animal from base.ts — Animal is genuinely absent from
     // dog.ts, so the cross-file match is legitimate heritage, not a
@@ -101,6 +137,41 @@ describe('resolveThisDispatch — cross-file name collision (issue #2062)', () =
     const lookup = makeLookup(
       { 'Animal.speak': [{ id: 5, file: 'base.ts', kind: 'method', line: 5 }] },
       { Animal: {} },
+    );
+    const chaCtx = makeChaCtx({ Dog: 'Animal' }, { 'Dog|dog.ts': 'Animal' });
+
+    const result = resolveThisDispatch('speak', 'Dog.speak', 'super', chaCtx, lookup, 'dog.ts');
+    expect(result).toEqual([{ id: 5, file: 'base.ts', kind: 'method', line: 5 }]);
+  });
+
+  it('resolves a legitimate cross-file super call even when an unrelated local variable shares the base name (Greptile finding on PR #2400)', () => {
+    // dog.ts imports Animal from base.ts, and ALSO happens to declare an
+    // unrelated top-level `const Animal = ...` (or similarly non-heritage-
+    // capable local) for some other purpose. That local has nothing to do
+    // with the class hierarchy and must not be mistaken for the real
+    // heritage declaration — only a class/interface/etc.-kind or function
+    // -kind same-named local is disqualifying (issue #2238's own fix).
+    const lookup = makeLookup(
+      { 'Animal.speak': [{ id: 5, file: 'base.ts', kind: 'method', line: 5 }] },
+      { Animal: { 'dog.ts': [{ id: 9, file: 'dog.ts', kind: 'variable', line: 3 }] } },
+    );
+    const chaCtx = makeChaCtx({ Dog: 'Animal' }, { 'Dog|dog.ts': 'Animal' });
+
+    const result = resolveThisDispatch('speak', 'Dog.speak', 'super', chaCtx, lookup, 'dog.ts');
+    expect(result).toEqual([{ id: 5, file: 'base.ts', kind: 'method', line: 5 }]);
+  });
+
+  it('resolves a legitimate cross-file super call even when an unrelated NESTED function shares the base name (Greptile finding on PR #2400)', () => {
+    // dog.ts imports Animal from base.ts and extends it. Somewhere else in
+    // dog.ts, an unrelated method has its own local helper function also
+    // named `Animal` (pure coincidence, nothing to do with the class
+    // hierarchy). A nested function can never be a legitimate `extends`
+    // target — unlike issue #2238's plain TOP-LEVEL constructor function —
+    // so it must not block the real cross-file heritage resolution either.
+    const lookup = makeLookup(
+      { 'Animal.speak': [{ id: 5, file: 'base.ts', kind: 'method', line: 5 }] },
+      { Animal: { 'dog.ts': [{ id: 9, file: 'dog.ts', kind: 'function', line: 12 }] } },
+      new Set(['dog.ts|12']),
     );
     const chaCtx = makeChaCtx({ Dog: 'Animal' }, { 'Dog|dog.ts': 'Animal' });
 
