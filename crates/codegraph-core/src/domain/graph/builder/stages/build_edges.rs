@@ -5,6 +5,7 @@ use napi_derive::napi;
 use crate::domain::graph::builder::barrel_resolution::{self, BarrelContext, ReexportRef};
 use crate::domain::graph::builder::stages::import_edges::{import_name_pairs, ImportNameSource};
 use crate::domain::graph::resolve;
+use crate::graph::classifiers::roles::FRAMEWORK_ENTRY_PREFIXES;
 use crate::types::{
     ArrayCallbackBinding, ArrayElemBinding, FnRefBinding, ForOfBinding, ObjectPropBinding,
     ObjectRestParamBinding, ParamBinding, RenamedImport, SpreadArgBinding, ThisCallBinding,
@@ -943,6 +944,7 @@ fn emit_pts_alias_edges<'a>(
             alias_ctx.imported_original_names,
             alias_ctx.namespace_imports,
             &mut alias_confidence_override,
+            None,
         );
         sort_targets_by_confidence(
             &mut alias_targets,
@@ -1356,7 +1358,7 @@ fn process_file<'a>(
             }
         }
 
-        let (caller_id, caller_name) =
+        let (caller_id, caller_name, enclosing_class_hint) =
             find_enclosing_caller(&fc.defs_with_ids, call.line, fc.file_node_id);
         let is_dynamic = if call.dynamic.unwrap_or(false) {
             1u32
@@ -1380,6 +1382,7 @@ fn process_file<'a>(
             &fc.imported_original_names,
             &fc.namespace_imports,
             &mut confidence_override,
+            enclosing_class_hint,
         );
         // #1771/#1784: value-ref references (object-literal property values,
         // Lua builtin reassignment, `instanceof ClassName`) resolve against
@@ -1528,9 +1531,16 @@ fn is_top_level_binding_kind(kind: &str) -> bool {
     kind == "variable" || kind == "constant"
 }
 
+/// True when `name` is a synthetic framework-dispatch placeholder
+/// (`route:`/`event:`/`command:`-prefixed). Mirrors `isFrameworkEntryName`
+/// in call-resolver.ts.
+fn is_framework_entry_name(name: &str) -> bool {
+    FRAMEWORK_ENTRY_PREFIXES.iter().any(|p| name.starts_with(p))
+}
+
 /// Find the narrowest enclosing definition for a call at the given line.
 ///
-/// Two-pass strategy (mirrors `findCaller` in call-resolver.ts):
+/// Two-pass strategy:
 ///   Pass 1 — narrowest enclosing function/method.  Local variable declarations
 ///             inside a function body must not shadow the enclosing function.
 ///   Pass 2 — widest (outermost) enclosing variable/constant binding.  Used as
@@ -1550,13 +1560,25 @@ fn is_top_level_binding_kind(kind: &str) -> bool {
 /// Names with angle brackets (e.g. `B.<static:36:2>`) are synthetic static-block
 /// nodes excluded from the bare-preference rule.
 ///
-/// Returns `(caller_id, caller_name)` — `caller_name` is `""` when the call
-/// falls back to file scope.
+/// Returns `(caller_id, caller_name, enclosing_class_hint)` — `caller_name`
+/// is `""` when the call falls back to file scope. `enclosing_class_hint`
+/// (issue #2259) is set ONLY when the attributed caller is itself a
+/// synthetic framework-dispatch placeholder (`route:`/`event:`/`command:`-
+/// prefixed) — such a placeholder has no class/`this` context of its own
+/// (e.g. `event:${eventName}` for an EventEmitter `.on('event', callback)`
+/// registration, when that callback is lexically nested inside a real class
+/// method: `w.on('message', (msg) => this.onMessage(msg))`), so
+/// `this.onMessage` could never resolve using ONLY the caller's own name.
+/// The hint supplies the nearest REAL enclosing method's class as a
+/// resolution-only fallback (see `find_enclosing_class_hint`) — it does NOT
+/// change which node the call's edge is sourced from, so flow/sequence
+/// traversal starting from the synthetic entry point still sees the
+/// callback's own calls (Greptile review, PR #2444).
 fn find_enclosing_caller<'a>(
     defs: &[DefWithId<'a>],
     call_line: u32,
     file_node_id: u32,
-) -> (u32, &'a str) {
+) -> (u32, &'a str, Option<&'a str>) {
     let mut fn_caller_id: Option<u32> = None;
     let mut fn_caller_name = "";
     let mut fn_caller_span = u32::MAX;
@@ -1608,12 +1630,49 @@ fn find_enclosing_caller<'a>(
 
     // Prefer function/method over variable/constant binding.
     if let Some(id) = fn_caller_id {
-        return (id, fn_caller_name);
+        let enclosing_class_hint = if is_framework_entry_name(fn_caller_name) {
+            find_enclosing_class_hint(defs, call_line)
+        } else {
+            None
+        };
+        return (id, fn_caller_name, enclosing_class_hint);
     }
     if let Some(id) = var_caller_id {
-        return (id, var_caller_name);
+        return (id, var_caller_name, None);
     }
-    (file_node_id, "")
+    (file_node_id, "", None)
+}
+
+/// Find the class context of the nearest enclosing REAL (non-synthetic)
+/// method for `call_line`, for use ONLY as a `this`/`self`/`super`
+/// resolution fallback — see `find_enclosing_caller`'s doc comment. Picks
+/// the NARROWEST enclosing real method (like `find_enclosing_caller`
+/// itself), so a callback nested inside nested classes/methods resolves
+/// against the innermost one — the correct `this` binding at that point.
+/// Mirrors `findEnclosingClassHint` in call-resolver.ts.
+fn find_enclosing_class_hint<'a>(defs: &[DefWithId<'a>], call_line: u32) -> Option<&'a str> {
+    let mut best: Option<&'a str> = None;
+    let mut best_span = u32::MAX;
+    for def in defs {
+        if def.kind != "method" || is_framework_entry_name(def.name) {
+            continue;
+        }
+        if def.line > call_line || call_line > def.end_line {
+            continue;
+        }
+        let Some(dot_idx) = def.name.rfind('.') else {
+            continue;
+        };
+        if dot_idx == 0 {
+            continue;
+        }
+        let span = def.end_line.saturating_sub(def.line);
+        if span < best_span {
+            best = Some(&def.name[..dot_idx]);
+            best_span = span;
+        }
+    }
+    best
 }
 
 /// Step 2 of the scoped (this/self/super or no-receiver) fallback: exact global
@@ -1767,6 +1826,7 @@ fn resolve_call_targets<'a>(
     imported_original_names: &HashMap<&str, &str>,
     namespace_imports: &HashMap<&str, &str>,
     confidence_override: &mut Option<f64>,
+    enclosing_class_hint: Option<&str>,
 ) -> Vec<&'a NodeInfo> {
     let targets = resolve_call_targets_core(
         ctx,
@@ -1779,6 +1839,7 @@ fn resolve_call_targets<'a>(
         imported_original_names,
         namespace_imports,
         confidence_override,
+        enclosing_class_hint,
     );
     if call.receiver.is_some() {
         return targets;
@@ -1828,6 +1889,7 @@ fn resolve_call_targets_core<'a>(
     imported_original_names: &HashMap<&str, &str>,
     namespace_imports: &HashMap<&str, &str>,
     confidence_override: &mut Option<f64>,
+    enclosing_class_hint: Option<&str>,
 ) -> Vec<&'a NodeInfo> {
     // Flagged dynamic calls use synthetic names like "<dynamic:eval>". Short-circuit
     // so they never accidentally match a real symbol via name lookup.
@@ -2346,9 +2408,18 @@ fn resolve_call_targets_core<'a>(
         // binding. Skip the same-class fallback for bare calls in those languages to prevent
         // false positives (e.g. `flush()` inside `Processor.run` must not resolve to
         // `Processor.flush`). this/self/super calls are unaffected.
+        //
+        // `enclosing_class_hint` (issue #2259) is consulted ONLY when `caller_name` itself has
+        // no dot to derive a class from — e.g. the caller is a synthetic framework-dispatch
+        // placeholder (`event:${event_name}` for an EventEmitter `.on('event', callback)`
+        // registration; see `find_enclosing_class_hint`) with no class context of its own, even
+        // though the callback is lexically nested inside a real class method. The callback's
+        // calls-edge still sources from the synthetic placeholder unchanged (so flow/sequence
+        // traversal starting from that entry point keeps working) — this hint only supplies the
+        // class needed to resolve `this`/`self` here.
         let is_bare_call = call.receiver.is_none();
         if !caller_name.is_empty() && !(is_bare_call && is_module_scoped_language(rel_path)) {
-            if let Some(dot_idx) = caller_name.rfind('.') {
+            let class_prefix = if let Some(dot_idx) = caller_name.rfind('.') {
                 // Extract only the segment immediately before the method name so that
                 // 'Namespace.ClassName.method' yields 'ClassName', not 'Namespace.ClassName'.
                 // Symbols are stored under their bare class name, not their qualified path.
@@ -2356,7 +2427,11 @@ fn resolve_call_targets_core<'a>(
                     .rfind('.')
                     .map(|p| p + 1)
                     .unwrap_or(0);
-                let class_prefix = &caller_name[seg_start..dot_idx];
+                Some(&caller_name[seg_start..dot_idx])
+            } else {
+                enclosing_class_hint
+            };
+            if let Some(class_prefix) = class_prefix {
                 let qualified = format!("{}.{}", class_prefix, call.name);
                 let class_scoped: Vec<&NodeInfo> = ctx
                     .nodes_by_name
