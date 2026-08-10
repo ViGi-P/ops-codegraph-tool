@@ -938,6 +938,36 @@ export interface ExtractorOutput {
    */
   definePropertyReceivers?: Map<string, string>;
   /**
+   * Table names (issue #2260) confirmed to have LOCAL computed-invocation
+   * evidence: `const handler = TABLE[computedExpr]; ...; handler(...)` —
+   * `TABLE`'s name is recorded here only when the declared variable
+   * (`handler`) is later found as the callee of a call expression in its
+   * own enclosing block (mirroring #2257's local, position-scoped liveness
+   * check — see `hasLaterCallInEnclosingBlock` in extractors/javascript.ts).
+   *
+   * Deliberately NOT keyed on the intermediate variable's name (`handler`):
+   * that's a generic local identifier that collides across unrelated
+   * functions/files far more often than a dispatch-table's own constant
+   * name does — the same reasoning #2257 used to reject a global,
+   * name-only liveness check for local variables. Keying on the TABLE name
+   * is still not enough on its own, though (Greptile review, PR #2445): two
+   * unrelated files — or two different functions in the same file — can
+   * each declare their own same-named table. The consumer
+   * (`build-edges.ts`/`build_edges.rs`) scopes evidence by file, and each
+   * entry here already carries a `#${startLine}` suffix identifying its
+   * enclosing function when the table is function-scoped, bare when it's
+   * module-scoped (see `findEnclosingTableName`/`findConsumerTableScopeLine`
+   * in extractors/javascript.ts) — so aggregating these strings graph-wide
+   * is safe once file+scope qualification is applied on lookup.
+   *
+   * Consumed alongside `invokedPropertyNames` as an alternate liveness
+   * pathway for a `dynamicKind: 'value-ref'` Call whose `receiver` (the
+   * table name, set by `collectObjectLiteralValueRefCall`) matches an
+   * entry here — extending the #1895 dot-property mechanism to the
+   * computed/bracket-access dispatch-table idiom.
+   */
+  computedDispatchTableEvidence?: readonly string[];
+  /**
    * CJS require bindings from `const { X, Y } = require('./path')` patterns.
    * Used by buildImportedNamesMap to classify X and Y as import artifacts so
    * receiver-edge resolution falls back to the global class lookup rather than

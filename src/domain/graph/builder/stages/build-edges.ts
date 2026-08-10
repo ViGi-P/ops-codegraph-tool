@@ -134,6 +134,8 @@ interface NativeFileEntry {
   arrayCallbackBindings?: ArrayCallbackBinding[];
   objectRestParamBindings?: ObjectRestParamBinding[];
   objectPropBindings?: ObjectPropBinding[];
+  /** Issue #2260: table names with confirmed computed-access invocation evidence. */
+  computedDispatchTableEvidence?: string[];
 }
 
 /** Shape returned by native buildCallEdges. */
@@ -846,6 +848,9 @@ function buildNativeFileEntry(
       ? symbols.objectRestParamBindings
       : undefined,
     objectPropBindings: symbols.objectPropBindings?.length ? symbols.objectPropBindings : undefined,
+    computedDispatchTableEvidence: symbols.computedDispatchTableEvidence?.length
+      ? [...symbols.computedDispatchTableEvidence]
+      : undefined,
   };
 }
 
@@ -1337,6 +1342,19 @@ function persistReturnTypes(ctx: PipelineContext): void {
 
 // ── Call edges (JS fallback) ────────────────────────────────────────────
 
+/**
+ * Scope key for #2260's computed-dispatch-table evidence set:
+ * `${file}::${tableName}`. A bare table name would let two unrelated files
+ * that each declare a same-named table (e.g. `HANDLERS`) share liveness —
+ * one file's confirmed computed-invocation evidence would wrongly credit
+ * the other file's same-named-but-unrelated table (Greptile review, PR
+ * #2445) — so every lookup/insert into that set must go through this key,
+ * mirroring the `callee::restName` scoping convention (#1358).
+ */
+function computedDispatchTableEvidenceKey(relPath: string, tableName: string): string {
+  return `${relPath}::${tableName}`;
+}
+
 function buildCallEdgesJS(
   ctx: PipelineContext,
   getNodeIdStmt: NodeIdStmt,
@@ -1361,6 +1379,30 @@ function buildCallEdgesJS(
     name: string;
   }>) {
     invokedPropertyNames.add(row.name);
+  }
+
+  // #2260: table names with confirmed computed-access invocation evidence
+  // (`const handler = TABLE[computedExpr]; ...; handler(...)`) — an
+  // in-memory-only aggregation across this build's files, unlike
+  // invokedPropertyNames above, which additionally reads a persisted table
+  // to stay correct on a scoped incremental build. The table+consumer here
+  // are typically same-file (an internal AST-dispatch table, not an
+  // exported API), so this narrower scope is accepted for now; a
+  // cross-file case missed on a scoped rebuild recovers on the next full
+  // build, matching this codebase's other documented incremental scoping
+  // trade-offs (see collectInvokedPropertyNames's own doc comment).
+  //
+  // Keyed on `${file}::${tableName}`, not the bare table name — mirrors the
+  // `callee::restName` scoping convention (#1358) for the same reason: two
+  // unrelated files can each declare a same-named table (e.g. `HANDLERS`),
+  // and a bare-name Set would let one file's computed-invocation evidence
+  // credit the other file's same-named-but-unrelated table (Greptile review,
+  // PR #2445).
+  const computedDispatchTableEvidence = new Set<string>();
+  for (const [relPath, symbols] of fileSymbols) {
+    for (const name of symbols.computedDispatchTableEvidence ?? []) {
+      computedDispatchTableEvidence.add(computedDispatchTableEvidenceKey(relPath, name));
+    }
   }
 
   for (const [relPath, symbols] of fileSymbols) {
@@ -1432,6 +1474,7 @@ function buildCallEdgesJS(
       allEdgeRows,
       typeMap,
       invokedPropertyNames,
+      computedDispatchTableEvidence,
       ptsMap,
       chaCtx,
       importArtifactNames,
@@ -1680,6 +1723,7 @@ function resolveFallbackTargets(
   typeMap: Map<string, TypeMapEntry | string>,
   definePropertyReceivers: Map<string, string> | undefined,
   invokedPropertyNames: ReadonlySet<string>,
+  computedDispatchTableEvidence: ReadonlySet<string>,
   importedOriginalNames?: ReadonlyMap<string, string>,
   namespaceImports?: ReadonlyMap<string, string>,
 ): {
@@ -1765,7 +1809,21 @@ function resolveFallbackTargets(
     // somewhere (`x.keyExpr(...)`) — merely being wired into an object
     // literal is not liveness. instanceof/Lua value-refs never set keyExpr,
     // so they are unaffected by this stricter check.
-    if (call.keyExpr && !invokedPropertyNames.has(call.keyExpr)) {
+    //
+    // #2260: OR, the property's own dispatch table (`call.receiver` — the
+    // table's variable name, set by collectObjectLiteralValueRefCall)
+    // has confirmed COMPUTED-access invocation evidence
+    // (`const handler = TABLE[computedExpr]; ...; handler(...)`) — a
+    // computed key can't name this specific property statically, so that
+    // evidence is credited to the whole table rather than per-key.
+    if (
+      call.keyExpr &&
+      !invokedPropertyNames.has(call.keyExpr) &&
+      !(
+        call.receiver &&
+        computedDispatchTableEvidence.has(computedDispatchTableEvidenceKey(relPath, call.receiver))
+      )
+    ) {
       targets = [];
     }
   }
@@ -2146,6 +2204,7 @@ function buildFileCallEdges(
   allEdgeRows: EdgeRowTuple[],
   typeMap: Map<string, TypeMapEntry | string>,
   invokedPropertyNames: ReadonlySet<string>,
+  computedDispatchTableEvidence: ReadonlySet<string>,
   ptsMap?: PointsToMap | null,
   chaCtx?: ChaContext,
   importArtifactNames?: ReadonlyMap<string, BarrelExportResolution>,
@@ -2189,6 +2248,7 @@ function buildFileCallEdges(
       typeMap,
       symbols.definePropertyReceivers,
       invokedPropertyNames,
+      computedDispatchTableEvidence,
       importedOriginalNames,
       namespaceImports,
     );
