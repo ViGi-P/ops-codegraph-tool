@@ -2142,22 +2142,64 @@ pub fn halstead_rules(lang_id: &str) -> Option<&'static HalsteadRules> {
     }
 }
 
-/// Comment line prefixes per language, used for LOC metrics.
-pub fn comment_prefixes(lang_id: &str) -> &'static [&'static str] {
+/// Single-line comment prefixes per language, used for LOC metrics.
+///
+/// Deliberately excludes `/*`/`*/`/a bare `*` continuation marker: a bare
+/// `*` also opens a pointer-dereference assignment (`*ptr = 5;`) in every
+/// block-comment language below that supports one, so trusting it as a
+/// standalone comment signal misclassified real code as a comment (issue
+/// #2287). Block-comment lines are instead recognized via explicit
+/// `/* ... */` state tracking in `compute_all_metrics`, scoped to languages
+/// where [`is_block_comment_lang`] returns true.
+pub fn line_comment_prefixes(lang_id: &str) -> &'static [&'static str] {
     match lang_id {
-        // c/cpp/cuda/objc/kotlin/swift/scala all use the same `/** ... */`
-        // block-comment style as JS/Java/C# — the 2-entry list omitted
-        // bare `*`/`*/` continuation lines, undercounting commentLines for
-        // any multi-line Javadoc-style comment (issue #2058).
-        "javascript" | "typescript" | "tsx" | "go" | "rust" | "java" | "csharp" | "c" | "cpp"
-        | "cuda" | "objc" | "kotlin" | "swift" | "scala" | "groovy" => &["//", "/*", "*", "*/"],
         "python" | "ruby" | "r" => &["#"],
-        "php" => &["//", "#", "/*", "*", "*/"],
+        "php" => &["//", "#"],
         "bash" => &["#"],
         "lua" => &["--"],
-        "zig" => &["//"],
-        _ => &["//", "/*", "*", "*/"],
+        _ => &["//"],
     }
+}
+
+/// Languages using `/** ... */`-style block comments (issue #2058, #2287).
+pub fn is_block_comment_lang(lang_id: &str) -> bool {
+    !matches!(lang_id, "python" | "ruby" | "r" | "bash" | "lua" | "zig")
+}
+
+/// Languages whose block comments can nest (`/* outer /* inner */ still
+/// outer */`) — Rust and Swift, unlike the other block-comment languages
+/// here, where an inner opening marker inside an already-open comment is
+/// inert text and the FIRST closing marker ends the whole thing.
+pub fn is_nestable_block_comment_lang(lang_id: &str) -> bool {
+    matches!(lang_id, "rust" | "swift")
+}
+
+/// Scan `text` for block-comment opening/closing markers, returning the
+/// nesting depth after the scan (0 = not in a comment). `start_depth` is
+/// the depth entering `text`. For a non-nestable language, depth never
+/// exceeds 1 under this scan (an inner opener while already at depth 1 is
+/// ignored, matching how those languages' own parsers treat it), so the
+/// first closer always fully closes it — nesting support only changes
+/// whether an inner opener is allowed to push depth past 1 (Greptile
+/// review, PR #2456: the original boolean-state version closed a
+/// Rust/Swift nested comment at its first, inner closing marker instead of
+/// its outer one).
+fn scan_block_comment_depth(text: &str, start_depth: u32, nestable: bool) -> u32 {
+    let bytes = text.as_bytes();
+    let mut depth = start_depth;
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'/' && bytes[i + 1] == b'*' && (depth == 0 || nestable) {
+            depth += 1;
+            i += 2;
+        } else if bytes[i] == b'*' && bytes[i + 1] == b'/' && depth > 0 {
+            depth -= 1;
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    depth
 }
 
 // ─── Merged Single-Pass: Complexity + Halstead + LOC + MI ─────────────────
@@ -2249,16 +2291,35 @@ pub fn compute_all_metrics(
     let func_text = String::from_utf8_lossy(func_source);
     let lines: Vec<&str> = func_text.split('\n').collect();
     let loc_total = lines.len() as u32;
-    let prefixes = comment_prefixes(lang_id);
+    let line_prefixes = line_comment_prefixes(lang_id);
+    let supports_block_comments = is_block_comment_lang(lang_id);
+    let nestable = is_nestable_block_comment_lang(lang_id);
 
     let mut comment_lines: u32 = 0;
     let mut blank_lines: u32 = 0;
+    let mut block_depth: u32 = 0;
     for line in &lines {
         let trimmed = line.trim();
+
+        if block_depth > 0 {
+            comment_lines += 1;
+            block_depth = scan_block_comment_depth(trimmed, block_depth, nestable);
+            continue;
+        }
+
         if trimmed.is_empty() {
             blank_lines += 1;
-        } else if prefixes.iter().any(|p| trimmed.starts_with(p)) {
+            continue;
+        }
+
+        if line_prefixes.iter().any(|p| trimmed.starts_with(p)) {
             comment_lines += 1;
+            continue;
+        }
+
+        if supports_block_comments && trimmed.starts_with("/*") {
+            comment_lines += 1;
+            block_depth = scan_block_comment_depth(trimmed, 0, nestable);
         }
     }
     let sloc = (loc_total
@@ -2531,24 +2592,105 @@ mod tests {
     use tree_sitter::Parser;
 
     #[test]
-    fn comment_prefixes_c_family_and_jvm_langs_match_continuation_lines() {
+    fn is_block_comment_lang_covers_c_family_and_jvm_langs() {
         // Regression guard (issue #2058): c/cpp/cuda/objc/kotlin/swift/scala
-        // all use the same `/** ... */` block-comment style as JS/Java/C# —
-        // the old 2-entry list omitted bare `*`/`*/` continuation lines,
-        // undercounting commentLines for any multi-line Javadoc-style comment.
+        // all use the same `/** ... */` block-comment style as JS/Java/C#.
         for lang in [
             "c", "cpp", "cuda", "objc", "kotlin", "swift", "scala", "groovy",
         ] {
-            let prefixes = comment_prefixes(lang);
             assert!(
-                prefixes.contains(&"*"),
-                "{lang} should match bare '*' continuation lines"
-            );
-            assert!(
-                prefixes.contains(&"*/"),
-                "{lang} should match closing '*/' lines"
+                is_block_comment_lang(lang),
+                "{lang} should support /* ... */ block comments"
             );
         }
+    }
+
+    #[test]
+    fn is_block_comment_lang_excludes_hash_and_dash_comment_langs() {
+        for lang in ["python", "ruby", "r", "bash", "lua", "zig"] {
+            assert!(
+                !is_block_comment_lang(lang),
+                "{lang} should not support /* ... */ block comments"
+            );
+        }
+    }
+
+    fn compute_rust(code: &str) -> ComplexityMetrics {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(code.as_bytes(), None).unwrap();
+        let root = tree.root_node();
+        let func = find_first_function(&root, &RUST_LANG_RULES).expect("no function found");
+        compute_all_metrics(&func, code.as_bytes(), "rust").expect("no metrics computed")
+    }
+
+    #[test]
+    fn loc_metrics_does_not_misclassify_pointer_dereference_as_a_comment_continuation() {
+        // Issue #2287: a bare `*` prefix (trusted unconditionally by the old
+        // flat comment-prefix list, to match Javadoc-style `* ...`
+        // continuation lines) also opens a pointer-dereference assignment in
+        // Rust/C/C#/Go, wrongly counting real code as a comment line.
+        let metrics = compute_rust(
+            "fn deref_heavy(ptr: *mut i32) -> i32 {\n    unsafe {\n        *ptr = 5;\n        *ptr = *ptr + 1;\n        return *ptr;\n    }\n}",
+        );
+        let loc = metrics.loc.expect("loc metrics missing");
+        assert_eq!(loc.comment_lines, 0, "no line here is a real comment");
+        assert_eq!(loc.sloc, loc.loc, "every non-blank line is real code");
+    }
+
+    #[test]
+    fn loc_metrics_still_tracks_a_genuine_multiline_block_comment() {
+        // Regression guard for #2058's own fix: a real Javadoc-style
+        // continuation line (opened by an actual `/*`) must still count as
+        // a comment under the new block-tracking state machine. The comment
+        // must be INSIDE the function body: a leading doc comment before the
+        // function signature is a sibling AST node, not part of the
+        // function node's own text span, so it would never reach this loop
+        // regardless of the prefix logic being tested here.
+        let metrics = compute_rust(
+            "fn documented() -> i32 {\n    /**\n     * Doc comment.\n     * More doc.\n     */\n    return 1;\n}",
+        );
+        let loc = metrics.loc.expect("loc metrics missing");
+        assert_eq!(
+            loc.comment_lines, 4,
+            "the 4-line doc comment must be fully counted"
+        );
+    }
+
+    #[test]
+    fn loc_metrics_closes_a_single_line_block_comment_without_entering_block_state() {
+        let metrics = compute_rust("fn f() -> i32 {\n    /* inline */\n    return 1;\n}");
+        let loc = metrics.loc.expect("loc metrics missing");
+        assert_eq!(loc.comment_lines, 1);
+        assert_eq!(loc.sloc, loc.loc - loc.comment_lines);
+    }
+
+    #[test]
+    fn loc_metrics_does_not_close_a_nested_rust_block_comment_at_the_inner_closer() {
+        // Greptile review, PR #2456: Rust (unlike the other block-comment
+        // languages here) allows /* ... */ to nest. A boolean in/out-of-comment
+        // state closes at the FIRST */, wrongly ending the comment at the
+        // inner one and counting the remaining outer-comment lines as SLOC.
+        let metrics = compute_rust(
+            "fn documented() -> i32 {\n    /* outer\n     /* inner */\n     still outer\n     */\n    1\n}",
+        );
+        let loc = metrics.loc.expect("loc metrics missing");
+        // /* outer, /* inner */, still outer, */ — all 4 lines are comment.
+        assert_eq!(
+            loc.comment_lines, 4,
+            "the whole nested comment must be counted, not just up to the inner closer"
+        );
+    }
+
+    #[test]
+    fn loc_metrics_single_line_nested_rust_block_comment_still_closes() {
+        let metrics =
+            compute_rust("fn f() -> i32 {\n    /* outer /* inner */ still outer */\n    1\n}");
+        let loc = metrics.loc.expect("loc metrics missing");
+        assert_eq!(loc.comment_lines, 1);
+        assert_eq!(loc.sloc, loc.loc - loc.comment_lines);
     }
 
     fn compute_js(code: &str) -> ComplexityMetrics {
