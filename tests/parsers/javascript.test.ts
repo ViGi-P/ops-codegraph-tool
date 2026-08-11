@@ -2331,6 +2331,65 @@ function runDemo(reporter: Reporter, users: string[]): void {
       ).toBe(true);
     });
 
+    // The flip side of the var-is-function-scoped model: because `var` hoists
+    // to the FUNCTION
+    // scope, a nested function declaring `var fn` at ANY depth in its body
+    // shadows the outer `fn` for that whole function — including a read that
+    // sits outside the block physically containing the `var`.
+    it('does not credit liveness from a nested function that hoists its own var deeper down', () => {
+      const symbols = parseJS(`
+        function outer() {
+          var fn = options.custom || fetchLatestVersion;
+          function inner(flag) {
+            if (flag) { var fn = 1; }
+            return fn();
+          }
+        }
+      `);
+      expect(
+        symbols.calls.some((c) => c.dynamicKind === 'value-ref' && c.name === 'fetchLatestVersion'),
+      ).toBe(false);
+    });
+
+    // Greptile review, PR #2432: a `for (let fn of …)` head declares its own
+    // per-iteration binding, so the body's read is of that binding. The
+    // grammar exposes the declaration as a `kind` FIELD rather than a
+    // `variable_declaration` child, which is why this needs handling on the
+    // for-in/of node itself.
+    it('does not credit liveness from a for-of loop that declares its own binding', () => {
+      const symbols = parseJS(`
+        const fn = options.custom || fetchLatestVersion;
+        for (let fn of values) { fn(); }
+      `);
+      expect(
+        symbols.calls.some((c) => c.dynamicKind === 'value-ref' && c.name === 'fetchLatestVersion'),
+      ).toBe(false);
+    });
+
+    // A for-in/of head that binds the name kills the pre-loop value, so the
+    // BODY can never be reading it — only `right` still can.
+    it('does not credit liveness from a for-of body read of a bare loop target', () => {
+      const symbols = parseJS(`
+        let fn = options.custom || fetchLatestVersion;
+        for (fn of values) { fn(); }
+      `);
+      expect(
+        symbols.calls.some((c) => c.dynamicKind === 'value-ref' && c.name === 'fetchLatestVersion'),
+      ).toBe(false);
+    });
+
+    // …but `right` IS evaluated in the enclosing scope, so a genuine read
+    // there must still count.
+    it('credits liveness from a for-of right-hand side read in the enclosing scope', () => {
+      const symbols = parseJS(`
+        const fn = options.custom || fetchLatestVersion;
+        for (const item of fn()) { use(item); }
+      `);
+      expect(
+        symbols.calls.some((c) => c.dynamicKind === 'value-ref' && c.name === 'fetchLatestVersion'),
+      ).toBe(true);
+    });
+
     // Greptile review, PR #2432: `for (fn of values) {}` / `for (fn in obj)
     // {}` with NO declaration keyword reassigns fn on every iteration — a
     // WRITE, not a read of the value it held before the loop started.
@@ -2399,14 +2458,91 @@ function runDemo(reporter: Reporter, users: string[]): void {
       ).toBe(true);
     });
 
-    // Same principle for a C-style for-loop: a `var` in the loop's own init
-    // clause is the SAME function-scoped binding, so a read in the loop's
-    // test/update clause must still count.
-    it('still credits liveness from a for-loop read when the loop redeclares the name via var', () => {
+    // A C-style for-loop whose own init clause rebinds the name via `var` is
+    // the SAME function-scoped binding — and that is precisely why it KILLS
+    // the fallback value rather than reading it: `var fn = 0` runs before the
+    // test/update clauses, so `fn < 10` and `fn++` only ever see the number.
+    // Verified at runtime: `typeof fn` inside that loop is always `number`,
+    // and the fallback function is never invoked. Crediting liveness here
+    // would fabricate an edge for a value that is assigned and immediately
+    // overwritten without ever being consumed.
+    //
+    // A loop that does NOT rebind the name is unaffected — `for (var i = 0;
+    // i < 10; i++) { fn(); }` still credits the body's genuine read.
+    it('does not credit liveness from a for-loop whose own var init overwrote the value', () => {
       const symbols = parseJS(`
         function outer() {
           var fn = options.custom || fetchLatestVersion;
           for (var fn = 0; fn < 10; fn++) {}
+        }
+      `);
+      expect(
+        symbols.calls.some((c) => c.dynamicKind === 'value-ref' && c.name === 'fetchLatestVersion'),
+      ).toBe(false);
+    });
+
+    // Greptile review, PR #2440: only an INITIALIZER overwrites the value. A
+    // bare `var fn;` redeclaration in the loop head assigns nothing, so it is
+    // not a kill and the body's read is genuine.
+    it('credits liveness from a for-loop body read when the head redeclares the name without initializing it', () => {
+      const symbols = parseJS(`
+        function outer() {
+          var fn = options.custom || fetchLatestVersion;
+          for (var fn; cond; update) { fn(); }
+        }
+      `);
+      expect(
+        symbols.calls.some((c) => c.dynamicKind === 'value-ref' && c.name === 'fetchLatestVersion'),
+      ).toBe(true);
+    });
+
+    // A sibling declarator BEFORE the killing one runs before the overwrite,
+    // so its read is genuine.
+    it('credits liveness from a for-head sibling initializer that runs before the kill', () => {
+      const symbols = parseJS(`
+        function outer() {
+          var fn = options.custom || fetchLatestVersion;
+          for (var a = fn(), fn = 0; fn < 3; fn++) {}
+        }
+      `);
+      expect(
+        symbols.calls.some((c) => c.dynamicKind === 'value-ref' && c.name === 'fetchLatestVersion'),
+      ).toBe(true);
+    });
+
+    // …but a sibling declarator AFTER the killing one reads the NEW value.
+    it('does not credit liveness from a for-head sibling initializer that runs after the kill', () => {
+      const symbols = parseJS(`
+        function outer() {
+          var fn = options.custom || fetchLatestVersion;
+          for (var fn = 0, a = fn(); fn < 3; fn++) {}
+        }
+      `);
+      expect(
+        symbols.calls.some((c) => c.dynamicKind === 'value-ref' && c.name === 'fetchLatestVersion'),
+      ).toBe(false);
+    });
+
+    // The killing declarator's own initializer still reads the pre-loop value.
+    it('credits liveness from a for-head initializer that reads the value it overwrites', () => {
+      const symbols = parseJS(`
+        function outer() {
+          var fn = options.custom || fetchLatestVersion;
+          for (var fn = fn; cond; update) {}
+        }
+      `);
+      expect(
+        symbols.calls.some((c) => c.dynamicKind === 'value-ref' && c.name === 'fetchLatestVersion'),
+      ).toBe(true);
+    });
+
+    // …and the guard for that last sentence: a loop counter with a DIFFERENT
+    // name must not suppress a real read in the loop body.
+    it('credits liveness from a loop body read when the loop counter is a different name', () => {
+      const symbols = parseJS(`
+        function outer() {
+          var fn = options.custom || fetchLatestVersion;
+          for (var i = 0; i < 10; i++) { fn(); }
         }
       `);
       expect(
@@ -2428,6 +2564,40 @@ function runDemo(reporter: Reporter, users: string[]): void {
       expect(
         symbols.calls.some((c) => c.dynamicKind === 'value-ref' && c.name === 'fetchLatestVersion'),
       ).toBe(false);
+    });
+
+    // Greptile review, PR #2440: a `let`/`const` for-of target creates a
+    // BRAND-NEW per-iteration binding for `name` — a default hidden inside
+    // that SAME destructuring pattern which mentions `name` resolves to that
+    // new binding (in the temporal dead zone until its own position
+    // initializes it), never to the enclosing fallback. Verified at runtime:
+    // `let [fn = fn] = [undefined]` throws "Cannot access 'fn' before
+    // initialization" — it never reads the outer `fn`.
+    it('does not credit liveness from a lexical destructuring default that self-references the loop target', () => {
+      const symbols = parseJS(`
+        function outer() {
+          var fn = options.custom || fetchLatestVersion;
+          for (const [fn = fn] of values) { fn(); }
+        }
+      `);
+      expect(
+        symbols.calls.some((c) => c.dynamicKind === 'value-ref' && c.name === 'fetchLatestVersion'),
+      ).toBe(false);
+    });
+
+    // …but a `var` target reuses the SAME pre-existing binding (no new
+    // scope), so the identical shape still reads the current,
+    // soon-to-be-overwritten value — this must stay credited.
+    it('still credits liveness from a var destructuring default that self-references the loop target', () => {
+      const symbols = parseJS(`
+        function outer() {
+          var fn = options.custom || fetchLatestVersion;
+          for (var [fn = fn] of values) {}
+        }
+      `);
+      expect(
+        symbols.calls.some((c) => c.dynamicKind === 'value-ref' && c.name === 'fetchLatestVersion'),
+      ).toBe(true);
     });
   });
 
