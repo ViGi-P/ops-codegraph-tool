@@ -50,7 +50,12 @@ import { isConstructorMethodSuffix, type ResolvedCandidate } from '../../resolve
 import type { CallNodeLookup } from '../call-resolver.js';
 import { RECEIVER_KINDS, resolveDefinePropertyAccessorTarget } from '../call-resolver.js';
 import type { ChaContext } from '../cha.js';
-import { resolveThisDispatch } from '../cha.js';
+import {
+  buildChaContextFromDb,
+  CHA_ZERO_IMPLEMENTOR_META_KEY,
+  deriveZeroImplementorInterfaces,
+  resolveThisDispatch,
+} from '../cha.js';
 import type { PipelineContext } from '../context.js';
 import {
   batchInsertEdges,
@@ -2730,6 +2735,49 @@ class NativeOrchestrationSession {
 }
 
 /**
+ * Snapshot which interfaces/base classes currently have ZERO instantiated
+ * implementors, for `codegraph info`'s CHA-zero-implementor nudge (#2315).
+ *
+ * Sibling of `persistChaZeroImplementorSnapshot` in `builder/stages/finalize.ts`
+ * — same key, same derivation, same "full builds only" gating, same
+ * rationale (see that function's doc comment for the full explanation of
+ * the gap this snapshot exists to make visible). A separate copy is needed
+ * here because `tryNativeOrchestrator`'s all-Rust fast path (#695) returns
+ * its `BuildResult` directly and never reaches `finalize()` — so `finalize.ts`'s
+ * copy of this logic is simply never called on that path.
+ *
+ * Called after `runPostNativePasses` so CHA/RTA dispatch edges (from the
+ * `cha` post-pass, backfill, and this/super dispatch) are already committed
+ * and visible on `ctx.db` — mirroring `finalize.ts`'s own timing requirement.
+ * Uses the plain JS `setBuildMeta(ctx.db, ...)` write (no `useNativeDb`
+ * branch): `ctx.db` is NOT necessarily a real better-sqlite3 connection at
+ * this exact call site — `ensureJsDbForPostPasses` (called above, before
+ * `runPostNativePasses`) only reopens/hands off the connection when
+ * `needsStructure || needsAnalysisFallback`; when neither is needed it
+ * returns `true` without touching `ctx.db`, which can still be the
+ * `NativeDbProxy` from the earlier native build. That's fine here: both
+ * `buildChaContextFromDb`'s `.prepare().all()` reads and `setBuildMeta`'s
+ * `.prepare().run()` write are part of `NativeDbProxy`'s own implemented
+ * `BetterSqlite3Database` interface (`builder/native-db-proxy.ts`) — this
+ * function only needs that shared interface, never a real-better-sqlite3-
+ * only API like `.prepare().iterate()` (which the proxy explicitly does not
+ * support), so it works correctly through either connection type (Greptile
+ * review, PR #2473).
+ */
+function persistChaZeroImplementorSnapshotNative(ctx: PipelineContext, isFullBuild: boolean): void {
+  if (!isFullBuild) return;
+  try {
+    const chaCtx = buildChaContextFromDb(ctx.db);
+    const zeroImplementorNames = deriveZeroImplementorInterfaces(chaCtx);
+    setBuildMeta(ctx.db, {
+      [CHA_ZERO_IMPLEMENTOR_META_KEY]: JSON.stringify(zeroImplementorNames),
+    });
+  } catch (err) {
+    warn(`Failed to write CHA zero-implementor snapshot: ${toErrorMessage(err)}`);
+  }
+}
+
+/**
  * Try the native build orchestrator.
  *
  * Returns:
@@ -2844,6 +2892,13 @@ export async function tryNativeOrchestrator(
   }
 
   const postPassTimings = await runPostNativePasses(ctx, result);
+
+  // Snapshot CHA-zero-implementor interfaces for `codegraph info`'s nudge
+  // (#2315) — must run after runPostNativePasses (CHA/RTA dispatch edges
+  // just committed above) and only for full builds; see the function's own
+  // doc comment for why finalize.ts's copy of this logic can't cover this
+  // all-Rust fast path.
+  persistChaZeroImplementorSnapshotNative(ctx, !!result.isFullBuild);
 
   // ── Structure and analysis fallback (run after edge-writing so roles see full graph) ──
   // Reconstruct fileSymbols once for both structure and analysis to avoid two
