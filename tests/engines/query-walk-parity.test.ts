@@ -366,6 +366,55 @@ export function useIt(): number {
 }
 `,
   },
+  // Issue #2389: JSX component references and call-argument identifiers
+  {
+    name: 'JSX self-closing component reference (#2389)',
+    file: 'test.jsx',
+    code: `
+import { Header } from './comp.jsx';
+export function App() {
+  return <Header title="x" />;
+}
+`,
+  },
+  {
+    name: 'JSX component with children and a namespaced reference (#2389)',
+    file: 'test.tsx',
+    code: `
+import * as NS from './comp';
+export function App() {
+  return <Wrapper><NS.Header /><span /></Wrapper>;
+}
+`,
+  },
+  {
+    name: 'call-argument identifier value reference (#2389)',
+    file: 'test.ts',
+    code: `
+class AppModule {}
+const Factory = { create(m: unknown) { return m; } };
+export function bootstrap() {
+  return Factory.create(AppModule);
+}
+`,
+  },
+  {
+    // Regression guard for Greptile's #2389 review finding: a call whose callee
+    // is itself an expression (not a bare identifier/member/subscript) has no
+    // dedicated query capture, so the value-ref extraction must be routed
+    // through a shape-agnostic capture rather than the shape-specific ones.
+    name: 'call-argument identifier value reference with expression-based callee (#2389)',
+    file: 'test.ts',
+    code: `
+class AppModule {}
+function getFactory() {
+  return (m: unknown) => m;
+}
+export function bootstrap() {
+  return getFactory()(AppModule);
+}
+`,
+  },
 ];
 
 describe('Query vs Walk parity', () => {

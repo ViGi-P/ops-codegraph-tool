@@ -180,6 +180,13 @@ const COMMON_QUERY_PATTERNS: string[] = [
   '(call_expression function: (member_expression) @callmem_fn) @callmem_node',
   '(call_expression function: (subscript_expression) @callsub_fn) @callsub_node',
   '(call_expression function: (super) @callsuper_fn) @callsuper_node',
+  // Generic capture for call-argument identifier value-ref extraction (#2389) —
+  // matches every call_expression regardless of the callee's shape (chained,
+  // curried, or parenthesized callees like `getFactory()(AppModule)`), mirroring
+  // the walk path's unconditional `case 'call_expression'` dispatch. Named-call
+  // resolution stays on the shape-specific patterns above; this one only feeds
+  // dispatchQueryMatch's `callarg_node` branch.
+  '(call_expression) @callarg_node',
   '(new_expression constructor: (identifier) @newfn_name) @newfn_node',
   '(new_expression constructor: (member_expression) @newmem_fn) @newmem_node',
   '(expression_statement (assignment_expression left: (member_expression) @assign_left right: (_) @assign_right)) @assign_node',
@@ -201,6 +208,18 @@ const TS_EXTRA_PATTERNS: string[] = [
   '(class name: (type_identifier) @cls_name) @cls_node',
   '(interface_declaration name: (type_identifier) @iface_name) @iface_node',
   '(type_alias_declaration name: (type_identifier) @type_name) @type_node',
+];
+
+// JSX element tag names — only javascript and tsx grammars define these node
+// types; plain typescript (.ts, no JSX) does not, so this must never be
+// folded into COMMON_QUERY_PATTERNS or TS_EXTRA_PATTERNS (shared with plain
+// typescript) — Query() compilation throws on an unknown node type, which
+// would break all .ts parsing (#2389).
+const JSX_QUERY_PATTERNS: string[] = [
+  '(jsx_opening_element name: (identifier) @jsxid_name) @jsxid_node',
+  '(jsx_self_closing_element name: (identifier) @jsxid_name) @jsxid_node',
+  '(jsx_opening_element name: (member_expression) @jsxmem_name) @jsxmem_node',
+  '(jsx_self_closing_element name: (member_expression) @jsxmem_name) @jsxmem_node',
 ];
 
 /**
@@ -227,9 +246,12 @@ async function doLoadLanguage(entry: LanguageRegistryEntry): Promise<void> {
     _cachedLanguages!.set(entry.id, lang);
     if (entry.extractor === extractSymbols && !_queryCache.has(entry.id)) {
       const isTS = entry.id === 'typescript' || entry.id === 'tsx';
-      const patterns = isTS
-        ? [...COMMON_QUERY_PATTERNS, ...TS_EXTRA_PATTERNS]
-        : [...COMMON_QUERY_PATTERNS, ...JS_CLASS_PATTERNS];
+      const supportsJsx = entry.id === 'javascript' || entry.id === 'tsx';
+      const patterns = [
+        ...COMMON_QUERY_PATTERNS,
+        ...(isTS ? TS_EXTRA_PATTERNS : JS_CLASS_PATTERNS),
+        ...(supportsJsx ? JSX_QUERY_PATTERNS : []),
+      ];
       _queryCache.set(entry.id, new Query(lang, patterns.join('\n')));
     }
   } catch (e: unknown) {
