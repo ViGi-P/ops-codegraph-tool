@@ -72,6 +72,35 @@ const JS_BUILTIN_GLOBALS: &[&str] = &[
     "Stream",
 ];
 
+/// Mirrors JS `name[0] !== name[0].toLowerCase()` exactly — the check TS's
+/// factory-method heuristic (`handleCallExprTypeMap`) uses to decide whether
+/// an identifier "starts with an uppercase letter". Two JS-specific quirks
+/// this must replicate precisely, not approximate, or the two engines
+/// silently diverge on this parity-sensitive heuristic (#2396):
+///
+/// - JS string indexing operates on UTF-16 code units, not full Unicode
+///   scalars: for an astral-plane leading character (code point > U+FFFF,
+///   e.g. a Deseret capital letter), `name[0]` is a lone UTF-16 surrogate,
+///   which doesn't case-fold and so is never treated as uppercase in JS.
+/// - The condition is "does lowercasing change this character", not "is
+///   this character in Unicode's Uppercase category" — those differ for
+///   titlecase letters (Unicode category Lt, e.g. `ǅ`), which lowercase to
+///   a different character but are neither uppercase nor lowercase per
+///   `char::is_uppercase()`/`is_lowercase()`. JS's `.toLowerCase()`-based
+///   check treats them as "uppercase-like"; Rust's `is_uppercase()` does not.
+fn starts_with_uppercase_like_js(name: &str) -> bool {
+    let Some(unit) = name.encode_utf16().next() else {
+        return false;
+    };
+    if (0xD800..=0xDFFF).contains(&unit) {
+        return false;
+    }
+    let Some(c) = char::from_u32(unit as u32) else {
+        return false;
+    };
+    c.to_lowercase().ne(std::iter::once(c))
+}
+
 pub struct JsExtractor;
 
 impl SymbolExtractor for JsExtractor {
@@ -323,6 +352,30 @@ fn handle_var_declarator_type_map(node: &Node, source: &[u8], symbols: &mut File
                             type_name,
                             propagated,
                         );
+                    }
+                }
+            } else if fn_n.kind() == "member_expression" {
+                // Factory method heuristic: `const x = Foo.create()` → type Foo,
+                // confidence 0.7 (#2396). Mirrors TS handleCallExprTypeMap's
+                // identical fallback. No explicit exclusion of Object.create is
+                // needed here — "Object" is itself in JS_BUILTIN_GLOBALS, and this
+                // branch is mutually exclusive with the identifier-callee
+                // return-type-propagation branch above (a call's `function` field
+                // is one node, never both kinds).
+                if let Some(obj_n) = fn_n.child_by_field_name("object") {
+                    if obj_n.kind() == "identifier" {
+                        let obj_name = node_text(&obj_n, source);
+                        if starts_with_uppercase_like_js(obj_name)
+                            && !JS_BUILTIN_GLOBALS.contains(&obj_name)
+                        {
+                            push_scoped_type_map_entry(
+                                symbols,
+                                enclosing_qualifier.as_deref(),
+                                var_name,
+                                obj_name.to_string(),
+                                0.7,
+                            );
+                        }
                     }
                 }
             }
@@ -10400,6 +10453,101 @@ mod tests {
         );
         assert_eq!(tm.unwrap().type_name, "Logger");
         assert_eq!(tm.unwrap().confidence, 1.0);
+    }
+
+    /// Issue #2396: `const x = Foo.create()` must type `x` as `Foo` at
+    /// confidence 0.7 — the same factory-method heuristic TS's
+    /// `handleCallExprTypeMap` already implements, previously missing here.
+    #[test]
+    fn factory_method_call_seeds_type_map_at_point_seven_confidence() {
+        let s = parse_js("const client = HttpClient.create();");
+        let tm = s.type_map.iter().find(|t| t.name == "client");
+        assert!(
+            tm.is_some(),
+            "type_map should contain 'client'; got: {:?}",
+            s.type_map
+        );
+        assert_eq!(tm.unwrap().type_name, "HttpClient");
+        assert_eq!(tm.unwrap().confidence, 0.7);
+    }
+
+    #[test]
+    fn factory_method_heuristic_ignores_lowercase_receiver() {
+        let s = parse_js("const result = utils.create();");
+        assert!(s.type_map.iter().all(|t| t.name != "result"));
+    }
+
+    #[test]
+    fn factory_method_heuristic_ignores_object_create_and_other_builtin_globals() {
+        let s = parse_js(
+            "const r = Math.random();\n\
+             const d = JSON.parse('{}');\n\
+             const p = Promise.resolve(42);\n\
+             const o = Object.create({});",
+        );
+        assert!(s.type_map.iter().all(|t| t.name != "r"));
+        assert!(s.type_map.iter().all(|t| t.name != "d"));
+        assert!(s.type_map.iter().all(|t| t.name != "p"));
+        assert!(s.type_map.iter().all(|t| t.name != "o"));
+    }
+
+    // Greptile review on #2396: JS string indexing (`name[0]`) operates on
+    // UTF-16 code units, not full Unicode scalars, so an astral-plane leading
+    // character becomes a lone surrogate that never case-folds — TS's
+    // `objName[0] !== objName[0].toLowerCase()` therefore never recognizes it
+    // as uppercase. A naive `chars().next().is_uppercase()` in Rust decodes
+    // the full scalar and WOULD recognize it, silently diverging from WASM
+    // for this heuristic.
+    #[test]
+    fn factory_method_heuristic_matches_js_utf16_semantics_for_a_bmp_letter() {
+        // 'Ω' (U+03A9 GREEK CAPITAL LETTER OMEGA) is a single UTF-16 code unit
+        // and IS recognized as uppercase by both `str[0].toLowerCase()` in JS
+        // and `char::is_uppercase()` in Rust — both engines must agree here.
+        let s = parse_js("const conn = Ωmega.create();");
+        let tm = s.type_map.iter().find(|t| t.name == "conn");
+        assert!(
+            tm.is_some(),
+            "expected 'conn' to be typed; got {:?}",
+            s.type_map
+        );
+        assert_eq!(tm.unwrap().type_name, "Ωmega");
+        assert_eq!(tm.unwrap().confidence, 0.7);
+    }
+
+    #[test]
+    fn factory_method_heuristic_matches_js_utf16_semantics_for_an_astral_letter() {
+        // '𐐔' (U+10414 DESERET CAPITAL LETTER LONG I) is astral-plane — its
+        // first UTF-16 code unit is a lone high surrogate, which JS's
+        // `objName[0].toLowerCase()` leaves unchanged, so
+        // `objName[0] !== objName[0].toLowerCase()` is false and TS's
+        // heuristic does NOT fire. Rust must not fire here either, even
+        // though `'𐐔'.is_uppercase()` is true for the full decoded scalar.
+        let s = parse_js("const conn = \u{10414}mega.create();");
+        assert!(
+            s.type_map.iter().all(|t| t.name != "conn"),
+            "must not type 'conn' — matches TS's UTF-16-surrogate semantics; got {:?}",
+            s.type_map
+        );
+    }
+
+    // Greptile's second review round on #2396: `char::is_uppercase()` and
+    // "does lowercasing change this character" (what JS's `.toLowerCase()`
+    // check actually implements) disagree for Unicode titlecase letters.
+    #[test]
+    fn factory_method_heuristic_matches_js_utf16_semantics_for_a_titlecase_letter() {
+        // 'ǅ' (U+01C5 LATIN CAPITAL LETTER D WITH SMALL LETTER Z WITH CARON)
+        // is Unicode category Lt (titlecase) — `char::is_uppercase()` is
+        // false for it, but JS's `'ǅ'.toLowerCase()` ('ǆ') differs from 'ǅ',
+        // so TS's heuristic DOES fire. Rust must fire here too.
+        let s = parse_js("const conn = \u{1C5}omega.create();");
+        let tm = s.type_map.iter().find(|t| t.name == "conn");
+        assert!(
+            tm.is_some(),
+            "expected 'conn' to be typed for a titlecase receiver; got {:?}",
+            s.type_map
+        );
+        assert_eq!(tm.unwrap().type_name, "\u{1C5}omega");
+        assert_eq!(tm.unwrap().confidence, 0.7);
     }
 
     /// `this.prop = new Ctor()` outside any class declaration (function-style
