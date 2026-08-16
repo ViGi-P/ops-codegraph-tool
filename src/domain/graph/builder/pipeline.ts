@@ -461,12 +461,13 @@ export async function buildGraph(
         }
       } catch (err) {
         // "Prior state exists but is unreadable" is the one failure that must
-        // not fall through. The orchestrator's own detection is the Rust
-        // `load_file_hashes`, which still collapses a read failure into "no
-        // prior state" and rebuilds from scratch — deleting the graph and
-        // embeddings this error is raised to protect. Falling through would
-        // therefore route around the safeguard and produce exactly the wipe it
-        // prevents on the JS path (see `loadFileHashes` in detect-changes.ts).
+        // not fall through. Falling through here would route around this
+        // JS-side detection and hand the decision to the orchestrator's own
+        // Rust `load_file_hashes` (#2418: now also correctly propagates a
+        // read failure rather than reporting "no prior state" — but that's a
+        // second, independent line of defense, not a reason to skip this one)
+        // — deleting the graph and embeddings this error exists to protect
+        // (see `loadFileHashes` in detect-changes.ts).
         if (isUnreadableBuildStateError(err)) throw err;
         // Every other pre-flight failure stays best-effort — fall through to
         // the orchestrator, which performs its own complete detection.
@@ -487,6 +488,30 @@ export async function buildGraph(
       if (nativeResult === 'early-exit') return;
       if (nativeResult) return nativeResult;
     } catch (err) {
+      // Same "must not fall through" case as the pre-flight's own catch
+      // above, one layer further out (#2418 Greptile review): a scoped
+      // build skips that pre-flight entirely and, once here, would
+      // otherwise fall through to `handleScopedBuild`, which trusts the
+      // caller-provided scope list and writes without ever re-reading
+      // `file_hashes` itself — silently completing with partial, possibly
+      // inconsistent data instead of the loud failure this error exists to
+      // produce. `isUnreadableBuildStateError` recognizes this even though
+      // a native-thrown error crosses the napi boundary as a plain `Error`,
+      // never a `DbError` instance — see its doc comment.
+      if (isUnreadableBuildStateError(err)) {
+        // `runBuildGraph()` threw before `tryNativeOrchestrator` reached its
+        // own `session.close()` call, and this whole function is about to
+        // exit via exception well before the normal end-of-build
+        // `closeDbPair()` call further down — so BOTH ctx.nativeDb and
+        // ctx.db are still open. Closing them here avoids leaking either
+        // handle on this early-throw exit. Windows in particular cannot
+        // unlink a `graph.db` file out from under a still-open handle
+        // (#2418 CI: a reproduction test's own temp-dir cleanup hit `EBUSY`
+        // on windows-2022 — closing only ctx.nativeDb was not sufficient,
+        // ctx.db was still holding the file open too).
+        closeDbPair({ db: ctx.db, nativeDb: ctx.nativeDb });
+        throw err;
+      }
       warn(`Native build orchestrator failed, falling back to JS pipeline: ${toErrorMessage(err)}`);
       // The version gate in checkEngineSchemaMismatch was skipped because
       // nativeAvailable was true. Now that we're falling back to the JS
