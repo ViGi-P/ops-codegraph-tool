@@ -675,9 +675,77 @@ describe('roles', () => {
   });
 
   it('prints message when no symbols classified', () => {
-    mocks.rolesData.mockReturnValue({ count: 0, summary: {}, symbols: [] });
+    mocks.rolesData.mockReturnValue({ count: 0, totalClassified: 0, summary: {}, symbols: [] });
     roles('/db', {});
     expect(output()).toContain('No classified symbols found');
+  });
+
+  // Regression guard for #2390: a --role filter with zero matches on a fully
+  // classified graph must not tell the user to rebuild — that's only correct
+  // when the graph itself has no classified symbols at all.
+  it('reports a role-specific zero-match message instead of "run build first" when the graph is otherwise classified (#2390)', () => {
+    mocks.rolesData.mockReturnValue({ count: 0, totalClassified: 548, summary: {}, symbols: [] });
+    roles('/db', { role: 'entry' });
+    const out = output();
+    expect(out).toContain('No symbols with role "entry"');
+    expect(out).toContain('548 classified symbols in graph');
+    expect(out).not.toContain('Run "codegraph build" first');
+  });
+
+  it('still recommends a rebuild for a --role filter when the graph genuinely has no classified symbols (#2390)', () => {
+    mocks.rolesData.mockReturnValue({ count: 0, totalClassified: 0, summary: {}, symbols: [] });
+    roles('/db', { role: 'entry' });
+    expect(output()).toContain('No classified symbols found. Run "codegraph build" first.');
+  });
+
+  // Regression guard for Greptile's second #2531 review finding: totalClassified
+  // is scoped by --file/--no-tests even in the role-specific branch, so the
+  // count must be labeled as belonging to that scope, not "in graph".
+  it('labels the count by scope instead of "in graph" when --role is combined with --file (#2390)', () => {
+    mocks.rolesData.mockReturnValue({ count: 0, totalClassified: 12, summary: {}, symbols: [] });
+    roles('/db', { role: 'entry', file: 'src/utils.ts' });
+    const out = output();
+    expect(out).toContain('No symbols with role "entry"');
+    expect(out).toContain('12 classified symbols in file "src/utils.ts"');
+    expect(out).not.toContain('12 classified symbols in graph');
+  });
+
+  it('labels the count by scope instead of "in graph" when --role is combined with --no-tests (#2390)', () => {
+    mocks.rolesData.mockReturnValue({ count: 0, totalClassified: 500, summary: {}, symbols: [] });
+    roles('/db', { role: 'entry', noTests: true });
+    const out = output();
+    expect(out).toContain('500 classified symbols in non-test files');
+    expect(out).not.toContain('500 classified symbols in graph');
+  });
+
+  // Regression guard for Greptile's #2531 review finding: a --file/--no-tests
+  // scope that excludes every classified symbol must not be reported as an
+  // unbuilt graph either, when the graph is healthy outside that scope.
+  it('reports a scope-specific zero-match message instead of "run build first" when --file excludes everything but the graph is healthy (#2390)', () => {
+    mocks.rolesData.mockReturnValue({
+      count: 0,
+      totalClassified: 0,
+      totalClassifiedUnscoped: 548,
+      summary: {},
+      symbols: [],
+    });
+    roles('/db', { file: 'empty.js' });
+    const out = output();
+    expect(out).toContain('No classified symbols found for file "empty.js"');
+    expect(out).toContain('548 classified symbols in graph overall');
+    expect(out).not.toContain('Run "codegraph build" first');
+  });
+
+  it('mentions both file and no-tests scope in the message when both are active (#2390)', () => {
+    mocks.rolesData.mockReturnValue({
+      count: 0,
+      totalClassified: 0,
+      totalClassifiedUnscoped: 548,
+      summary: {},
+      symbols: [],
+    });
+    roles('/db', { file: 'app.test.js', noTests: true });
+    expect(output()).toContain('for file "app.test.js" and non-test files');
   });
 });
 

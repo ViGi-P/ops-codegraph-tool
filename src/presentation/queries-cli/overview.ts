@@ -124,6 +124,8 @@ interface RoleSymbol {
 
 interface RolesData {
   count: number;
+  totalClassified: number;
+  totalClassifiedUnscoped?: number;
   summary: Record<string, number>;
   symbols: RoleSymbol[];
 }
@@ -369,7 +371,32 @@ export function roles(customDbPath: string, opts: OutputOpts = {}): void {
   if (outputResult(data, 'symbols', opts, customDbPath)) return;
 
   if (data.count === 0) {
-    console.log('No classified symbols found. Run "codegraph build" first.');
+    if (opts.role && data.totalClassified > 0) {
+      // The graph is fine — this role filter simply matched nothing (#2390).
+      // totalClassified is itself scoped by --file/--no-tests, so the count
+      // shown must be labeled accordingly instead of always claiming "in
+      // graph" (Greptile review on #2531).
+      const roleScopeParts: string[] = [];
+      if (opts.file) roleScopeParts.push(`file "${opts.file}"`);
+      if (opts.noTests) roleScopeParts.push('non-test files');
+      const roleScopeDesc =
+        roleScopeParts.length > 0 ? `in ${roleScopeParts.join(' and ')}` : 'in graph';
+      console.log(
+        `No symbols with role "${opts.role}". (${data.totalClassified} classified symbols ${roleScopeDesc}.)`,
+      );
+    } else if (data.totalClassifiedUnscoped) {
+      // The --file/--no-tests scope excluded every classified symbol, but the
+      // graph is healthy outside that scope — don't blame the build (#2390).
+      const scopeParts: string[] = [];
+      if (opts.file) scopeParts.push(`file "${opts.file}"`);
+      if (opts.noTests) scopeParts.push('non-test files');
+      const scopeDesc = scopeParts.length > 0 ? ` for ${scopeParts.join(' and ')}` : '';
+      console.log(
+        `No classified symbols found${scopeDesc}. (${data.totalClassifiedUnscoped} classified symbols in graph overall.)`,
+      );
+    } else {
+      console.log('No classified symbols found. Run "codegraph build" first.');
+    }
     return;
   }
 
