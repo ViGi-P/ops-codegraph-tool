@@ -258,7 +258,16 @@ static GO_DATAFLOW: DataflowRules = DataflowRules {
     param_list_field: "parameters",
     param_identifier: "identifier",
     param_wrapper_types: &[],
-    grouped_param_types: &[],
+    // A `parameter_declaration` can share one type across multiple
+    // comma-separated names (`func f(a, b int)` — both `a` and `b` are
+    // `name`-field children of the SAME node, per tree-sitter-go's
+    // node-types.json). This makes `extract_params` iterate this node's own
+    // named children as separate slots instead of calling
+    // `extract_params_go` on the whole node — each `identifier` name
+    // resolves via the generic `param_identifier` handler and gets its own
+    // index, while the trailing `type_identifier` yields no name and
+    // consumes no index (issue #2501).
+    grouped_param_types: &["parameter_declaration"],
     default_param_type: None,
     rest_param_type: None,
     object_destruct_type: None,
@@ -821,26 +830,12 @@ fn extract_params_python(node: &Node, source: &[u8]) -> Option<Vec<String>> {
 }
 
 fn extract_params_go(node: &Node, source: &[u8]) -> Option<Vec<String>> {
-    let t = node.kind();
-    if t == "parameter_declaration" {
-        let mut names = Vec::new();
-        let cursor = &mut node.walk();
-        for c in node.named_children(cursor) {
-            if c.kind() == "identifier" {
-                names.push(node_text(&c, source).to_string());
-            }
-        }
-        if !names.is_empty() {
-            Some(names)
-        } else {
-            None
-        }
-    } else if t == "variadic_parameter_declaration" {
-        node.child_by_field_name("name")
-            .map(|n| vec![node_text(&n, source).to_string()])
-    } else {
-        None
+    if node.kind() == "variadic_parameter_declaration" {
+        return node
+            .child_by_field_name("name")
+            .map(|n| vec![node_text(&n, source).to_string()]);
     }
+    None
 }
 
 fn extract_params_rust(node: &Node, source: &[u8]) -> Option<Vec<String>> {
@@ -1023,8 +1018,11 @@ fn extract_param_names(node: &Node, rules: &DataflowRules, source: &[u8]) -> Vec
 /// `optional_formal_parameters`, issue #2358) groups multiple genuinely
 /// separate parameter slots — each of ITS OWN named children gets its own
 /// index, and a slot yielding zero names (a flat default-value literal
-/// sibling, not a real parameter) does NOT consume an index. This does NOT
-/// apply to an ordinary (non-grouped) top-level child, which always
+/// sibling, not a real parameter) does NOT consume an index — UNLESS the
+/// grouped node yields zero names in total, in which case it is itself one
+/// unnamed parameter slot (Go's own `parameter_declaration` can be entirely
+/// unnamed, issue #2501) and still consumes exactly one index. This does
+/// NOT apply to an ordinary (non-grouped) top-level child, which always
 /// consumes an index regardless of name count — an unnamed parameter
 /// (e.g. C/C++'s `void f(int, int value)`) is a real slot that must not
 /// collapse into the next one. Mirrors TS's `extractParams`
@@ -1035,15 +1033,28 @@ fn extract_params(params_node: &Node, rules: &DataflowRules, source: &[u8]) -> V
     let cursor = &mut params_node.walk();
     for child in params_node.named_children(cursor) {
         if rules.grouped_param_types.contains(&child.kind()) {
+            let mut matched_any = false;
             let inner_cursor = &mut child.walk();
             for slot in child.named_children(inner_cursor) {
                 let names = extract_param_names(&slot, rules, source);
                 if names.is_empty() {
                     continue;
                 }
+                matched_any = true;
                 for name in names {
                     result.push((name, index));
                 }
+                index += 1;
+            }
+            // A grouped node that yields NO names at all (Go's own entirely
+            // unnamed `parameter_declaration`, e.g. `*int` in `func f(*int,
+            // a int)` — tree-sitter-go still parses this even though real Go
+            // requires all-named-or-all-unnamed) is still exactly one real,
+            // positional slot and must consume an index like any other
+            // unnamed parameter, unlike Dart's non-slot siblings above
+            // (which never trigger this: a Dart grouped wrapper always
+            // contains at least one real named parameter) (issue #2501).
+            if !matched_any {
                 index += 1;
             }
             continue;
@@ -1973,5 +1984,98 @@ mod dart_tests {
             .unwrap();
         assert_eq!(helper_ret.referenced_names, vec!["z".to_string()]);
         assert_eq!(caller_ret.referenced_names, vec!["a".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod go_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn extract(code: &str) -> DataflowResult {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_go::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(code, None).unwrap();
+        extract_dataflow(&tree, code.as_bytes(), "go").expect("go dataflow rules must exist")
+    }
+
+    // Regression test for issue #2501: tree-sitter-go's `parameter_declaration`
+    // shares one `type` field across multiple comma-separated `name` fields
+    // (`func f(a, b int)` — both `a` and `b` are `name`-field children of the
+    // SAME node). The outer per-child loop used to increment its index once
+    // per node regardless of how many names it yielded, so `a` and `b` both
+    // got paramIndex 0.
+    #[test]
+    fn grouped_param_names_each_get_their_own_index() {
+        let data = extract("package main\nfunc f(a, b int, c string) {\n}\n");
+        let get = |n: &str| {
+            data.parameters
+                .iter()
+                .find(|p| p.func_name == "f" && p.param_name == n)
+                .map(|p| p.param_index)
+        };
+        assert_eq!(get("a"), Some(0));
+        assert_eq!(get("b"), Some(1));
+        assert_eq!(get("c"), Some(2));
+    }
+
+    #[test]
+    fn single_name_parameter_declarations_still_index_correctly() {
+        let data = extract("package main\nfunc add(a int, b int) int {\n  return a + b\n}\n");
+        let get = |n: &str| {
+            data.parameters
+                .iter()
+                .find(|p| p.func_name == "add" && p.param_name == n)
+                .map(|p| p.param_index)
+        };
+        assert_eq!(get("a"), Some(0));
+        assert_eq!(get("b"), Some(1));
+    }
+
+    #[test]
+    fn variadic_parameter_still_extracted_after_a_grouped_group() {
+        let data = extract("package main\nfunc f(a, b int, nums ...int) {\n}\n");
+        let get = |n: &str| {
+            data.parameters
+                .iter()
+                .find(|p| p.func_name == "f" && p.param_name == n)
+                .map(|p| p.param_index)
+        };
+        assert_eq!(get("a"), Some(0));
+        assert_eq!(get("b"), Some(1));
+        assert_eq!(get("nums"), Some(2));
+    }
+
+    // Greptile review on PR #2575 for #2501: tree-sitter-go still parses an
+    // entirely unnamed `parameter_declaration` (e.g. `*int`, a compound type
+    // that can't be mistaken for an identifier) as its own node with no
+    // `name` field — confirmed via a parse-tree dump before writing this
+    // test. Grouping every `parameter_declaration` must not let a fully
+    // unnamed one collapse into the next slot instead of consuming its own
+    // index.
+    #[test]
+    fn unnamed_parameter_before_a_named_one_still_gets_correct_index() {
+        let data = extract("package main\nfunc f(*int, a int) {\n}\n");
+        let get = |n: &str| {
+            data.parameters
+                .iter()
+                .find(|p| p.func_name == "f" && p.param_name == n)
+                .map(|p| p.param_index)
+        };
+        assert_eq!(get("a"), Some(1));
+    }
+
+    #[test]
+    fn two_unnamed_parameters_before_a_named_one_still_get_correct_index() {
+        let data = extract("package main\nfunc f(*int, *string, a int) {\n}\n");
+        let get = |n: &str| {
+            data.parameters
+                .iter()
+                .find(|p| p.func_name == "f" && p.param_name == n)
+                .map(|p| p.param_index)
+        };
+        assert_eq!(get("a"), Some(2));
     }
 }

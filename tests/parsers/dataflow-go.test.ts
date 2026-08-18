@@ -41,6 +41,58 @@ describe('extractDataflow — Go', () => {
         ]),
       );
     });
+
+    // Regression test for issue #2501: a single `parameter_declaration` node
+    // shares one type across multiple comma-separated names (`a, b int` — both
+    // `a` and `b` are `name`-field children of the SAME node). The outer
+    // per-child loop used to increment its index once per node regardless of
+    // how many names it yielded, so `a` and `b` both got paramIndex 0.
+    it('gives grouped multi-name parameters each their own index', () => {
+      const data = parseAndExtract('package main\nfunc f(a, b int, c string) {\n}\n');
+      expect(data.parameters).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ funcName: 'f', paramName: 'a', paramIndex: 0 }),
+          expect.objectContaining({ funcName: 'f', paramName: 'b', paramIndex: 1 }),
+          expect.objectContaining({ funcName: 'f', paramName: 'c', paramIndex: 2 }),
+        ]),
+      );
+    });
+
+    it('still indexes a variadic parameter correctly after a grouped group', () => {
+      const data = parseAndExtract('package main\nfunc f(a, b int, nums ...int) {\n}\n');
+      expect(data.parameters).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ funcName: 'f', paramName: 'a', paramIndex: 0 }),
+          expect.objectContaining({ funcName: 'f', paramName: 'b', paramIndex: 1 }),
+          expect.objectContaining({ funcName: 'f', paramName: 'nums', paramIndex: 2 }),
+        ]),
+      );
+    });
+
+    // Greptile review on PR #2575 for #2501: tree-sitter-go still parses an
+    // entirely unnamed `parameter_declaration` (e.g. `*int`, a compound type
+    // that can't be mistaken for an identifier) as its own node with no
+    // `name` field — confirmed via a parse-tree dump before writing this
+    // test. Grouping every `parameter_declaration` must not let a fully
+    // unnamed one collapse into the next slot instead of consuming its own
+    // index.
+    it('gives a named parameter the correct index after an unnamed one', () => {
+      const data = parseAndExtract('package main\nfunc f(*int, a int) {\n}\n');
+      expect(data.parameters).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ funcName: 'f', paramName: 'a', paramIndex: 1 }),
+        ]),
+      );
+    });
+
+    it('gives a named parameter the correct index after two unnamed ones', () => {
+      const data = parseAndExtract('package main\nfunc f(*int, *string, a int) {\n}\n');
+      expect(data.parameters).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ funcName: 'f', paramName: 'a', paramIndex: 2 }),
+        ]),
+      );
+    });
   });
 
   describe('returns', () => {
