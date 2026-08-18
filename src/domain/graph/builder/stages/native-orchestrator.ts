@@ -28,6 +28,7 @@ import { semverCompare } from '../../../../infrastructure/update-check.js';
 import { getOrCreatePerDbChunkStmt } from '../../../../shared/chunked-stmt-cache.js';
 import { normalizePath, TS_NATIVE_CONFIDENCE_FLOOR } from '../../../../shared/constants.js';
 import { toErrorMessage } from '../../../../shared/errors.js';
+import { CALLABLE_SYMBOL_KINDS } from '../../../../shared/kinds.js';
 import { CODEGRAPH_VERSION } from '../../../../shared/version.js';
 import type {
   BetterSqlite3Database,
@@ -321,12 +322,26 @@ async function runPostNativeStructure(
  */
 async function runDataflowVertexPass(
   ctx: PipelineContext,
+  isFullBuild: boolean,
   changedFiles: string[] | undefined,
 ): Promise<void> {
   if (ctx.opts.dataflow === false) return;
 
   const native = loadNative();
   if (!native?.extractDataflowAnalysis) return;
+
+  // Quiet incremental: no files changed → no new dataflow edges/vertices to
+  // add, nothing to do. Without this, an incremental no-op rebuild falls
+  // through to the "full build" branch below just like a genuine full
+  // build would (changedFiles is `[]`, not `undefined`, but the `else`
+  // below treats both the same) and re-scans every eligible file for
+  // nothing — mirrors backfillEdgeTechniquesAfterNativeOrchestrator's
+  // identical guard just above (#2483 follow-up: caught by the perf-canary
+  // "No-op rebuild" benchmark after broadening which files that full-build
+  // branch considers eligible).
+  if (!isFullBuild && changedFiles && changedFiles.length === 0) {
+    return;
+  }
 
   // Determine which files to process: changed files for incremental, all for full builds.
   let filesToProcess: string[];
@@ -338,23 +353,29 @@ async function runDataflowVertexPass(
     //   (a) Non-native language files — NATIVE_SUPPORTED_EXTENSIONS doesn't cover them,
     //       so extractDataflowAnalysis returns null; the wasmStubs path calls buildDataflowEdges
     //       which writes both edges AND vertices for those files.
-    //   (b) Native-language files with dataflow edges already written by the Rust orchestrator
-    //       (flows_to/returns/mutates) — those need vertex rows to connect them.
+    //   (b) Native-language files with at least one function/method definition — every
+    //       such definition gets its own param/return/local vertices regardless of whether
+    //       it participates in any INTER-procedural flow (#2483: a leaf function with no
+    //       cross-function argument/assignment/mutation relationships still has params and a
+    //       return worth recording — extractDataflowAnalysis's vertex output isn't gated on
+    //       argFlows/assignments/mutations being non-empty). An earlier version of this filter
+    //       scoped to files with existing `dataflow` EDGE rows instead, which wrongly skipped
+    //       vertex extraction for every file whose functions happen to have no inter-procedural
+    //       edges — verified empirically: a repro fixture with plain param/return-only functions
+    //       (no cross-function dataflow at all) produced zero dataflow_vertices rows on the
+    //       native engine while WASM correctly recorded them.
     //
-    // Skipping native-language files with no dataflow edges is safe: extractDataflowAnalysis
-    // would return argFlows=[], assignments=[], mutations=[] for them, producing zero vertices
-    // and zero inter-procedural edges. Excluding them avoids O(n_total_files) re-analysis on
-    // every full build (codegraph itself: ~2000 files, ~50-80% with no dataflow edges).
-    const filesWithDataflow = new Set(
+    // Excluding files with NO function/method definitions at all (pure type/data files) is
+    // still a safe, meaningful prune — they can never produce vertices either way — and avoids
+    // O(n_total_files) re-analysis on every full build.
+    const filesWithFunctions = new Set(
       (
         ctx.db
           .prepare(
-            `SELECT DISTINCT n.file
-             FROM dataflow d
-             JOIN nodes n ON n.id = d.source_id
-             WHERE n.file IS NOT NULL`,
+            `SELECT DISTINCT file FROM nodes
+             WHERE file IS NOT NULL AND kind IN (${[...CALLABLE_SYMBOL_KINDS].map(() => '?').join(',')})`,
           )
-          .all() as { file: string }[]
+          .all(...CALLABLE_SYMBOL_KINDS) as { file: string }[]
       ).map((r) => r.file),
     );
 
@@ -368,8 +389,8 @@ async function runDataflowVertexPass(
         const ext = path.extname(f).toLowerCase();
         // Non-native files: always include (WASM handles them via wasmStubs path).
         if (!NATIVE_SUPPORTED_EXTENSIONS.has(ext)) return true;
-        // Native files: only include when Rust wrote dataflow edges for them.
-        return filesWithDataflow.has(f);
+        // Native files: only include when they have at least one function/method definition.
+        return filesWithFunctions.has(f);
       });
   }
 
@@ -2941,7 +2962,7 @@ export async function tryNativeOrchestrator(
   // Languages where Rust has no dataflow rules are silently skipped; a WASM
   // fallback for those is tracked in issue #1614.
   if (ctx.opts.dataflow !== false && !needsAnalysisFallback) {
-    await runDataflowVertexPass(ctx, result.changedFiles);
+    await runDataflowVertexPass(ctx, !!result.isFullBuild, result.changedFiles);
   }
 
   session.close();
