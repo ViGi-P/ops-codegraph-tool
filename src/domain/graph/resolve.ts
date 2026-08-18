@@ -1259,6 +1259,8 @@ function resolveImportPathJS(
   for (const ext of [
     '.ts',
     '.tsx',
+    '.mts',
+    '.cts',
     '.js',
     '.jsx',
     '.mjs',
@@ -1266,6 +1268,8 @@ function resolveImportPathJS(
     '.pyi',
     '/index.ts',
     '/index.tsx',
+    '/index.mts',
+    '/index.cts',
     '/index.js',
     '/__init__.py',
   ]) {

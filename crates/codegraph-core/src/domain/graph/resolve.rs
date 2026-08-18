@@ -1503,6 +1503,8 @@ fn probe_known_extensions(
     const EXTENSIONS: &[&str] = &[
         ".ts",
         ".tsx",
+        ".mts",
+        ".cts",
         ".js",
         ".jsx",
         ".mjs",
@@ -1510,6 +1512,8 @@ fn probe_known_extensions(
         ".pyi",
         "/index.ts",
         "/index.tsx",
+        "/index.mts",
+        "/index.cts",
         "/index.js",
         "/__init__.py",
     ];
@@ -1948,6 +1952,97 @@ mod tests {
             None,
         );
         assert_eq!(result, "src/legacy.cts");
+    }
+
+    #[test]
+    fn probe_known_extensions_resolves_an_extension_less_specifier_to_mts() {
+        // #2464: distinct from resolve_mjs_to_mts_remap_with_known_files above
+        // — `./utils` here carries no extension at all, unlike `./utils.mjs`,
+        // so it exercises probe_known_extensions's EXTENSIONS list directly
+        // instead of EMIT_EXTENSION_REMAPS.
+        let mut known = HashSet::new();
+        known.insert("src/utils.mts".to_string());
+
+        let aliases = PathAliases {
+            base_url: None,
+            paths: vec![],
+        };
+
+        let result = resolve_import_path_inner(
+            "/project/src/index.mts",
+            "./utils",
+            "/project",
+            &aliases,
+            Some(&known),
+            None,
+        );
+        assert_eq!(result, "src/utils.mts");
+    }
+
+    #[test]
+    fn probe_known_extensions_resolves_an_extension_less_specifier_to_cts() {
+        let mut known = HashSet::new();
+        known.insert("src/legacy.cts".to_string());
+
+        let aliases = PathAliases {
+            base_url: None,
+            paths: vec![],
+        };
+
+        let result = resolve_import_path_inner(
+            "/project/src/index.cts",
+            "./legacy",
+            "/project",
+            &aliases,
+            Some(&known),
+            None,
+        );
+        assert_eq!(result, "src/legacy.cts");
+    }
+
+    #[test]
+    fn probe_known_extensions_resolves_a_directory_specifier_to_its_index_mts() {
+        // Greptile follow-up on #2464: the direct .mts/.cts candidates alone
+        // don't cover the directory-index convention (`./dir` -> `dir/index.mts`),
+        // which every other extension in this list already supports.
+        let mut known = HashSet::new();
+        known.insert("src/esm-dir/index.mts".to_string());
+
+        let aliases = PathAliases {
+            base_url: None,
+            paths: vec![],
+        };
+
+        let result = resolve_import_path_inner(
+            "/project/src/index.mts",
+            "./esm-dir",
+            "/project",
+            &aliases,
+            Some(&known),
+            None,
+        );
+        assert_eq!(result, "src/esm-dir/index.mts");
+    }
+
+    #[test]
+    fn probe_known_extensions_resolves_a_directory_specifier_to_its_index_cts() {
+        let mut known = HashSet::new();
+        known.insert("src/cjs-dir/index.cts".to_string());
+
+        let aliases = PathAliases {
+            base_url: None,
+            paths: vec![],
+        };
+
+        let result = resolve_import_path_inner(
+            "/project/src/index.cts",
+            "./cjs-dir",
+            "/project",
+            &aliases,
+            Some(&known),
+            None,
+        );
+        assert_eq!(result, "src/cjs-dir/index.cts");
     }
 
     #[test]
