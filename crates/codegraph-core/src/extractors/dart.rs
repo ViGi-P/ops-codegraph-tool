@@ -62,6 +62,7 @@ fn match_dart_type_map(node: &Node, source: &[u8], symbols: &mut FileSymbols, _d
         "declaration" => handle_dart_field_decl_type_map(node, source, symbols),
         "constructor_param" => handle_dart_constructor_param_type_map(node, source, symbols),
         "formal_parameter" => handle_dart_formal_param_type_map(node, source, symbols),
+        "initialized_variable_definition" => handle_dart_local_var_type_map(node, source, symbols),
         _ => {}
     }
 }
@@ -802,35 +803,35 @@ fn collect_dart_param_names(param_list: &Node, source: &[u8]) -> std::collection
     names
 }
 
-/// Parameter names in scope for a receiver identifier at a call site
-/// (`node`, some descendant of the enclosing function/method's
-/// `function_body`) — used by `find_dart_selector_receiver` /
-/// `handle_dart_call_expression` to decide whether a bare identifier is
-/// shadowed by a same-named parameter rather than being a genuine field
-/// access (#2319 second follow-up, Greptile finding on PR #2477).
+/// The `method_signature`/`function_signature`/`constructor_signature` node
+/// enclosing `node`, where `node` is some descendant of that function's
+/// `function_body` — the shared traversal behind both
+/// `find_enclosing_dart_param_list_for_call` (needs the parameter list) and
+/// `find_enclosing_dart_function_qualifier_for_body` (needs the qualified
+/// name; #2474, local-variable constructor-call typeMap seeding).
 ///
 /// Unlike `find_enclosing_dart_function_qualifier_for_param` (a simple
-/// ancestor walk), a CALL site can't reach its enclosing signature by
-/// walking ancestors alone: tree-sitter-dart 0.2 splits a function/method's
-/// signature and body into SIBLING nodes under a shared parent
-/// (`method_signature` + `function_body` under `method_declaration`, or
-/// `function_signature` + `function_body` under `function_declaration` —
-/// confirmed by parsing top-level, class-method, and constructor variants;
-/// the same split `dart_function_end_line` already documents and skips
-/// forward across for `end_line` computation, #2082) — a call inside the
-/// body has the `function_body` node as an ancestor, never the signature.
-/// This walks up to that `function_body` ancestor, then scans ITS siblings
-/// backward (skipping any intervening `comment` nodes, mirroring
+/// ancestor walk), a descendant of a function's body — a call site, a local
+/// variable declaration, anything inside `function_body` — can't reach its
+/// enclosing signature by walking ancestors alone: tree-sitter-dart 0.2
+/// splits a function/method's signature and body into SIBLING nodes under a
+/// shared parent (`method_signature` + `function_body` under
+/// `method_declaration`, or `function_signature` + `function_body` under
+/// `function_declaration` — confirmed by parsing top-level, class-method,
+/// and constructor variants; the same split `dart_function_end_line` already
+/// documents and skips forward across for `end_line` computation, #2082) —
+/// such a node has the `function_body` node as an ancestor, never the
+/// signature. This walks up to that `function_body` ancestor, then scans ITS
+/// siblings backward (skipping any intervening `comment` nodes, mirroring
 /// `dart_function_end_line`'s identical forward skip) for the nearest
 /// signature-shaped node.
 ///
-/// Returns `None` (safe default: no shadowing detected, `this.`-prefix
-/// kept) when no enclosing `function_body` is found at all, or when the
-/// sibling immediately preceding it isn't recognizably a signature —
+/// Returns `None` when no enclosing `function_body` is found at all, or when
+/// the sibling immediately preceding it isn't recognizably a signature —
 /// deliberately conservative, matching this file's own established
 /// discipline of falling through rather than guessing. Mirrors
-/// `findEnclosingDartParamListForCall` in `src/extractors/dart.ts`.
-fn find_enclosing_dart_param_list_for_call<'a>(node: &Node<'a>) -> Option<Node<'a>> {
+/// `findEnclosingDartSignatureFromBody` in `src/extractors/dart.ts`.
+fn find_enclosing_dart_signature_from_body<'a>(node: &Node<'a>) -> Option<Node<'a>> {
     let mut current = node.parent();
     while let Some(n) = current {
         if n.kind() == "function_body" {
@@ -853,8 +854,7 @@ fn find_enclosing_dart_param_list_for_call<'a>(node: &Node<'a>) -> Option<Node<'
                     sibling.kind(),
                     "method_signature" | "function_signature" | "constructor_signature"
                 ) {
-                    let inner = find_dart_inner_signature_node(&sibling);
-                    return find_child(&inner, "formal_parameter_list");
+                    return Some(sibling);
                 }
                 return None;
             }
@@ -863,6 +863,169 @@ fn find_enclosing_dart_param_list_for_call<'a>(node: &Node<'a>) -> Option<Node<'
         current = n.parent();
     }
     None
+}
+
+/// Parameter names in scope for a receiver identifier at a call site
+/// (`node`, some descendant of the enclosing function/method's
+/// `function_body`) — used by `find_dart_selector_receiver` /
+/// `handle_dart_call_expression` to decide whether a bare identifier is
+/// shadowed by a same-named parameter rather than being a genuine field
+/// access (#2319 second follow-up, Greptile finding on PR #2477). Mirrors
+/// `findEnclosingDartParamListForCall` in `src/extractors/dart.ts`.
+fn find_enclosing_dart_param_list_for_call<'a>(node: &Node<'a>) -> Option<Node<'a>> {
+    let sig = find_enclosing_dart_signature_from_body(node)?;
+    let inner = find_dart_inner_signature_node(&sig);
+    find_child(&inner, "formal_parameter_list")
+}
+
+/// Qualified name (`ClassName.methodName`, or bare `functionName`) of the
+/// function/method enclosing `node`, a descendant of that function's
+/// `function_body` — e.g. a local variable declaration inside the body
+/// (#2474). Mirrors `find_enclosing_dart_function_qualifier_for_param`'s
+/// return shape, but for a body descendant rather than a parameter — see
+/// `find_enclosing_dart_signature_from_body` for why these need different
+/// traversals. Mirrors `findEnclosingDartFunctionQualifierForBody` in
+/// `src/extractors/dart.ts`.
+fn find_enclosing_dart_function_qualifier_for_body(node: &Node, source: &[u8]) -> Option<String> {
+    let sig = find_enclosing_dart_signature_from_body(node)?;
+    let fn_name = extract_dart_fn_name(&sig, source)?;
+    let class_name = find_enclosing_dart_class_name(&sig, source);
+    Some(match class_name {
+        Some(cn) => format!("{}.{}", cn, fn_name),
+        None => fn_name,
+    })
+}
+
+/// Seed a function-scoped typeMap entry for `var svc = UserService(repo);`
+/// (#2474).
+///
+/// tree-sitter-dart's two grammar versions structure this differently, same
+/// class of divergence `handle_dart_constructor_call` already documents:
+///
+/// - Native (crates.io tree-sitter-dart 0.2): a clean single `value:` field
+///   pointing straight at a `(call_expression function: (identifier)
+///   arguments: (...))` — the only shape this Rust extractor ever actually
+///   parses.
+/// - WASM (npm tree-sitter-dart 1.x, mirrored here only so both engines'
+///   logic stay in lockstep — this crate never parses this grammar itself):
+///   `value:` is a field marker on TWO different children of
+///   `initialized_variable_definition` — the bare callee identifier AND the
+///   trailing `selector` node carrying the call's `argument_part` — so the
+///   WASM-side lookup falls through to a sibling scan for the `selector`
+///   node, then takes ITS immediately preceding sibling as the callee —
+///   exactly Layout C, the same shape `resolve_dart_selector_call`'s own doc
+///   comment documents for `var w = Foo();` / `helper();`.
+///
+/// No-ops for any other initializer shape (a literal, a bare identifier
+/// reference, an `await` expression, …) — there is no statically-knowable
+/// constructor type to seed.
+///
+/// Also requires the callee to be capitalized (Greptile finding on this PR):
+/// unlike JS/TS's `new` keyword, Dart lets a constructor call omit `new`
+/// entirely, so `Foo()` and `foo()` are syntactically identical
+/// `call_expression`s at this position — tree-sitter-dart gives no node-kind
+/// signal to tell "constructor call" apart from "ordinary function call that
+/// happens to return an object" (confirmed: even a genuine `UserRepository()`
+/// constructor call parses its callee as a plain `identifier`, not
+/// `type_identifier`, in this position). Without this gate, an ordinary
+/// factory FUNCTION call (`var svc = makeService();`) would be seeded as if
+/// `svc`'s type were the literal function name `makeService`. Gating on
+/// capitalization matches Dart's own type-naming convention (enforced by the
+/// language's default `camel_case_types` lint) and this crate's own existing
+/// precedent for the identical ambiguity in `javascript.rs`
+/// (`starts_with(|c: char| c.is_ascii_uppercase())`) — deliberately a plain
+/// ASCII check, not a full-Unicode-scalar `char::is_uppercase()`, so this
+/// agrees byte-for-byte with TS's `/^[A-Z]/` without the astral-plane/
+/// titlecase divergence risk #2396 already found in the fuller Unicode-aware
+/// heuristic.
+///
+/// Capitalization only narrows, not eliminates, the ambiguity: a legally
+/// uppercase ordinary function (`OrderService MakeOrderService() {...}`) is
+/// still indistinguishable from a constructor call here, and — confirmed via
+/// a dual-engine integration test during review — wrongly guessing its name
+/// as the type can cause a later receiver call through that local to lose
+/// its edge (both `resolve_call_targets_core` here and `resolveByReceiver`
+/// in `resolver/strategy.ts` skip the untyped direct-qualified fallback
+/// whenever ANY typeMap entry exists for the receiver, right or wrong — a
+/// pre-existing, language-agnostic property of the shared resolver, not
+/// something introduced here). Seeded at confidence 0.7 rather than 1.0 —
+/// the same tier as JS/TS's own `Foo.create()` factory heuristic, which
+/// carries the identical capitalization-based uncertainty — so a more
+/// certain entry from elsewhere wins any `dedup_type_map` tie. Closing the
+/// residual gap needs either a shared-resolver change (fall through to the
+/// untyped fallback when the type-aware tier finds nothing, across every
+/// language using this cascade) or a same-file "is this name already a
+/// known ordinary function?" cross-check — the latter requires refactoring
+/// `dart.ts`'s single-pass `walkDartNode` into the two-pass design this
+/// crate and `javascript.ts` already use, since a single-pass check would be
+/// declaration-order-dependent there and diverge from this (order-
+/// independent) engine. Both options are out of scope for this fix —
+/// tracked in #2568. Mirrors `handleDartLocalVarTypeMap` in
+/// `src/extractors/dart.ts` — see that function's doc comment for why a
+/// LOCAL VARIABLE shadowing a class field of the same name is deliberately
+/// out of scope here (tracked separately as #2478).
+fn handle_dart_local_var_type_map(node: &Node, source: &[u8], symbols: &mut FileSymbols) {
+    let Some(name_node) = node.child_by_field_name("name") else {
+        return;
+    };
+    if name_node.kind() != "identifier" {
+        return;
+    }
+
+    if let Some(value_node) = node.child_by_field_name("value") {
+        if value_node.kind() != "call_expression" {
+            return;
+        }
+        let Some(fn_node) = value_node.child_by_field_name("function") else {
+            return;
+        };
+        if fn_node.kind() != "identifier" && fn_node.kind() != "type_identifier" {
+            return;
+        }
+        if !node_text(&fn_node, source).starts_with(|c: char| c.is_ascii_uppercase()) {
+            return;
+        }
+        let enclosing_qualifier = find_enclosing_dart_function_qualifier_for_body(node, source);
+        push_scoped_type_map_entry(
+            symbols,
+            enclosing_qualifier.as_deref(),
+            node_text(&name_node, source),
+            node_text(&fn_node, source),
+            0.7,
+        );
+        return;
+    }
+
+    // WASM grammar: `value` (if present at all) is the bare callee
+    // identifier, not a call_expression — find the `selector` child carrying
+    // the call (`argument_part`) instead, then take ITS immediately
+    // preceding sibling as the callee, mirroring
+    // `resolve_dart_selector_call`'s identical Layout C lookup.
+    for i in 1..node.child_count() {
+        let Some(child) = node.child(i) else {
+            continue;
+        };
+        if child.kind() != "selector" || find_child(&child, "argument_part").is_none() {
+            continue;
+        }
+        if let Some(callee) = node.child(i - 1) {
+            if (callee.kind() == "identifier" || callee.kind() == "type_identifier")
+                && callee.id() != name_node.id()
+                && node_text(&callee, source).starts_with(|c: char| c.is_ascii_uppercase())
+            {
+                let enclosing_qualifier =
+                    find_enclosing_dart_function_qualifier_for_body(node, source);
+                push_scoped_type_map_entry(
+                    symbols,
+                    enclosing_qualifier.as_deref(),
+                    node_text(&name_node, source),
+                    node_text(&callee, source),
+                    0.7,
+                );
+            }
+        }
+        return;
+    }
 }
 
 fn handle_dart_selector(node: &Node, source: &[u8], symbols: &mut FileSymbols) {
@@ -1581,6 +1744,146 @@ mod tests {
                 .find(|e| e.name == "Service.run::_repo")
                 .expect("missing Service.run::_repo scoped type-map entry");
             assert_eq!(scoped.type_name, "MockRepository");
+        }
+    }
+
+    // #2474: `var svc = UserService(repo);` never seeded a typeMap entry for
+    // `svc`, unlike every other language extractor's identical
+    // constructor-call-initializer convention — so a later call through it
+    // (`svc.createUser(...)`) could never resolve via the typeMap.
+    mod local_var_constructor_call_typing {
+        use super::*;
+
+        #[test]
+        fn seeds_a_type_map_entry_for_a_bare_constructor_call_initializer() {
+            let s = parse_dart("void main() {\n  var svc = UserService();\n}");
+            let entry = s.type_map.iter().find(|e| e.name == "main::svc");
+            assert!(
+                entry.is_some(),
+                "missing function-scoped main::svc entry; got: {:?}",
+                s.type_map
+            );
+            assert_eq!(entry.unwrap().type_name, "UserService");
+            assert_eq!(entry.unwrap().confidence, 0.7);
+        }
+
+        #[test]
+        fn also_seeds_the_bare_fallback_key() {
+            let s = parse_dart("void main() {\n  var svc = UserService();\n}");
+            let entry = s.type_map.iter().find(|e| e.name == "svc");
+            assert!(
+                entry.is_some(),
+                "missing bare svc entry; got: {:?}",
+                s.type_map
+            );
+            assert_eq!(entry.unwrap().type_name, "UserService");
+        }
+
+        #[test]
+        fn does_not_collide_across_two_functions_with_a_same_named_local() {
+            let s = parse_dart(
+                "void a() {\n  var svc = UserService();\n}\nvoid b() {\n  var svc = MockUserService();\n}",
+            );
+            let a_scoped = s.type_map.iter().find(|e| e.name == "a::svc");
+            let b_scoped = s.type_map.iter().find(|e| e.name == "b::svc");
+            assert_eq!(
+                a_scoped.map(|e| e.type_name.as_str()),
+                Some("UserService"),
+                "got: {:?}",
+                s.type_map
+            );
+            assert_eq!(
+                b_scoped.map(|e| e.type_name.as_str()),
+                Some("MockUserService"),
+                "got: {:?}",
+                s.type_map
+            );
+        }
+
+        #[test]
+        fn does_not_seed_for_a_non_constructor_call_initializer() {
+            let s = parse_dart("void main() {\n  var x = 5;\n  var y = other;\n}");
+            assert!(
+                s.type_map
+                    .iter()
+                    .all(|e| e.name != "main::x" && e.name != "x"),
+                "must not seed a type for a literal initializer; got: {:?}",
+                s.type_map
+            );
+            assert!(
+                s.type_map
+                    .iter()
+                    .all(|e| e.name != "main::y" && e.name != "y"),
+                "must not seed a type for a bare-identifier initializer; got: {:?}",
+                s.type_map
+            );
+        }
+
+        // Greptile finding on PR #2567: Dart lets a constructor call omit
+        // `new`, so `makeService()` (an ordinary lowercase factory FUNCTION)
+        // and `UserService()` (a genuine constructor call) are
+        // indistinguishable `call_expression`s. Without the capitalization
+        // gate this handler would wrongly seed `svc`'s type as the literal
+        // function name `makeService`.
+        #[test]
+        fn does_not_seed_for_a_lowercase_bare_function_call_initializer() {
+            let s = parse_dart("void main() {\n  var svc = makeService();\n}");
+            assert!(
+                s.type_map
+                    .iter()
+                    .all(|e| e.name != "main::svc" && e.name != "svc"),
+                "must not seed a type from a lowercase factory-function callee; got: {:?}",
+                s.type_map
+            );
+        }
+
+        #[test]
+        fn seeds_class_method_scoped_entry_too() {
+            let s = parse_dart(
+                "class Controller {\n  void run() {\n    var svc = UserService();\n    svc.createUser();\n  }\n}",
+            );
+            let scoped = s.type_map.iter().find(|e| e.name == "Controller.run::svc");
+            assert!(
+                scoped.is_some(),
+                "missing Controller.run::svc scoped entry; got: {:?}",
+                s.type_map
+            );
+            assert_eq!(scoped.unwrap().type_name, "UserService");
+        }
+
+        #[test]
+        fn end_to_end_repro_from_the_issue() {
+            // The issue's own repro: a constructor-call-initialized local
+            // passed to a second constructor call. Confirms both locals
+            // resolve independently via the typeMap. Whether the resulting
+            // `svc.createUser(...)` call edge actually resolves through that
+            // typeMap entry depends on receiver-prefix handling that is
+            // #2478's territory (a local var shadowing/looking like a field),
+            // not this fix's — exercised end-to-end, across both engines, by
+            // the dedicated integration test for #2474 instead.
+            let s = parse_dart(
+                "class UserService {\n  void createUser() {}\n}\nvoid main() {\n  var repo = UserRepository();\n  var svc = UserService(repo);\n  svc.createUser();\n}",
+            );
+            let repo_entry = s.type_map.iter().find(|e| e.name == "main::repo");
+            assert_eq!(
+                repo_entry.map(|e| e.type_name.as_str()),
+                Some("UserRepository"),
+                "got: {:?}",
+                s.type_map
+            );
+            let svc_entry = s.type_map.iter().find(|e| e.name == "main::svc");
+            assert_eq!(
+                svc_entry.map(|e| e.type_name.as_str()),
+                Some("UserService"),
+                "got: {:?}",
+                s.type_map
+            );
+            let call = s.calls.iter().find(|c| c.name == "createUser");
+            assert!(
+                call.is_some(),
+                "missing createUser call; got: {:?}",
+                s.calls
+            );
         }
     }
 }
