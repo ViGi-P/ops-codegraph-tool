@@ -207,6 +207,56 @@ describe('guard-git.sh IFS whitespace-expansion bypass (#2451)', () => {
     expect(isDenied('git${IFS+ }reset')).toBe(true);
   });
 
+  it('still blocks git reset via a whitespace-only alternate-value expansion on a non-IFS, normally-set variable (#2558)', () => {
+    // ${HOME:+ } works identically to ${IFS:+ } — the operator substitutes
+    // the literal "word" whenever the named variable is set and non-null,
+    // regardless of what that variable's own value actually is. HOME is
+    // normally set in any real shell, so this produces the same token
+    // boundary as the IFS-specific form; a per-variable-name check could
+    // never fully close this class, since the variable name isn't fixed.
+    // biome-ignore lint/suspicious/noTemplateCurlyInString: literal bash syntax under test, not a missed template literal
+    expect(isDenied('git${HOME:+ }reset')).toBe(true);
+  });
+
+  it('still blocks git reset via the bare (colon-less) whitespace-only alternate-value form on a non-IFS variable', () => {
+    // biome-ignore lint/suspicious/noTemplateCurlyInString: literal bash syntax under test, not a missed template literal
+    expect(isDenied('git${PWD+ }reset')).toBe(true);
+  });
+
+  it('still blocks git reset via a whitespace-only alternate-value expansion on the $? special parameter (Greptile review)', () => {
+    // ${?:+ } is always-set (bash's exit-status special parameter is never
+    // unset), so this substitutes the literal space "word" exactly like an
+    // ordinary variable would -- verified directly against real bash.
+    // Neither special parameters nor bare digit sequences (positional
+    // parameters) match a bash identifier shape, so they need their own
+    // branch in the alternation, not just the ordinary-variable one above.
+    // biome-ignore lint/suspicious/noTemplateCurlyInString: literal bash syntax under test, not a missed template literal
+    expect(isDenied('git${?:+ }reset')).toBe(true);
+  });
+
+  it('still blocks git reset via a whitespace-only alternate-value expansion on the $$ (PID) special parameter', () => {
+    // biome-ignore lint/suspicious/noTemplateCurlyInString: literal bash syntax under test, not a missed template literal
+    expect(isDenied('git${$:+ }reset')).toBe(true);
+  });
+
+  it('still blocks git reset via a whitespace-only alternate-value expansion on the $# (arg count) special parameter', () => {
+    // biome-ignore lint/suspicious/noTemplateCurlyInString: literal bash syntax under test, not a missed template literal
+    expect(isDenied('git${#:+ }reset')).toBe(true);
+  });
+
+  it('still blocks git reset via a whitespace-only alternate-value expansion on the $- (shell options) special parameter', () => {
+    // biome-ignore lint/suspicious/noTemplateCurlyInString: literal bash syntax under test, not a missed template literal
+    expect(isDenied('git${-:+ }reset')).toBe(true);
+  });
+
+  it('does not invent a token boundary from a non-whitespace alternate-value expansion on a non-IFS variable', () => {
+    // ${SOME_VAR:+x} substitutes the literal "x", not whitespace — the
+    // all-whitespace-content restriction applies regardless of which
+    // variable is named.
+    // biome-ignore lint/suspicious/noTemplateCurlyInString: literal bash syntax under test, not a missed template literal
+    expect(isDenied('echo git${SOME_VAR:+x}reset')).toBe(false);
+  });
+
   it('does not invent a token boundary from an empty IFS alternate-value expansion', () => {
     // ${IFS:+} (nothing between + and }) substitutes an EMPTY string when
     // IFS is set and non-null — an unquoted empty expansion contributes
