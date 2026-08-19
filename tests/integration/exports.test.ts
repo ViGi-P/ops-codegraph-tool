@@ -63,6 +63,38 @@ beforeAll(() => {
   const fApp = insertNode(db, 'app.js', 'file', 'app.js', 0);
   const fBarrel = insertNode(db, 'barrel.js', 'file', 'barrel.js', 0);
   const fTest = insertNode(db, 'lib.test.js', 'file', 'lib.test.js', 0);
+  // Entry script with a file-kind node but no exported symbols at all (#2530).
+  insertNode(db, 'entry.js', 'file', 'entry.js', 0);
+  insertNode(db, 'runApp', 'function', 'entry.js', 1); // never marked exported
+  // Unrelated file whose path contains "widget.js" as a mid-string substring
+  // (not a `/`-bounded suffix) and also has zero exports — a false LIKE-query
+  // collision for a query of "widget.js" that must NOT report fileFound:
+  // true, with no genuine match present anywhere in the graph (#2530
+  // Greptile review).
+  insertNode(db, 'src/my-widget.js', 'file', 'src/my-widget.js', 0);
+  // Same shape, but paired with a genuine match: "src/my-utils.js" (a
+  // collision for "utils.js", inserted first) and "src/utils.js" (the
+  // genuine target, inserted after). findFileNodes has no ORDER BY, so an
+  // unordered LIKE scan would return the collision first unless a plausible
+  // match is explicitly preferred (#2530 Greptile round 2).
+  insertNode(db, 'src/my-utils.js', 'file', 'src/my-utils.js', 0);
+  insertNode(db, 'src/utils.js', 'file', 'src/utils.js', 0);
+  // A collision file WITH real exports, for a target with no plausible
+  // candidate at all ("gadget.js" -> "src/my-gadget.js"). fileFound must
+  // still be true here, since real (non-empty) results are being returned —
+  // fileFound: false alongside non-empty results is a self-contradictory
+  // signal for structured/JSON consumers (#2530 Greptile round 5).
+  insertNode(db, 'src/my-gadget.js', 'file', 'src/my-gadget.js', 0);
+  const gadgetExport = insertNode(db, 'buildGadget', 'function', 'src/my-gadget.js', 1);
+  // Two distinct real files differing only by case, to test that an
+  // exact-case match always wins over a same-name case-insensitive one
+  // (#2530 Greptile round 5). The case-different file is inserted FIRST so
+  // an unordered LIKE scan visits it before the exact-case match, forcing a
+  // naive case-insensitive-only `.find()` to pick the wrong file.
+  insertNode(db, 'src/CaseDemo.js', 'file', 'src/CaseDemo.js', 0);
+  const upperCaseExport = insertNode(db, 'upperCaseFn', 'function', 'src/CaseDemo.js', 1);
+  insertNode(db, 'src/casedemo.js', 'file', 'src/casedemo.js', 0);
+  const lowerCaseExport = insertNode(db, 'lowerCaseFn', 'function', 'src/casedemo.js', 1);
 
   // Function nodes in lib.js
   const add = insertNode(db, 'add', 'function', 'lib.js', 1);
@@ -81,6 +113,9 @@ beforeAll(() => {
   markExported.run(add);
   markExported.run(multiply);
   markExported.run(unusedFn);
+  markExported.run(gadgetExport);
+  markExported.run(lowerCaseExport);
+  markExported.run(upperCaseExport);
 
   // Import edges
   insertEdge(db, fApp, fLib, 'imports');
@@ -164,6 +199,72 @@ describe('exportsData', () => {
     expect(data.totalExported).toBe(0);
     expect(data.totalInternal).toBe(0);
     expect(data.totalUnused).toBe(0);
+    // No file-kind node matched at all — genuinely unbuilt/not-found (#2530).
+    expect(data.fileFound).toBe(false);
+  });
+
+  test('fileFound is true for a file in the graph with legitimately zero exports (#2530)', () => {
+    const data = exportsData('entry.js', dbPath);
+    expect(data.results).toEqual([]);
+    expect(data.totalExported).toBe(0);
+    expect(data.fileFound).toBe(true);
+  });
+
+  test('fileFound is false for a target that only mid-string-collides with an unrelated file, no genuine match present (#2530 Greptile review)', () => {
+    // "widget.js" is not a real file anywhere in the fixture, but
+    // "src/my-widget.js" (added below) contains it as a substring (not a
+    // `/`-bounded suffix). The rebuild suggestion must still fire, since this
+    // is not genuinely the file the caller asked about.
+    const data = exportsData('widget.js', dbPath);
+    expect(data.results).toEqual([]);
+    expect(data.fileFound).toBe(false);
+  });
+
+  test('prefers a genuine exact/suffix match over an unordered mid-string collision returned first (#2530 Greptile round 2)', () => {
+    // findFileNodes has no ORDER BY, so a plain LIKE '%utils.js%' scan
+    // returns whichever row SQLite visits first. "src/my-utils.js" (a
+    // collision, no `/`-bounded suffix match) was inserted BEFORE the
+    // genuine "src/utils.js" — without preferring a plausible match, the
+    // first (arbitrary) result would win and wrongly report fileFound: false
+    // plus the wrong file's (empty) data, even though "src/utils.js" is a
+    // real, matching file in the graph.
+    const data = exportsData('utils.js', dbPath);
+    expect(data.file).toBe('src/utils.js');
+    expect(data.fileFound).toBe(true);
+  });
+
+  test("fileFound is case-insensitive, matching SQLite LIKE's own default case-insensitivity (#2530 Greptile round 3)", () => {
+    // SQLite's LIKE is case-insensitive for ASCII by default, so a
+    // case-mismatched target ("Entry.js") still LIKE-matches the stored
+    // "entry.js" -- isPlausibleFileMatch must not be stricter than the LIKE
+    // lookup that already decided this is a hit.
+    const data = exportsData('Entry.js', dbPath);
+    expect(data.file).toBe('entry.js');
+    expect(data.fileFound).toBe(true);
+  });
+
+  test('treats a collision with no plausible candidate as not-found, even when the collision itself has real exports (#2530 Greptile round 6)', () => {
+    // "gadget.js" has no plausible candidate at all -- only the collision
+    // "src/my-gadget.js" LIKE-matches it, and that collision has a REAL
+    // export. Earlier this fell back to returning the collision's real data
+    // with fileFound: true, which is misleading regardless of what fileFound
+    // says (round 6) -- and fileFound: false alongside non-empty results was
+    // self-contradictory before that (round 5). Requiring a plausible
+    // candidate to exist at all resolves both: nothing plausible means
+    // nothing is returned, full stop, exactly like a genuinely missing file.
+    const data = exportsData('gadget.js', dbPath);
+    expect(data.results).toEqual([]);
+    expect(data.fileFound).toBe(false);
+  });
+
+  test('prefers an exact-case match over a same-name case-insensitive match (#2530 Greptile round 5)', () => {
+    // "src/casedemo.js" and "src/CaseDemo.js" are two DISTINCT real files.
+    // A query for the exact-case "casedemo.js" must resolve to
+    // "src/casedemo.js", never to its differently-cased sibling, even though
+    // isPlausibleFileMatch's case-insensitivity (round 3) would accept both.
+    const data = exportsData('casedemo.js', dbPath);
+    expect(data.file).toBe('src/casedemo.js');
+    expect(data.results.map((r) => r.name)).toEqual(['lowerCaseFn']);
   });
 
   test('pagination works', () => {

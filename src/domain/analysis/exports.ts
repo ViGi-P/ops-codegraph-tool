@@ -27,6 +27,40 @@ const _reexportsToStmtCache: StmtCache<{ file: string }> = new WeakMap();
 const _reexportSymbolsStmtCache: StmtCache<NodeRow> = new WeakMap();
 const _wildcardReexportTargetsStmtCache: StmtCache<{ file: string }> = new WeakMap();
 
+/**
+ * Whether `matchedFile` is exactly (case-sensitively) the file the caller
+ * asked for, or a `/`-bounded path suffix of it. Checked before the
+ * case-insensitive variant below so that a genuine exact-case match always
+ * wins over a merely case-insensitive one when both exist among the
+ * candidates (e.g. distinct real files `src/utils.js` and `src/UTILS.js` on
+ * a case-sensitive filesystem — #2530 review round 5).
+ */
+function isExactFileMatch(matchedFile: string, target: string): boolean {
+  return matchedFile === target || matchedFile.endsWith(`/${target}`);
+}
+
+/**
+ * Whether `matchedFile` (a result of the `LIKE '%target%'` fuzzy lookup used
+ * throughout this module) plausibly *is* the file the caller asked for,
+ * rather than an unrelated file whose path merely contains `target` as a
+ * substring somewhere in the middle (e.g. target `add.js` mid-string-matching
+ * `badd.jsx`, or `utils.js` matching `my-utils.js` with no path separator
+ * before it). Requires an exact match or a `/`-bounded path suffix — the
+ * only two cases where the match reflects genuine user intent (#2530 review).
+ *
+ * Case-insensitive to match SQLite's own default `LIKE` behavior (ASCII
+ * case-insensitive) — otherwise a target that only differs from the graph's
+ * stored casing would pass the LIKE lookup but fail this stricter check,
+ * reintroducing a false "not found" for a match SQLite itself already deemed
+ * a hit (#2530 review round 3). Callers selecting among multiple candidates
+ * should prefer `isExactFileMatch` first (round 5).
+ */
+function isPlausibleFileMatch(matchedFile: string, target: string): boolean {
+  const a = matchedFile.toLowerCase();
+  const b = target.toLowerCase();
+  return a === b || a.endsWith(`/${b}`);
+}
+
 export function exportsData(
   file: string,
   customDbPath: string,
@@ -52,10 +86,22 @@ export function exportsData(
     const unused = opts.unused || false;
     const fileResults = exportsFileImpl(db, file, noTests, getFileLines, unused, displayOpts);
 
-    if (fileResults.length === 0) {
+    // Prefer, in order: an exact-case match, then a case-insensitive/suffix
+    // match. If NEITHER exists among the LIKE lookup's results, treat this
+    // exactly like "no file found at all" rather than falling back to an
+    // arbitrary unrelated substring collision's real data — returning that
+    // collision's export payload under a mismatched query is misleading
+    // regardless of what `fileFound` says about it (#2530 Greptile round 6),
+    // and it can never be a plausible answer to what was actually asked.
+    const first =
+      fileResults.find((r) => isExactFileMatch(r.file, file)) ??
+      fileResults.find((r) => isPlausibleFileMatch(r.file, file));
+
+    if (!first) {
       return paginateResult(
         {
           file,
+          fileFound: false,
           results: [],
           reexports: [],
           reexportedSymbols: [],
@@ -70,10 +116,12 @@ export function exportsData(
       );
     }
 
-    // For single-file match return flat; for multi-match return first (like explainData)
-    const first = fileResults[0]!;
     const base = {
       file: first.file,
+      // Always true here: `first` only exists when isExactFileMatch or
+      // isPlausibleFileMatch accepted it, so this can never contradict
+      // non-empty results the way an unconditional plausibility check could.
+      fileFound: true,
       results: first.results,
       reexports: first.reexports,
       reexportedSymbols: first.reexportedSymbols,
