@@ -41,6 +41,48 @@ export interface GraphAdapter {
 }
 
 /**
+ * The default edge-weight rule: `attrs.weight` when numeric, else 1.
+ *
+ * Kept as a named function (rather than inlined into `resolveAdapterOptions`)
+ * because the native Leiden binding has to apply the *same* rule when it
+ * resolves weights for the FFI boundary. Two independent copies of this rule
+ * would let the engines disagree about what a graph weighs, which is the whole
+ * bug class `resolveEdgeWeight` exists to prevent.
+ */
+function defaultLinkWeight(attrs: EdgeAttrs): number {
+  return attrs && typeof attrs.weight === 'number' ? attrs.weight : 1;
+}
+
+/**
+ * Numeric coercion applied to every resolved link weight: `NaN`, zero, and
+ * anything non-numeric collapse to 0, which drops the edge from the adapter
+ * rather than propagating NaN through every modularity sum downstream.
+ *
+ * `Infinity`/`-Infinity` are *not* collapsed -- they are truthy, so `+w || 0`
+ * keeps them, and they then poison the modularity sums via
+ * `Infinity - Infinity`. That is a real gap rather than intended design, but
+ * both engines share it (the native binding's `resolve_weight` mirrors this
+ * rule exactly, NaN included) and nothing in-tree can produce an infinite
+ * weight today, so it is tracked in #2597 rather than changed here: clamping
+ * would alter the vendored reference's numeric semantics and needs its own
+ * decision plus a matching native change.
+ */
+function coerceLinkWeight(w: number): number {
+  return +w || 0;
+}
+
+/**
+ * Resolve an edge attribute bag to the weight both engines must agree on.
+ *
+ * Exported for `louvainCommunities`, which builds the native binding's edge
+ * array: doing the resolution here means the attribute-to-number rule has one
+ * implementation shared by the native and JS paths instead of one per engine.
+ */
+export function resolveEdgeWeight(attrs: EdgeAttrs): number {
+  return coerceLinkWeight(defaultLinkWeight(attrs));
+}
+
+/**
  * Populate edge arrays for a directed graph. Each edge is stored once in
  * outEdges[from] and inEdges[to]. Self-loops are tracked in both the selfLoop
  * array and the adjacency lists (partition.ts accounts for this).
@@ -59,7 +101,7 @@ function populateDirectedEdges(
     const from = idToIndex.get(src);
     const to = idToIndex.get(tgt);
     if (from == null || to == null) continue;
-    const w: number = +linkWeight(attrs) || 0;
+    const w: number = coerceLinkWeight(linkWeight(attrs));
     if (from === to) {
       taAdd(selfLoop, from, w);
       // Self-loop is intentionally kept in outEdges/inEdges as well.
@@ -107,7 +149,7 @@ function aggregateUndirectedPairs(
     const a = idToIndex.get(src);
     const b = idToIndex.get(tgt);
     if (a == null || b == null) continue;
-    const w: number = +linkWeight(attrs) || 0;
+    const w: number = coerceLinkWeight(linkWeight(attrs));
     if (a === b) {
       taAdd(selfLoop, a, w);
       continue;
@@ -199,9 +241,7 @@ interface ResolvedAdapterOptions {
 /** Apply GraphAdapterOptions defaults (weight=1, size=1, directed=false). */
 function resolveAdapterOptions(opts: GraphAdapterOptions): ResolvedAdapterOptions {
   return {
-    linkWeight:
-      opts.linkWeight ||
-      ((attrs) => (attrs && typeof attrs.weight === 'number' ? attrs.weight : 1)),
+    linkWeight: opts.linkWeight || defaultLinkWeight,
     nodeSize:
       opts.nodeSize || ((attrs) => (attrs && typeof attrs.size === 'number' ? attrs.size : 1)),
     directed: !!opts.directed,
